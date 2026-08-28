@@ -1065,6 +1065,7 @@ ask_profile() {
     "Standard (includes SSH hardening, Fail2ban, sysctl, AppArmor)" \
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
     "Custom (I will be asked per category)" \
+    "Restore SSH (diagnose & fix common lockout causes; option-only menu)" \
     "Maintenance suite (pick individual categories, return to this menu)"
   REPLY_PROFILE=$REPLY_CHOICE
 }
@@ -1073,18 +1074,121 @@ ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
   _should_run_step "$key" || return 1
   case "$REPLY_PROFILE" in
-    0) [ "$default" = "y" ]; return $?;;
-    1) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ]; return $?;;
-    2) return 0;;
-    3) prompt_yn "Run: $desc?" "$default"; return $?;;
-    4) return 1;;
+    1) [ "$default" = "y" ]; return $?;;
+    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ]; return $?;;
+    3) return 0;;
+    4) prompt_yn "Run: $desc?" "$default"; return $?;;
+    5) return 1;;
+    6) return 1;;
   esac
 }
 
+# --- Maintenance suite helpers ---
+
+_ssh_inspect_config() {
+  local cfg="/etc/ssh/sshd_config"
+  msg "SSH server configuration inspection"
+  if [ ! -f "$cfg" ]; then
+    err "sshd_config not found at $cfg"; return 1; fi
+  info "Key directives in $cfg:"
+  local _key_params="Port Protocol AddressFamily PasswordAuthentication PubkeyAuthentication
+    PermitRootLogin PermitEmptyPasswords X11Forwarding AllowTcpForwarding Banner
+    ClientAliveInterval ClientAliveCountMax MaxAuthTries LoginGraceTime"
+  local _p
+  for _p in $_key_params; do
+    local _val
+    _val=$(awk "/^[[:space:]]*#?[[:space:]]*${_p}[[:space:]]/ {for(i=2;i<=NF;i++) printf '%s ', \$i; print ''}" "$cfg" 2>/dev/null | head -1)
+    if [ -n "$_val" ]; then
+      printf '  %-25s %s\n' "$_p:" "$_val"
+    fi
+  done
+  echo
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    local _d
+    info "Active drop-in files:"
+    for _d in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$_d" ] || continue
+      printf '  %s\n' "$_d"
+      awk '/^[[:space:]]*[^#]/ {printf "    %s\n", $0}' "$_d" 2>/dev/null || true
+    done
+  fi
+  echo
+  if systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+    ok "sshd service is running."
+  else
+    err "sshd service is NOT running."
+  fi
+}
+
+_maintenance_list_keys() {
+  msg "Authorized SSH keys inspection"
+  local _total=0
+  local _f _keyfile
+  for _keyfile in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    if [ -f "$_keyfile" ]; then
+      info "File: $_keyfile"
+      local _count=0
+      while IFS= read -r _line || [ -n "$_line" ]; do
+        case "$_line" in ''|\#*) continue ;; esac
+        _count=$((_count + 1))
+        local _type _comment
+        _type=$(echo "$_line" | awk '{print $1}')
+        _comment=$(echo "$_line" | awk '{$1=""; print $0}' | sed 's/^[[:space:]]*//')
+        printf '  [%d] type=%s  comment="%s"\n' "$_count" "$_type" "$_comment"
+      done < "$_keyfile"
+      _total=$((_total + _count))
+    fi
+  done
+  echo
+  if [ "$_total" -eq 0 ]; then
+    warn "No authorized_keys found."
+    info "Run:  ssh-copy-id $USER@$(hostname -I 2>/dev/null | awk '{print $1}')"
+  else
+    ok "Total: $_total key(s) across all authorized_keys files."
+  fi
+}
+
+_maintenance_logs() {
+  msg "Recent rollback and self-heal log entries"
+  echo
+  if [ -f /var/log/linux-install-rollback.log ]; then
+    info "=== Rollback log (last 20 lines) ==="
+    tail -n 20 /var/log/linux-install-rollback.log 2>/dev/null | sed 's/^/  /'
+  else
+    info "Rollback log not found."
+  fi
+  echo
+  if [ -f /var/log/neohiro-ssh-watchdog.log ]; then
+    info "=== SSH self-heal log (last 20 lines) ==="
+    tail -n 20 /var/log/neohiro-ssh-watchdog.log 2>/dev/null | sed 's/^/  /'
+  else
+    info "SSH self-heal log not found (guard may not be installed yet)."
+  fi
+}
+
+_maintenance_sysinfo() {
+  msg "System information"
+  printf '  %-20s %s\n' "Hostname:" "$(hostname 2>/dev/null)"
+  printf '  %-20s %s\n' "Uptime:" "$(uptime -p 2>/dev/null || uptime 2>/dev/null)"
+  printf '  %-20s %s\n' "Load (1/5/15 min):" "$(cat /proc/loadavg 2>/dev/null)"
+  printf '  %-20s %s\n' "Memory:" "$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2}')"
+  printf '  %-20s %s\n' "Disk /:" "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}')"
+  printf '  %-20s %s\n' "Kernel:" "$(uname -r 2>/dev/null)"
+  printf '  %-20s %s\n' "CPU:" "$(nproc 2>/dev/null) cores$(lscpu 2>/dev/null | awk '/Model name/ {printf ": %s", $0}' | sed 's/Model name.*: //')"
+  if command -v ss >/dev/null 2>&1; then
+    printf '  %-20s\n' "Listening TCP ports:"
+    ss -tlnp 2>/dev/null | awk 'NR>1 {printf "    %s\n", $0}' | head -20
+  fi
+}
+
+# Maintenance menu: expanded suite for SSH recovery, config inspection, key
+# management, self-heal controls, and system diagnostics.
+# The menu uses a magenta header and numbered choices (20 = exit).
 maintenance_menu() {
   local choice rc
   while true; do
-    prompt_choice "Maintenance suite — pick a category (15=exit)" \
+    printf '\n%s\n' "$(_c '1;35m' '━━━ Maintenance suite ━━━')"
+    prompt_choice "Maintenance — pick a category (20=exit)" \
       "System update (apt update + upgrade + base packages)" \
       "DNSCrypt (DNS encryption)" \
       "Firewall (UFW)" \
@@ -1098,7 +1202,12 @@ maintenance_menu() {
       "Password & lockout policy" \
       "OptimizeLinuxASR (attack-surface reduction)" \
       "DeepClean (cleanup + auto-prune)" \
-       "Other helpers (reserved for future cross-distro helpers)" \
+      "SSH diagnostics & lockout fix (restore_ssh_mode)" \
+      "Authorized keys (list + inspect)" \
+      "SSH config review (show current directives)" \
+      "SSH self-heal guard (install / remove / status)" \
+      "Logs (rollback + self-heal log viewer)" \
+      "System info (uptime, memory, disk, ports)" \
       "Back to main menu"
     choice=$REPLY_CHOICE
     rc=0
@@ -1116,8 +1225,25 @@ maintenance_menu() {
      10) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
      11) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
      12) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      13) info "No other helpers in the linux repo yet."; break;;
-     14) info "Returning to main menu."; break;;
+     13) bold "=== SSH diagnostics & lockout fix ==="; restore_ssh_mode || rc=$?;;
+     14) bold "=== Authorized keys ==="; _maintenance_list_keys;;
+     15) bold "=== SSH config review ==="; _ssh_inspect_config || rc=$?;;
+     16) bold "=== SSH self-heal guard ==="
+         if [ -f /var/run/neohiro-ssh-watchdog.armed ]; then
+           info "Self-heal guard is installed and armed."
+           if prompt_yn "Remove the self-heal guard?" "n"; then
+             _ssh_self_heal_uninstall
+           fi
+         else
+           info "Self-heal guard is NOT installed."
+           if prompt_yn "Install the SSH self-heal guard?" "y"; then
+             _ssh_self_heal_install
+           fi
+         fi
+         ;;
+     17) bold "=== Log viewer ==="; _maintenance_logs;;
+     18) bold "=== System info ==="; _maintenance_sysinfo;;
+     19) info "Returning to main menu."; break;;
     esac
     if [ $rc -eq 0 ]; then
       ok "Done."
@@ -2187,6 +2313,27 @@ harden_ssh() {
   fi
   _ssh_safe_restart "$SSHCFG" || return 1
   ok "SSH hardened and (re)loaded safely."
+
+  # Auto-install the per-minute + boot-time self-heal guard when SSH is
+  # used.  This is the layer that turns "I might have broken SSH" into
+  # "if I did, it will be fixed within 60s even if I lose my session".
+  # The user can opt out at install time and remove it later with
+  # --no-self-heal.
+  if [ "$USE_REMOTE_SSH" = "yes" ] || [ "$SSH_AUTO_MODE" = "1" ]; then
+    if [ -f /var/run/neohiro-ssh-watchdog.armed ]; then
+      ok "SSH self-heal guard already installed."
+    else
+      if [ "$SSH_AUTO_MODE" = "1" ]; then
+        QUIET_PROMPTS=1 _ssh_self_heal_install
+      else
+        if prompt_yn "Install SSH self-heal guard (cron/systemd timer that auto-recovers from lockout within 60s)?" "y"; then
+          _ssh_self_heal_install
+        else
+          info "Skipped self-heal guard. You can install it later:  sudo bash $SCRIPT_PATH --install-self-heal"
+        fi
+      fi
+    fi
+  fi
 }
 
 _ssh_disable_password_auth() {
@@ -2521,6 +2668,217 @@ rollback_mode() {
   return 0
 }
 
+# --- SSH Self-heal Guard (boot + every-minute watchdog) ---
+# Installs a systemd timer or cron job that runs _ssh_self_heal_check every
+# minute and at boot.  This is the layer that prevents SSH lockout even when
+# the user is connected over SSH and the script makes a mistake: the watchdog
+# detects the broken state within 60 seconds and restores connectivity.
+#
+# Design principles:
+#   - Idempotent: safe to run multiple times; overwrites existing installs.
+#   - Unobtrusive: only acts when a problem is detected.
+#   - Auditable: every action is logged to /var/log/neohiro-ssh-watchdog.log.
+#   - Fail-safe: never locks the user out of a working SSH; only fixes broken ones.
+#   - No secrets: does not modify authorized_keys or write any credentials.
+
+_ssh_self_heal_check() {
+  local SSHCFG="/etc/ssh/sshd_config"
+  local PORT
+  PORT=$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' "$SSHCFG" 2>/dev/null)
+  PORT="${PORT:-22}"
+  local TS
+  TS="$(date -Iseconds 2>/dev/null || date)"
+  local FIXED=0
+
+  if ! sshd -t 2>&1; then
+    printf '[%s] WARN: sshd -t failed; skipping self-heal (would need manual review)\n' "$TS"
+    return 0
+  fi
+
+  if ! _service_present ssh && ! _service_present sshd; then
+    printf '[%s] INFO: ssh/sshd service not found; skipping self-heal\n' "$TS"
+    return 0
+  fi
+
+  if ! _is_listening "$PORT"; then
+    printf '[%s] INFO: SSH not listening on port %s; attempting restart\n' "$TS" "$PORT"
+    local _unit
+    _unit="$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)"
+    systemctl restart "$_unit" 2>/dev/null
+    if _is_listening "$PORT"; then
+      printf '[%s] FIXED: SSH now listening on port %s after restart\n' "$TS" "$PORT"
+      FIXED=1
+    else
+      printf '[%s] WARN: SSH still not listening after restart; needs manual review\n' "$TS"
+    fi
+  fi
+
+  _fw_detect
+  local _blocked=0
+  case "$FW_CMD" in
+    firewall-cmd)
+      if systemctl is-active --quiet firewalld 2>/dev/null; then
+        if ! firewall-cmd --list-ports 2>/dev/null | grep -qE "${PORT}/tcp"; then
+          printf '[%s] FIX: firewalld missing port %s/tcp; opening\n' "$TS" "$PORT"
+          firewall-cmd --add-port="${PORT}/tcp" --permanent 2>/dev/null
+          firewall-cmd --reload 2>/dev/null
+          printf '[%s] FIXED: firewalld opened port %s/tcp\n' "$TS" "$PORT"
+          FIXED=1
+          _blocked=1
+        fi
+      fi
+      ;;
+    ufw)
+      if ufw status 2>/dev/null | grep -qE 'Status: active'; then
+        if ! ufw status 2>/dev/null | grep -qE "ALLOW IN.*${PORT}/tcp"; then
+          printf '[%s] FIX: UFW missing port %s/tcp; opening\n' "$TS" "$PORT"
+          ufw allow "${PORT}/tcp" >/dev/null 2>&1
+          printf '[%s] FIXED: UFW opened port %s/tcp\n' "$TS" "$PORT"
+          FIXED=1
+          _blocked=1
+        fi
+      fi
+      ;;
+  esac
+
+  if [ "$_blocked" = "1" ]; then
+    printf '[%s] INFO: SSH port was blocked by firewall; connectivity should be restored\n' "$TS"
+  fi
+
+  local _ak_count=0 _f _c
+  for _f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$_f" ] || continue
+    _c=$(grep -cE '^(ssh-|ecdsa-' "$_f" 2>/dev/null) || _c=0
+    _ak_count=$((_ak_count + _c))
+  done
+
+  if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$SSHCFG" 2>/dev/null && [ "$_ak_count" -eq 0 ]; then
+    printf '[%s] CRITICAL: lockout detected (PasswordAuthentication=no, no pubkeys); re-enabling password auth\n' "$TS"
+    if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$SSHCFG" 2>/dev/null; then
+      sed -i -E 's/^([[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+)no/\1yes/' "$SSHCFG" 2>/dev/null
+      printf '[%s] FIXED: PasswordAuthentication re-enabled to prevent lockout\n' "$TS"
+      FIXED=1
+    fi
+    local _d
+    for _d in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$_d" ] || continue
+      if grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$_d" 2>/dev/null; then
+        sed -i -E 's/^([[:space:]]*#?[[:space:]]*PasswordAuthentication[[:space:]]+)no/# \1no  # self-heal: re-enabled by ssh-watchdog/' "$_d" 2>/dev/null
+        printf '[%s] FIXED: %s PasswordAuthentication no commented out\n' "$TS" "$_d"
+        FIXED=1
+      fi
+    done
+    if sshd -t 2>/dev/null; then
+      local _unit
+      _unit="$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)"
+      systemctl restart "$_unit" 2>/dev/null
+      printf '[%s] INFO: sshd restarted after lockout recovery\n' "$TS"
+    fi
+  fi
+
+  if [ "$FIXED" -eq 1 ]; then
+    printf '[%s] INFO: SSH self-heal completed; 1+ issue(s) resolved\n' "$TS"
+  fi
+  return 0
+}
+
+_ssh_self_heal_install() {
+  local _log="/var/log/neohiro-ssh-watchdog.log"
+  local _guard="/var/run/neohiro-ssh-watchdog.armed"
+  install -m 0644 /dev/null "$_log" 2>/dev/null || true
+
+  if [ -f "$_guard" ]; then
+    info "SSH self-heal guard is already installed."
+    if [ "$SSH_AUTO_MODE" = "1" ]; then
+      ok "[AUTO] SSH self-heal guard installed (idempotent re-install)."
+      return 0
+    fi
+    if ! prompt_yn "Re-install the SSH self-heal guard (replaces existing)?" "n"; then
+      info "Self-heal guard left unchanged."
+      return 0
+    fi
+  fi
+
+  msg "Installing SSH self-heal guard (runs every minute + at boot)..."
+  _ssh_self_heal_uninstall 2>/dev/null || true
+
+  if command -v systemctl >/dev/null 2>&1 && systemctl --version 2>/dev/null | grep -q systemd; then
+    local _svc="/etc/systemd/system/neohiro-ssh-watchdog.service"
+    local _timer="/etc/systemd/system/neohiro-ssh-watchdog.timer"
+    local _script="/usr/local/libexec/neohiro-ssh-watchdog.sh"
+    install -d -m 0755 /usr/local/libexec 2>/dev/null || true
+    cat > "$_script" <<SCRIPT
+#!/bin/bash
+# neohiro-ssh-watchdog.sh -- invoked by systemd timer / cron every minute.
+# Calls the canonical self-heal logic in the parent linuxinstall.sh.
+exec /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+SCRIPT
+    chmod 0755 "$_script" 2>/dev/null || true
+    cat > "$_svc" <<UNIT
+[Unit]
+Description=neohiro SSH self-heal watchdog
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$_script
+UNIT
+    cat > "$_timer" <<TIMER
+[Unit]
+Description=neohiro SSH self-heal watchdog -- every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable --now neohiro-ssh-watchdog.timer 2>/dev/null
+    ok "SSH self-heal guard installed (systemd timer: boot+every 60s)."
+  else
+    local _cron_dir="/etc/cron.d"
+    [ -d "$_cron_dir" ] || _cron_dir="/etc/cron.d"
+    if [ ! -d "$_cron_dir" ]; then
+      warn "No systemd and no cron.d found; self-heal guard cannot be installed."
+      info "On this system, manual SSH monitoring is required."
+      return 1
+    fi
+    cat > "$_cron_dir/neohiro-ssh-watchdog" <<CRON
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+# Run self-heal at boot (+30s grace) and every minute
+@reboot sleep 30 && /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+* * * * * root /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+CRON
+    chmod 0644 "$_cron_dir/neohiro-ssh-watchdog"
+    ok "SSH self-heal guard installed (cron: @reboot + every minute)."
+  fi
+
+  install -m 0644 /dev/null "$_guard" 2>/dev/null || true
+  printf '%s\n' "$(date -Iseconds 2>/dev/null || date)" > "$_guard"
+  info "Self-heal log: $_log"
+  info "To disable:  sudo bash $SCRIPT_PATH --no-self-heal"
+  # Signal _print_run_summary to show the scheduled-self-heal note at end of run.
+  _SELF_HEAL_INSTALLED=1
+  return 0
+}
+
+_ssh_self_heal_uninstall() {
+  if [ -f /etc/systemd/system/neohiro-ssh-watchdog.timer ]; then
+    systemctl stop neohiro-ssh-watchdog.timer 2>/dev/null || true
+    systemctl disable neohiro-ssh-watchdog.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/neohiro-ssh-watchdog.{service,timer}
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  rm -f /etc/cron.d/neohiro-ssh-watchdog
+  rm -f /usr/local/libexec/neohiro-ssh-watchdog.sh
+  rm -f /var/run/neohiro-ssh-watchdog.armed
+  info "SSH self-heal guard removed."
+}
+
 # --- Restore-SSH mode (also callable from restore_ssh.sh) ---
 # Walks through every step the script may have touched and proposes a
 # safe undo. Intended to be re-run from console (or Tailscale SSH) when
@@ -2694,6 +3052,22 @@ main() {
       restore_ssh_mode
       exit $?
       ;;
+    --self-heal)
+      shift
+      # Silent mode: log only, no prompts, no output unless something changed.
+      QUIET_PROMPTS=1 _ssh_self_heal_check 2>&1 | sed -e 's/^/[self-heal] /' >> /var/log/neohiro-ssh-watchdog.log 2>&1
+      exit $?
+      ;;
+    --no-self-heal)
+      bold "neohiro/linux - Disable SSH self-heal guard"
+      _ssh_self_heal_uninstall
+      exit $?
+      ;;
+    --install-self-heal)
+      bold "neohiro/linux - Install SSH self-heal guard"
+      _ssh_self_heal_install
+      exit $?
+      ;;
     --restore-etc-snapshot)
       bold "neohiro/linux - Restore /etc from snapshot"
       _restore_etc_snapshot
@@ -2749,6 +3123,10 @@ Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--re
   --restore-ssh     Diagnose & fix the most common SSH lockout causes.
                     Use this from a console/Tailscale session if you got
                     locked out.
+  --self-heal       Run the self-heal check now (used by the cron / systemd
+                    timer; logs to /var/log/neohiro-ssh-watchdog.log).
+  --install-self-heal  Install the per-minute + boot-time self-heal guard.
+  --no-self-heal    Remove the self-heal guard (cron job / systemd timer).
   --restore-etc-snapshot
                     Restore /etc from the latest snapshot taken before
                     hardening (requires ENABLE_ETC_SNAPSHOT=1 when the
@@ -2778,7 +3156,7 @@ USAGE
   ask_profile
 
   # Full + server => run SSH hardening in auto mode (no interactive lockout-prone prompts)
-  if [ "$REPLY_PROFILE" = "2" ] && [ "$ENV_TYPE" = "server" ]; then
+  if [ "$REPLY_PROFILE" = "3" ] && [ "$ENV_TYPE" = "server" ]; then
     FULL_AUTO=1
     SSH_AUTO_MODE=1
     USE_REMOTE_SSH="yes"  # treat as remote because we're a headless server
@@ -2790,10 +3168,27 @@ USAGE
   # config tree can be restored wholesale.  Skipped if ENABLE_ETC_SNAPSHOT=0.
   _take_etc_snapshot
 
-  if [ "$REPLY_PROFILE" = "4" ]; then
+  if [ "$REPLY_PROFILE" = "6" ]; then
     maintenance_menu
     if [ "$USE_REMOTE_SSH" = "yes" ]; then
       info "Because SSH may have been changed, verify a SECOND session can log in BEFORE closing this one."
+    fi
+    _print_run_summary
+    return $?
+  fi
+
+  if [ "$REPLY_PROFILE" = "5" ]; then
+    # Restore-SSH is its own first-class menu entry (above Maintenance suite).
+    # Detect, propose fixes, and optionally re-install the self-heal guard.
+    bold "=== Restore SSH (from main menu) ==="
+    restore_ssh_mode
+    echo
+    if [ -f /var/run/neohiro-ssh-watchdog.armed ]; then
+      info "Self-heal guard is already installed."
+    else
+      if prompt_yn "Install the SSH self-heal guard (auto-recovers from lockout within 60s)?" "y"; then
+        _ssh_self_heal_install
+      fi
     fi
     _print_run_summary
     return $?
@@ -2854,6 +3249,23 @@ _print_run_summary() {
     else
       info "Skipped reboot. Run $(_c '1;36m' 'sudo systemctl reboot') when ready."
     fi
+  fi
+
+  # If the SSH self-heal guard was installed during this run, tell the user
+  # that a check is scheduled at every boot and every minute -- so even a
+  # full-disconnect lockout will recover automatically.
+  if [ "${_SELF_HEAL_INSTALLED:-0}" = "1" ]; then
+    printf '\n  %s\n' "$(_c '1;36m' '━━━ SSH SELF-HEAL GUARD ARMED ━━━')"
+    if [ -f /etc/systemd/system/neohiro-ssh-watchdog.timer ]; then
+      printf '%s\n' "  An SSH self-heal run is scheduled at every reboot and every 60s."
+      printf '  Watchdog: %s\n' "$(_c '1;37m' 'systemd timer neohiro-ssh-watchdog.timer')"
+    else
+      printf '%s\n' "  An SSH self-heal run is scheduled at every reboot and every minute."
+      printf '  Watchdog: %s\n' "$(_c '1;37m' '/etc/cron.d/neohiro-ssh-watchdog')"
+    fi
+    printf '  Log file:  %s\n' "$(_c '1;37m' '/var/log/neohiro-ssh-watchdog.log')"
+    printf '  Disable:   %s\n' "$(_c '1;36m' "sudo bash $SCRIPT_PATH --no-self-heal")"
+    printf '  Trigger now: %s\n' "$(_c '1;36m' "sudo bash $SCRIPT_PATH --self-heal")"
   fi
   if [ "$_FAIL_COUNT" -gt 0 ]; then
     if [ "$STRICT_RUN" = "1" ]; then

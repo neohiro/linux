@@ -17,6 +17,10 @@ else C_RED=""; C_GRN=""; C_BLD=""; C_RST=""; fi
 
 ok_t()   { printf '  %s[OK]  %s%s\n'   "$C_GRN" "$1" "$C_RST"; PASS=$((PASS+1)); }
 fail_t() { printf '  %s[FAIL]%s %s\n    %s\n' "$C_RED" "$C_RST" "$1" "$2"; FAIL=$((FAIL+1)); }
+# msg and info are defined in the inline fallback of linuxinstall.sh (before line 297,
+# outside the extracted region).  Stub them here so the maintenance helpers can call them.
+msg()  { printf '=> %s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
 
 # Repo root is the parent of tests/.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,19 +30,32 @@ SRC="$ROOT/linuxinstall.sh"
 WD="$(mktemp -d)"
 trap 'rm -rf "$WD"' EXIT
 
-# Extract helper block. Two non-contiguous regions:
-#   1. STRICT_RUN / _FAIL_COUNT / run() body (lines 164-182)
-#   2. _should_run_step / _VALID_STEPS / _valid_step (lines 683-705)
-# We concatenate both into a single sourced file. Anchors are line numbers
-# from grep -n; resilient to small edits above each anchor.
+# Extract helper block. Four regions:
+#   1. run() body: STRICT_RUN to just before _ssh_inspect_config
+#      This captures run(), _fw_detect, _is_listening, _service_present,
+#      _ensure_firewall_open, and all other cross-cutting helpers.
+#   2. Step functions: _should_run_step to _valid_step
+#   3. Maintenance helpers: _ssh_inspect_config to before maintenance_menu
+#   4. Self-heal functions: _ssh_self_heal_check to before restore_ssh_mode
 _STRICT_LINE=$(grep -n '^STRICT_RUN=' "$SRC" | head -1 | cut -d: -f1)
-_RUN_END_LINE=$(grep -n '^_restore_etc_snapshot() {' "$SRC" | head -1 | cut -d: -f1)
+# Include ALL helpers between _restore_etc_snapshot and _ssh_inspect_config:
+#   _fw_detect (line ~663), _is_listening (~750), _service_present (~835), etc.
+_RUN_END_LINE=$(grep -n '^_ssh_inspect_config() {' "$SRC" | head -1 | cut -d: -f1)
 _RUN_END_LINE=$((_RUN_END_LINE - 1))
 _STEP_START=$(grep -n '^_should_run_step() {' "$SRC" | tail -1 | cut -d: -f1)
 _STEP_END=$(grep -n '^_valid_step() {' "$SRC" | tail -1 | cut -d: -f1)
-# _valid_step is a 4-line function; grab 3 more lines past the signature.
 _STEP_END=$((_STEP_END + 3))
+_MAINT_START=$(grep -n '^_ssh_inspect_config() {' "$SRC" | head -1 | cut -d: -f1)
+# End right before maintenance_menu so we capture all maintenance helpers
+# but not the menu loop itself (which uses prompt_choice and needs a TTY).
+_MAINT_END=$(grep -n '^maintenance_menu() {' "$SRC" | head -1 | cut -d: -f1)
+_MAINT_END=$((_MAINT_END - 1))
+_HEAL_START=$(grep -n '^_ssh_self_heal_check() {' "$SRC" | head -1 | cut -d: -f1)
+_HEAL_END=$(grep -n '^restore_ssh_mode() {' "$SRC" | head -1 | cut -d: -f1)
+_HEAL_END=$((_HEAL_END - 1))
 [ -n "$_STRICT_LINE" ] && [ -n "$_RUN_END_LINE" ] && [ -n "$_STEP_START" ] && [ -n "$_STEP_END" ] \
+  && [ -n "$_MAINT_START" ] && [ -n "$_MAINT_END" ] \
+  && [ -n "$_HEAL_START" ] && [ -n "$_HEAL_END" ] \
   || { echo "Could not locate helper block in $SRC"; exit 2; }
 
 # Source lib/color.sh first so the run() body can call msg/err/ok.
@@ -47,14 +64,16 @@ if [ -r "$ROOT/lib/color.sh" ]; then
   . "$ROOT/lib/color.sh"
 fi
 
-# Source the two extracted regions.
+# Source the extracted regions.
 {
   sed -n "${_STRICT_LINE},${_RUN_END_LINE}p" "$SRC"
   sed -n "${_STEP_START},${_STEP_END}p" "$SRC"
+  sed -n "${_MAINT_START},${_MAINT_END}p" "$SRC"
+  sed -n "${_HEAL_START},${_HEAL_END}p" "$SRC"
 } > "$WD/helpers.sh"
 # shellcheck disable=SC1090
 . "$WD/helpers.sh"
-unset _STRICT_LINE _RUN_END_LINE _STEP_START _STEP_END
+unset _STRICT_LINE _RUN_END_LINE _STEP_START _STEP_END _MAINT_START _MAINT_END _HEAL_START _HEAL_END
 
 # --- lib/temp.sh: source the real library, not the script's fallback ---
 if [ -r "$ROOT/lib/temp.sh" ]; then
@@ -222,6 +241,66 @@ for k in system system_update firewall tor ssh_hardening; do
   fi
 done
 [ "$FAIL" = "0" ] && ok_t "_valid_step: regression on common keys"
+
+# --- _ssh_self_heal_check: declared functions it calls must exist ---
+for fn in _is_listening _service_present _fw_detect; do
+  if declare -F "$fn" >/dev/null 2>&1; then
+    ok_t "_ssh_self_heal_check helper: $fn is declared"
+  else
+    fail_t "_ssh_self_heal_check helper: $fn is declared" "not found"
+  fi
+done
+
+# --- _ssh_self_heal_install / _ssh_self_heal_uninstall: declared ---
+for fn in _ssh_self_heal_install _ssh_self_heal_uninstall; do
+  if declare -F "$fn" >/dev/null 2>&1; then
+    ok_t "$fn is declared"
+  else
+    fail_t "$fn is declared" "not found"
+  fi
+done
+
+# --- _maintenance_list_keys: function exists and is callable ---
+if declare -F _maintenance_list_keys >/dev/null 2>&1; then
+  ok_t "_maintenance_list_keys: declared"
+else
+  fail_t "_maintenance_list_keys: declared" "not found"
+fi
+
+# --- _ssh_inspect_config: function exists ---
+if declare -F _ssh_inspect_config >/dev/null 2>&1; then
+  ok_t "_ssh_inspect_config is declared"
+else
+  fail_t "_ssh_inspect_config is declared" "not found"
+fi
+
+# --- _maintenance_logs: function exists ---
+if declare -F _maintenance_logs >/dev/null 2>&1; then
+  ok_t "_maintenance_logs: declared"
+else
+  fail_t "_maintenance_logs: declared" "not found"
+fi
+
+# --- _maintenance_sysinfo: function exists ---
+if declare -F _maintenance_sysinfo >/dev/null 2>&1; then
+  ok_t "_maintenance_sysinfo: declared"
+else
+  fail_t "_maintenance_sysinfo: declared" "not found"
+fi
+
+# --- _ssh_self_heal_check: function is callable without crashing on a no-ssh system ---
+# Calling it on a test environment without sshd installed should be a no-op (returns 0).
+if declare -F _ssh_self_heal_check >/dev/null 2>&1; then
+  QUIET_PROMPTS=1 _ssh_self_heal_check >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" = "0" ]; then
+    ok_t "_ssh_self_heal_check: no-op on system without sshd (rc=0)"
+  else
+    fail_t "_ssh_self_heal_check: no-op rc" "got rc=$rc"
+  fi
+else
+  fail_t "_ssh_self_heal_check: declared" "not found"
+fi
 
 echo
 TOTAL=$((PASS + FAIL))

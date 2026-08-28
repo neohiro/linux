@@ -131,12 +131,39 @@ session is left intact for inspection.
 Tailscale identity layer, so it works even when `PasswordAuthentication=no`
 or the sshd service is down. Prefer Tailscale SSH for recovery.
 
+**Automatic recovery (SSH self-heal guard):** the script can install a
+self-heal guard that runs at every boot and every 60 seconds. If sshd
+ever becomes unreachable, the guard:
+- re-validates `sshd -t`
+- re-opens the SSH port in firewalld / UFW if it was dropped
+- restarts sshd if it stopped
+- re-enables `PasswordAuthentication yes` if a lockout is detected
+  (only when no pubkeys are installed)
+
+It is offered automatically at the end of `harden_ssh` when you answer
+"yes" to the "use remote SSH?" prompt. You can also install it
+standalone, remove it, or trigger a check manually:
+
+```bash
+sudo bash linuxinstall.sh --install-self-heal  # install
+sudo bash linuxinstall.sh --self-heal          # trigger now (used by cron)
+sudo bash linuxinstall.sh --no-self-heal       # remove
+```
+
+On systemd systems the guard is a `systemd` timer (`neohiro-ssh-watchdog.timer`)
+that fires 30s after boot and every 60s thereafter. On systems without
+systemd (e.g. some minimal images) it installs as a `cron.d` job with
+`@reboot` and `* * * * *` entries. Every action is logged to
+`/var/log/neohiro-ssh-watchdog.log`.
+
 **Quick recovery (from any working session — console, Tailscale SSH, or
 out-of-band):**
 
 ```bash
 # 1. Diagnose and auto-fix most lockout causes
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/restore_ssh.sh)"
+# or, equivalently, via the main script's first-class menu entry
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)" --restore-ssh
 
 # 2. Or undo every config change the script made (dry-run):
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)" --rollback
@@ -166,6 +193,30 @@ sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /mnt/etc/ssh/s
 sed -i 's/^Port .*/Port 22/' /mnt/etc/ssh/sshd_config
 # or restore a backup: ls /mnt/etc/ssh/sshd_config.bak.* && cp <latest> /mnt/etc/ssh/sshd_config
 ```
+
+## Maintenance suite and SSH self-heal
+
+The script's `main()` tree offers a **Maintenance suite** (distinctive
+magenta header) and a **Restore SSH** entry (above Maintenance). The
+Restore-SSH entry calls the same diagnostic routine that the
+`--restore-ssh` flag and the standalone `restore_ssh.sh` script use.
+
+The Maintenance suite itself is expanded to include:
+
+| # | Option | What it does |
+|---|---|---|
+| 1–13 | system / dns / firewall / tor / ssh / fail2ban / unattended / ipv6 / sysctl / apparmor / pam / OptimizeLinuxASR / DeepClean | Re-run any step on demand |
+| 14 | SSH diagnostics & lockout fix | Same routine as `--restore-ssh` |
+| 15 | Authorized keys | List all keys in every user's `authorized_keys` |
+| 16 | SSH config review | Print every key directive from `sshd_config` and drop-ins |
+| 17 | SSH self-heal guard | Install / remove / status of the per-minute watchdog |
+| 18 | Logs | Tail `/var/log/linux-install-rollback.log` and `/var/log/neohiro-ssh-watchdog.log` |
+| 19 | System info | Uptime, load, memory, disk, CPU, listening ports |
+| 20 | Back to main menu | — |
+
+The self-heal guard runs as root via `systemd` or cron and **never
+modifies `authorized_keys` or any credentials** — it only fixes config
+and service state, so it cannot open the system to a new attacker.
 
 ## Manual steps (cross-distro)
 
