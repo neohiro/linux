@@ -41,8 +41,18 @@ bold()  { printf '%s%s%s\n' "$C_BLD" "$*" "$C_RST"; }
 
 prompt_yn() {
   local q="$1" def="${2:-n}" ans
-  printf '%s [y/n, default=%s]: ' "$q" "$def"
-  read -r ans
+  if [ -t 0 ]; then
+    printf '%s [y/n, default=%s]: ' "$q" "$def"
+    read -r ans
+  elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    printf '%s [y/n, default=%s]: ' "$q" "$def" >/dev/tty
+    read -r ans </dev/tty
+  else
+    if [ "${QUIET_PROMPTS:-0}" != "1" ]; then
+      warn "stdin is not a TTY and /dev/tty is unavailable; defaulting to '$def' for: $q"
+    fi
+    ans="$def"
+  fi
   ans="${ans:-$def}"
   case "$ans" in y|Y|yes|YES) return 0;; *) return 1;; esac
 }

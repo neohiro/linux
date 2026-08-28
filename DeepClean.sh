@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+if [ "$EUID" -ne 0 ]; then
+  echo "[!] This script must be run as root. Please use sudo." >&2
+  exit 1
+fi
+
 # Color constants and helpers sourced from lib/color.sh (falls back inline).
 # shellcheck disable=SC1091
 if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then

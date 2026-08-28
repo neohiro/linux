@@ -14,6 +14,22 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
+# Read one line interactively. Falls back to /dev/tty when stdin is not a
+# TTY (cron, sudo -i from a pipeline, etc.) so the script cannot hang.
+# Usage: _read_tty <prompt> <var>
+_read_tty() {
+  local prompt="$1"
+  if [ -t 0 ]; then
+    read -r -p "$prompt"
+  elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    printf '%s' "$prompt" >/dev/tty
+    read -r REPLY </dev/tty
+  else
+    echo "stdin is not a TTY and /dev/tty is unavailable; defaulting." >&2
+    REPLY=""
+  fi
+}
+
 echo "============================================================================="
 echo "         Linux Service Optimization & Attack Surface Reducer                 "
 echo "============================================================================="
@@ -34,8 +50,8 @@ ask_category() {
     echo " CATEGORY: ${category_name}"
     echo "============================================================================="
     while true; do
-        read -r -p "Action for this category? [i=Interactive / a=Disable All / s=Skip All] (Default i): " cat_choice
-        cat_choice=${cat_choice,,}
+        REPLY="" ; _read_tty "Action for this category? [i=Interactive / a=Disable All / s=Skip All] (Default i): "
+        cat_choice="${REPLY,,}"
         case "$cat_choice" in
             a|all )
                 CATEGORY_ACTION="a"
@@ -78,7 +94,8 @@ ask_disable() {
                 choice="y"
                 echo "[BULK DISABLE] ${service}: ${description}"
             else
-                read -r -p "Disable ${service} (${description})? [y/N]: " choice
+                REPLY="" ; _read_tty "Disable ${service} (${description})? [y/N]: "
+                choice="$REPLY"
                 [ -z "$choice" ] && choice="$default_choice"
             fi
 
