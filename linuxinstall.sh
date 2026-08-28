@@ -580,7 +580,8 @@ fw_default_incoming_deny() {
       # old public zone. awk extracts interface names from the "interfaces:" lines.
       local iface
       for iface in $(sudo firewall-cmd --get-active-zones 2>/dev/null \
-                       | awk '/^  interfaces: / {for(i=2;i<=NF;i++) print $i}'); do
+                       | awk '/^  interfaces: / {for(i=2;i<=NF;i++) print $i}' \
+                       | grep -v '^lo$\|^lo[0-9]'); do
         run sudo firewall-cmd --zone=drop --change-interface="$iface" --permanent
       done
       ;;
