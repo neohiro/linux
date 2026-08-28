@@ -1,6 +1,6 @@
 # neohiro/linux
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgray.svg)](https://github.com/)
-[![Supported distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Debian%20%7C%20RHEL%20%7C%20Fedora%20%7C%20SUSE%20%7C%20Arch-blue.svg)](#supported-distributions)
+[![Supported distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Debian%20%7C%20RHEL%20%7C%20Fedora%20%7C%20SUSE%20%7C%20Arch%20%7C%20Amazon%20Linux-blue.svg)](#supported-distributions)
 
 Cross-distro general-purpose setup & hardening script. Auto-detects the
 distribution and the package manager, and adapts every step accordingly —
@@ -11,14 +11,14 @@ Offers a more secure starting point for any new super user.
 
 ## Supported distributions
 
-| Family       | Distros                                  | Package manager | Firewall    | Notes |
-|--------------|------------------------------------------|-----------------|-------------|-------|
-| Debian       | Ubuntu (incl. 24.04 LTS, 22.04, 20.04), Debian 12/11 | `apt`           | `ufw`       | full feature set (unattended-upgrades, AppArmor) |
-| RHEL         | RHEL 8/9, AlmaLinux 8/9, Rocky 8/9, CentOS Stream | `dnf`         | `firewalld` | AppArmor replaced by SELinux |
-| Legacy RHEL  | CentOS 7, RHEL 7                         | `yum`           | `firewalld` | legacy; no `dnf` |
-| Fedora       | Fedora 39+                               | `dnf`           | `firewalld` | AppArmor not on by default — uses SELinux |
-| SUSE         | openSUSE Leap 15, SLES 15                | `zypper`        | `firewalld` | AppArmor profile packages available |
-| Arch         | Arch Linux, Manjaro                      | `pacman`        | `firewalld` | AppArmor / fail2ban via AUR |
+| Family       | Distros                                           | Package manager | Firewall    | Notes |
+|--------------|---------------------------------------------------|----------------|-------------|-------|
+| Debian       | Ubuntu (incl. 24.04 LTS, 22.04, 20.04), Debian 12/11 | `apt`      | `ufw`       | full feature set (unattended-upgrades, AppArmor) |
+| RHEL         | RHEL 8/9, AlmaLinux 8/9, Rocky 8/9, CentOS Stream | `dnf`    | `firewalld` | AppArmor replaced by SELinux |
+| Legacy RHEL  | CentOS 7, RHEL 7, Amazon Linux 2023              | `yum` / `dnf` | `firewalld` | CentOS 7 / RHEL 7 use `yum`; Amazon Linux 2023 uses `dnf` |
+| Fedora       | Fedora 39+                                       | `dnf`          | `firewalld` | AppArmor not on by default — uses SELinux |
+| SUSE         | openSUSE Leap 15, SLES 15                       | `zypper`       | `firewalld` | AppArmor profile packages available |
+| Arch         | Arch Linux, Manjaro                              | `pacman`       | `firewalld` | AppArmor / fail2ban via AUR |
 
 > Distribution is detected from `/etc/os-release` (with `ID_LIKE` fallback).
 > The package manager is then selected from the order `pacman → zypper → dnf
