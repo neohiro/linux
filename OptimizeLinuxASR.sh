@@ -3,6 +3,12 @@
 # Works on: Ubuntu / Debian / RHEL / AlmaLinux / Rocky / Fedora / SUSE / Arch
 # Run as root:  sudo ./OptimizeLinuxASR.sh
 
+# Color helpers from lib/color.sh (no-op if running via curl|bash).
+# shellcheck disable=SC1091
+if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
+  source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
+fi
+
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root. Please use sudo."
    exit 1

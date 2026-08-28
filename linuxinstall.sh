@@ -9,22 +9,46 @@
 #
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
-TMP_DIR="$(mktemp -d)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 ORIG_CWD="$(pwd)"
-# _TMP_FILES is reserved for any future per-function temp files that need
-# guaranteed cleanup on exit (e.g. sensitive content). The EXIT trap
-# removes $TMP_DIR and any tracked files even if the user hits Ctrl+C.
-_TMP_FILES=()
-trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
-# Track a temp file so it is removed on exit.  Use this instead of bare
-# `mktemp` for any temp file that holds sensitive content (e.g. GPG output).
-_tmpfile() {
-  local f
-  f=$(mktemp "${TMPDIR:-/tmp}/linuxinstall.XXXXXX")
-  _TMP_FILES+=("$f")
-  printf '%s' "$f"
-}
+
+# Canonical helpers. Resolved relative to the script's own location so the
+# library works whether the script is run from a clone, a symlink, or
+# curl|bash (where BASH_SOURCE[0] is /dev/fd/...; we fall back to $0).
+_NEOHIRO_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo /usr/local/bin)")/lib" 2>/dev/null && pwd || echo "")"
+if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
+  # shellcheck disable=SC1091
+  source "$_NEOHIRO_LIB_DIR/color.sh"
+  # shellcheck disable=SC1091
+  source "$_NEOHIRO_LIB_DIR/temp.sh"
+else
+  # Inline fallback for run-from-pipe (curl ... | bash) where the lib
+  # directory is not on disk. Same canonical definitions, kept in sync
+  # with lib/color.sh and lib/temp.sh.
+  USE_COLOR=1
+  if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then USE_COLOR=0; fi
+  _c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+  bold() { printf "%s\n" "$(_c '1m' "$*")"; }
+  warn() { printf "%s %s\n" "$(_c '1;33m' '[WARNING]')" "$*" >&2; }
+  err()  { printf "%s %s\n" "$(_c '1;31m' '[ERROR]')"   "$*" >&2; }
+  ok()   { printf "%s %s\n" "$(_c '1;32m' '[OK]')"      "$*"; }
+  info() { printf "  %s\n" "$*"; }
+  msg()  { echo "=> $*"; }
+  TMP_DIR="$(mktemp -d)"
+  _TMP_FILES=()
+  if [ "${STRICT_RUN:-0}" = "1" ] || [ -n "${CI:-}" ]; then
+    _log_error() { :; }
+    trap '_log_error $?; rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' ERR
+  fi
+  trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
+  _tmpfile() {
+    local f
+    f=$(mktemp "${TMPDIR:-/tmp}/neohiro.XXXXXX")
+    _TMP_FILES+=("$f")
+    printf '%s' "$f"
+  }
+fi
+unset _NEOHIRO_LIB_DIR
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
 ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
@@ -132,30 +156,7 @@ INNER_EOF
     "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
 }
 
-bold() { printf "%s\n" "$(_c '1m' "$*")"; }
-warn() { printf "%s %s\n" "$(_c '1;33m' '[WARNING]')" "$*"; }
-err()  { printf "%s %s\n" "$(_c '1;31m' '[ERROR]')"   "$*"; }
-ok()   { printf "%s %s\n" "$(_c '1;32m' '[OK]')"      "$*"; }
-info() { printf "  %s\n" "$*"; }
-
-msg() { echo "=> $*"; }
-
-# --- color gating: only emit ANSI when the terminal actually supports it ---
-# Tailscale SSH and many remote PTYs report TERM=dumb, which renders
-# CSI escapes as literal garbage. NO_COLOR is the XDG standard.
-_USE_COLOR=1
-case "${TERM:-}" in
-  dumb|"") _USE_COLOR=0 ;;
-esac
-[ -n "${NO_COLOR:-}" ] && _USE_COLOR=0
-# _c <color> <text> -- wrap in ANSI only if supported, else print plain.
-_c() {
-  if [ "$_USE_COLOR" = "1" ]; then
-    printf '\033[%sm%s\033[0m' "$1" "$2"
-  else
-    printf '%s' "$2"
-  fi
-}
+# bold/warn/err/ok/info/msg/_c are provided by lib/color.sh (sourced above).
 
 # STRICT_RUN=1 makes run() propagate the actual exit code (default is 0,
 # so a single failed command does not abort the whole interactive run).

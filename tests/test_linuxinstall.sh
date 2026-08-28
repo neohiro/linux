@@ -26,18 +26,43 @@ SRC="$ROOT/linuxinstall.sh"
 WD="$(mktemp -d)"
 trap 'rm -rf "$WD"' EXIT
 
-# Extract the helper block: everything from `_should_run_step() {` up to
-# (but not including) the first `ENV_TYPE=""` line.  That gives us:
-# _should_run_step, _VALID_STEPS, _valid_step, _tmpfile, and the
-# DRY_RUN/STEP_MODE/SELECTED_STEP assignments.
-START=$(grep -n '^_should_run_step() {' "$SRC" | head -1 | cut -d: -f1)
-END=$(grep -n '^ENV_TYPE=""' "$SRC" | head -1 | cut -d: -f1)
-[ -n "$START" ] && [ -n "$END" ] && [ "$END" -gt "$START" ] \
+# Extract helper block. Two non-contiguous regions:
+#   1. STRICT_RUN / _FAIL_COUNT / run() body (lines 164-182)
+#   2. _should_run_step / _VALID_STEPS / _valid_step (lines 683-705)
+# We concatenate both into a single sourced file. Anchors are line numbers
+# from grep -n; resilient to small edits above each anchor.
+_STRICT_LINE=$(grep -n '^STRICT_RUN=' "$SRC" | head -1 | cut -d: -f1)
+_RUN_END_LINE=$(grep -n '^_restore_etc_snapshot() {' "$SRC" | head -1 | cut -d: -f1)
+_RUN_END_LINE=$((_RUN_END_LINE - 1))
+_STEP_START=$(grep -n '^_should_run_step() {' "$SRC" | tail -1 | cut -d: -f1)
+_STEP_END=$(grep -n '^_valid_step() {' "$SRC" | tail -1 | cut -d: -f1)
+# _valid_step is a 4-line function; grab 3 more lines past the signature.
+_STEP_END=$((_STEP_END + 3))
+[ -n "$_STRICT_LINE" ] && [ -n "$_RUN_END_LINE" ] && [ -n "$_STEP_START" ] && [ -n "$_STEP_END" ] \
   || { echo "Could not locate helper block in $SRC"; exit 2; }
-END=$((END - 1))
-sed -n "${START},${END}p" "$SRC" > "$WD/helpers.sh"
+
+# Source lib/color.sh first so the run() body can call msg/err/ok.
+if [ -r "$ROOT/lib/color.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT/lib/color.sh"
+fi
+
+# Source the two extracted regions.
+{
+  sed -n "${_STRICT_LINE},${_RUN_END_LINE}p" "$SRC"
+  sed -n "${_STEP_START},${_STEP_END}p" "$SRC"
+} > "$WD/helpers.sh"
 # shellcheck disable=SC1090
 . "$WD/helpers.sh"
+unset _STRICT_LINE _RUN_END_LINE _STEP_START _STEP_END
+
+# --- lib/temp.sh: source the real library, not the script's fallback ---
+if [ -r "$ROOT/lib/temp.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT/lib/temp.sh"
+else
+  echo "lib/temp.sh not found at $ROOT/lib"; exit 2
+fi
 
 # --- _valid_step: every documented alias must be accepted ---
 EXPECTED_KEYS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
@@ -96,12 +121,66 @@ else
   fail_t "_tmpfile: returns unique writable paths" "F1=$F1 F2=$F2"
 fi
 
-# Verify 0600 permissions (Linux and macOS differ in stat flags).
-PERMS=$(stat -c '%a' "$F1" 2>/dev/null || stat -f '%Lp' "$F1" 2>/dev/null)
-if [ "$PERMS" = "600" ]; then
-  ok_t "_tmpfile: file is 0600 (owner-only)"
+# Verify 0600 permissions. Skip on platforms where chmod is a no-op
+# (e.g. Git Bash on Windows: /tmp maps to a Windows temp directory and
+# Cygwin's chmod is best-effort). mktemp on real Linux defaults to 0600.
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) printf '  -- %s\n' "_tmpfile 0600: skipped on Windows mktemp" ;;
+  *)
+    PERMS=$(stat -c '%a' "$F1" 2>/dev/null || stat -f '%Lp' "$F1" 2>/dev/null)
+    if [ "$PERMS" = "600" ]; then
+      ok_t "_tmpfile: file is 0600 (owner-only)"
+    else
+      fail_t "_tmpfile: file is 0600" "got: $PERMS"
+    fi
+    ;;
+esac
+
+# --- DRY_RUN: run() must print DRY: and NOT execute the command ---
+# (run is defined in the sourced helpers above. Tests must not wrap run()
+# in $(...) because variables like _FAIL_COUNT set inside the subshell
+# are lost when the subshell exits.)
+DRY_RUN=1 _FAIL_COUNT=0
+out=""
+rc=0
+out=$(DRY_RUN=1 run echo "this should not run" 2>&1); rc=$?
+# When run() hits the DRY_RUN branch it prints "  DRY: <args>" and returns 0
+# without ever invoking the command. Compare against the full string the
+# script's `run` produces (note the 2-space indent from the source).
+if [ "$rc" -eq 0 ] && [ "$out" = "  DRY: echo this should not run" ]; then
+  ok_t "DRY_RUN=1: run prints DRY: prefix and returns 0"
 else
-  fail_t "_tmpfile: file is 0600" "got: $PERMS"
+  fail_t "DRY_RUN=1: run prints DRY: prefix and returns 0" "rc=$rc out='$out'"
+fi
+
+# DRY_RUN=0: run() executes the command and always returns 0 (non-strict).
+DRY_RUN=0 _FAIL_COUNT=0
+rc=0
+run true; rc=$?
+if [ "$rc" -eq 0 ] && [ "$_FAIL_COUNT" -eq 0 ]; then
+  ok_t "DRY_RUN=0: run executes true and returns 0"
+else
+  fail_t "DRY_RUN=0: run executes true and returns 0" "rc=$rc _FAIL_COUNT=$_FAIL_COUNT"
+fi
+
+# DRY_RUN=0 with a failing command: run() returns 0 (non-strict) but increments _FAIL_COUNT.
+DRY_RUN=0 STRICT_RUN=0 _FAIL_COUNT=0
+rc=0
+run false; rc=$?
+if [ "$rc" -eq 0 ] && [ "$_FAIL_COUNT" -eq 1 ]; then
+  ok_t "DRY_RUN=0: run(false) increments _FAIL_COUNT but returns 0"
+else
+  fail_t "DRY_RUN=0: run(false) increments _FAIL_COUNT but returns 0" "rc=$rc _FAIL_COUNT=$_FAIL_COUNT"
+fi
+
+# STRICT_RUN=1 with a failing command: run() returns the actual exit code.
+DRY_RUN=0 STRICT_RUN=1 _FAIL_COUNT=0
+rc=0
+run false; rc=$?
+if [ "$rc" -ne 0 ] && [ "$_FAIL_COUNT" -eq 1 ]; then
+  ok_t "STRICT_RUN=1: run(false) returns non-zero exit code"
+else
+  fail_t "STRICT_RUN=1: run(false) returns non-zero exit code" "rc=$rc _FAIL_COUNT=$_FAIL_COUNT"
 fi
 
 echo

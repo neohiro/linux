@@ -1,1 +1,1 @@
-pass 8 robustness: prompt_choice non-TTY warning now honors QUIET_PROMPTS=1 (matches prompt_yn parity). coloring: restore_ssh.sh and DeepClean.sh color gates now also disable on NO_COLOR=1 and TERM=dumb (matches linuxinstall.sh _c semantics) so the helper scripts no longer render literal ANSI escapes on Tailscale SSH or CI.
+proposal 1-3: lib/ module extraction, DRY_RUN regression tests, color/temp helpers

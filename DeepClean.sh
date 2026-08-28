@@ -6,6 +6,19 @@
 
 set -euo pipefail
 
+# Color constants and helpers sourced from lib/color.sh (falls back inline).
+# shellcheck disable=SC1091
+if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
+  source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
+fi
+
+# If lib/color.sh was sourced, emit GREEN/BLUE/YELLOW/CYAN/NC from USE_COLOR.
+if [ "$USE_COLOR" = "1" ]; then
+  GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+else
+  GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
+fi
+
 USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
 
 msg()  { echo "[*] $*"; }
@@ -188,25 +201,17 @@ ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
 ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
 ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
-  GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
-  CYAN='\033[0;36m'; NC='\033[0m'
-else
-  GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
-fi
-
-echo -e "\n${BLUE}=================================================================${NC}"
-echo -e "${GREEN}             DEEPCLEAN AND AUTO-PRUNE COMPLETE!                  ${NC}"
-echo -e "${BLUE}=================================================================${NC}\n"
+printf '\n%s\n' "$(_c '1;34m' '=================================================================')"
+printf '%s\n' "$(_c '1;32m' '             DEEPCLEAN AND AUTO-PRUNE COMPLETE!')"
+printf '%s\n\n' "$(_c '1;34m' '=================================================================')"
 
 if [ "$FREED_KB" -gt 1024000 ]; then
-    echo -e "Total Space Freed: ${GREEN}${FREED_GB} GB${NC} (${FREED_MB} MB)\n"
+    printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_GB} GB") ($(_c '1;37m' "${FREED_MB} MB"))"
 else
-    echo -e "Total Space Freed: ${GREEN}${FREED_MB} MB${NC}\n"
+    printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_MB} MB")"
 fi
 
-echo -e "Current Disk (${CYAN}${ROOT_FS}${NC}):"
-echo -e "  Total : ${BLUE}${ROOT_TOTAL}${NC}"
-echo -e "  Used  : ${BLUE}${ROOT_USED}${NC} (${ROOT_PERCENT})"
-echo -e "  Free  : ${GREEN}${ROOT_FREE}${NC}\n"
-echo -e "${BLUE}=================================================================${NC}\n"
+printf 'Current Disk (%s):\n' "$(_c '1;36m' "$ROOT_FS")"
+printf '  Total : %s\n' "$(_c '1;34m' "$ROOT_TOTAL")"
+printf '  Used  : %s (%s)\n' "$(_c '1;34m' "$ROOT_USED")" "$ROOT_PERCENT"
+printf '  Free  : %s\n\n' "$(_c '1;32m' "$ROOT_FREE")"

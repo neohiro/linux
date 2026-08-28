@@ -16,12 +16,22 @@ set -eo pipefail
 PROG_NAME="restore_ssh"
 ROLLBACK_LOG="/var/log/linux-install-rollback.log"
 
-# --- minimal styling (no dependency on parent script) ---
-if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
-  C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
-  C_CYA=$'\033[1;36m'; C_BLD=$'\033[1;37m'; C_RST=$'\033[0m'
-else
-  C_RED=""; C_GRN=""; C_YEL=""; C_CYA=""; C_BLD=""; C_RST=""
+# Color constants sourced from lib/color.sh (falls back inline).
+# shellcheck disable=SC1091
+if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
+  source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
+fi
+
+# --- print helpers (format preserved from original restore_ssh.sh) ---
+# If lib/color.sh was sourced, C_* constants are already set by _c's output;
+# re-emit them so that print helpers produce the original "[ OK ]" format.
+if [ -z "${C_RED:-}" ]; then
+  if [ "$USE_COLOR" = "1" ]; then
+    C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
+    C_CYA=$'\033[1;36m'; C_BLD=$'\033[1;37m'; C_RST=$'\033[0m'
+  else
+    C_RED=""; C_GRN=""; C_YEL=""; C_CYA=""; C_BLD=""; C_RST=""
+  fi
 fi
 ok()    { printf '%s[ OK ]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
 warn()  { printf '%s[WARN]%s %s\n' "$C_YEL" "$C_RST" "$*" 1>&2; }
