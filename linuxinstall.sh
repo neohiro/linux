@@ -27,7 +27,9 @@ else
   # with lib/color.sh and lib/temp.sh.
   USE_COLOR=1
   if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then USE_COLOR=0; fi
+  # _c <ansi-code> <text>  -- wrap text in CSI escapes iff USE_COLOR=1.
   _c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+  # Print helpers. All accept a single message string. warn/err go to stderr.
   bold() { printf "%s\n" "$(_c '1m' "$*")"; }
   warn() { printf "%s %s\n" "$(_c '1;33m' '[WARNING]')" "$*" >&2; }
   err()  { printf "%s %s\n" "$(_c '1;31m' '[ERROR]')"   "$*" >&2; }
@@ -36,12 +38,27 @@ else
   msg()  { echo "=> $*"; }
   TMP_DIR="$(mktemp -d)"
   _TMP_FILES=()
-  # _log_error is not defined in the inline fallback (no NEOHIRO_DEBUG_LOG);
-  # run() calls it conditionally via declare -F so this is safe to omit.
+  # Debug log location. Override with NEOHIRO_DEBUG_LOG=path. /var/log may
+  # be unwritable in containers; fall back to TMP_DIR.
+  # The file is created with mode 0600 so command arguments (which may contain
+  # user-supplied values) are not readable by other users on the system.
+  if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
+    if [ -w /var/log ] 2>/dev/null; then
+      NEOHIRO_DEBUG_LOG="/var/log/neohiro-debug.log"
+    else
+      NEOHIRO_DEBUG_LOG="${TMP_DIR}/neohiro-debug.log"
+    fi
+  fi
+  # Create the log with owner-only permissions before any breadcrumb is written.
+  install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
   trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
+
+  # Public: create a tracked temp file. Returns the new path.
+  # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)
   _tmpfile() {
+    local prefix="${1:-neohiro}"
     local f
-    f=$(mktemp "${TMPDIR:-/tmp}/neohiro.XXXXXX")
+    f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
     _TMP_FILES+=("$f")
     printf '%s' "$f"
   }

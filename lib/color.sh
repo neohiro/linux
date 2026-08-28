@@ -28,13 +28,7 @@ if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then
 fi
 
 # _c <ansi-code> <text>  -- wrap text in CSI escapes iff USE_COLOR=1.
-_c() {
-  if [ "$USE_COLOR" = "1" ]; then
-    printf '\033[%sm%s\033[0m' "$1" "$2"
-  else
-    printf '%s' "$2"
-  fi
-}
+_c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 
 # Print helpers. All accept a single message string. warn/err go to stderr.
 bold() { printf "%s\n" "$(_c '1m' "$*")"; }

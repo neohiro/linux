@@ -13,6 +13,10 @@
 # Call _log_error from your script's failure path to write a breadcrumb
 # to NEOHIRO_DEBUG_LOG. The ERR trap is intentionally NOT installed here;
 # see _log_error for the rationale.
+#
+# SECURITY NOTE: NEOHIRO_DEBUG_LOG receives command-line arguments verbatim.
+# Avoid passing secrets (passwords, tokens) through run() -- they will be
+# written to this log. The log is created with mode 0600 (owner-only).
 
 # Guard against double-sourcing.
 [ -n "${__NEOHIRO_TEMP_SOURCED:-}" ] && return 0 2>/dev/null || true
@@ -23,6 +27,8 @@ _TMP_FILES=()
 
 # Debug log location. Override with NEOHIRO_DEBUG_LOG=path. /var/log may
 # be unwritable in containers; fall back to TMP_DIR.
+# The file is created with mode 0600 so command arguments (which may contain
+# user-supplied values) are not readable by other users on the system.
 if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
   if [ -w /var/log ] 2>/dev/null; then
     NEOHIRO_DEBUG_LOG="/var/log/neohiro-debug.log"
@@ -30,6 +36,8 @@ if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
     NEOHIRO_DEBUG_LOG="${TMP_DIR}/neohiro-debug.log"
   fi
 fi
+# Create the log with owner-only permissions before any breadcrumb is written.
+install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
 
 # Public: create a tracked temp file. Returns the new path.
 # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)
@@ -59,10 +67,5 @@ _log_error() {
   }
 }
 
-# Internal: full cleanup. Idempotent.
-_clean_temp() {
-  rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null
-}
-
 # Master trap: always clean up temp files on exit.
-trap '_clean_temp' EXIT
+trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
