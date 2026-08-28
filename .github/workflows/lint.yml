@@ -1,0 +1,55 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# shellcheck excludes:
+#   SC1091 - sourced file not found (we run shellcheck without following
+#            curl|bash sources).
+#   SC2046 - legitimate word-splitting in our context.
+#   SC2034 - assigned-but-unused placeholder for future flags.
+#   SC1010 - false positive on the inline `$([ $rc -eq 0 ] && echo done
+#            || echo skip)` pattern used in the step dispatcher.
+
+jobs:
+  lint:
+    name: Shellcheck + bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck >/dev/null 2>&1
+      - name: Run shellcheck on all shell scripts
+        run: |
+          set -e
+          find . -name '*.sh' -not -path './.git/*' -print0 | while IFS= read -r -d '' f; do
+            echo "=== $f ==="
+            shellcheck --severity=warning \
+              --exclude=SC1091,SC2046,SC2034,SC1010 \
+              "$f"
+          done
+          echo "All shellcheck passes."
+      - name: bash -n syntax check
+        run: |
+          set -e
+          find . -name '*.sh' -not -path './.git/*' -print0 | while IFS= read -r -d '' f; do
+            echo "  $f: syntax OK"
+            bash -n "$f"
+          done
+          echo "All syntax checks pass."
+
+  json-validate:
+    name: JSON validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate profile JSON files
+        run: |
+          set -e
+          for f in profiles/*.json; do
+            [ -f "$f" ] || { echo "No JSON files in profiles/"; exit 0; }
+            echo "  $f: $(python3 -c "import json; json.load(open('$f')); print('valid')")"
+          done

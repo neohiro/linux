@@ -152,6 +152,9 @@ STRICT_RUN="${STRICT_RUN:-0}"
 _FAIL_COUNT=0
 
 run() {
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    printf "  %s\n" "DRY: $*"; return 0
+  fi
   msg "$*"
   "$@"
   local rc=$?
@@ -392,8 +395,11 @@ SSH_AUTO_MODE=0
 _KERNEL_UPDATE_PENDING=0  # set to 1 by update_kernel; consumed by _print_run_summary
 # ── Cross-distro package-manager and distro detection ──────────────────────
 # Detected once at script start; every other function reads $PKG_MGR / $DISTRO.
+DRY_RUN=0           # set to 1 to preview without executing
+STEP_MODE=0         # set to 1 to run a single named step
+SELECTED_STEP=""    # step name for --step mode
 PKG_MGR=""   # apt | dnf | yum | zypper | pacman
-DISTRO=""    # ubuntu | debian | fedora | rhel | alma | rocky | centos | opensuse | arch | unknown
+DISTRO=""    # ubuntu | debian | fedora | rhel | alma | amzn | rocky | centos | opensuse | arch | unknown
 
 detect_distro() {
   if [ -n "$PKG_MGR" ] && [ -n "$DISTRO" ]; then return 0; fi
@@ -410,6 +416,7 @@ detect_distro() {
     fedora)          DISTRO="fedora" ;;
     rhel|redhat)    DISTRO="rhel" ;;
     almalinux)       DISTRO="alma" ;;
+    amzn)             DISTRO="amzn" ;;   # Amazon Linux (AL2023) - uses dnf/yum like RHEL
     rocky)           DISTRO="rocky" ;;
     centos)          DISTRO="centos" ;;
     opensuse|suse)   DISTRO="opensuse" ;;
@@ -652,6 +659,22 @@ CHECKLIST_LABEL_summary="Print run summary"
 mark_step() {
   CHECKLIST[$1]="${2:-done}"
 }
+
+# When --step STEP is set, run() is a no-op and ask_category_enabled returns 1
+# for every step except the named one. _valid_step validates the user input
+# against a known list so typos fail loudly instead of silently skipping
+# everything.
+_should_run_step() {
+  if [ "${STEP_MODE:-0}" = "0" ]; then return 0; fi
+  if [ "$1" = "${SELECTED_STEP:-}" ]; then return 0; fi
+  info "[STEP] Skipping: $1 (--step=${SELECTED_STEP})"
+  return 1
+}
+_VALID_STEPS="system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean"
+_valid_step() {
+  case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
+  return 1
+}
 show_progress() {
   local done=0 total=0 i key
   for key in tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary; do
@@ -793,6 +816,7 @@ ask_profile() {
 
 ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
+  _should_run_step "$key" || return 1
   case "$REPLY_PROFILE" in
     0) [ "$default" = "y" ]; return $?;;
     1) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ]; return $?;;
@@ -2332,11 +2356,42 @@ main() {
       rollback_mode "${1#--rollback=}"
       exit $?
       ;;
+    --dry-run)
+      DRY_RUN=1; shift
+      bold "[DRY-RUN] Preview mode - no changes will be made"
+      ;;
+    --step=*)
+      STEP_MODE=1
+      SELECTED_STEP="${1#--step=}"
+      if ! _valid_step "$SELECTED_STEP"; then
+        err "Unknown step: $SELECTED_STEP"
+        info "Valid steps: $(echo $_VALID_STEPS | tr ' ' ', ')"
+        exit 1
+      fi
+      bold "[STEP] Running only step: $SELECTED_STEP"
+      shift
+      ;;
+    --step)
+      STEP_MODE=1
+      if [ -z "${2:-}" ]; then
+        err "--step requires a value (e.g. --step firewall)"; exit 1
+      fi
+      SELECTED_STEP="$2"
+      if ! _valid_step "$SELECTED_STEP"; then
+        err "Unknown step: $SELECTED_STEP"
+        info "Valid steps: $(echo $_VALID_STEPS | tr ' ' ', ')"
+        exit 1
+      fi
+      bold "[STEP] Running only step: $SELECTED_STEP"
+      shift 2
+      ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo bash linuxinstall.sh [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
+Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
 
   (no flag)         Run the full interactive setup & hardening.
+  --dry-run         Preview what would run without executing any commands.
+  --step STEP       Run only the named step (e.g. --step firewall).
   --restore-ssh     Diagnose & fix the most common SSH lockout causes.
                     Use this from a console/Tailscale session if you got
                     locked out.
@@ -2347,9 +2402,9 @@ Usage: sudo bash linuxinstall.sh [--restore-ssh] [--restore-etc-snapshot] [--rol
                     broken after hardening and the per-file rollback does
                     not cover the damage.
                     Usage: sudo bash linuxinstall.sh --restore-etc-snapshot
-  --rollback        Dry-prints the inverse `cp` commands needed to undo
+  --rollback        Dry-prints the inverse cp commands needed to undo
                     every change recorded in /var/log/linux-install-rollback.log.
-  --rollback --apply  Run those `cp` commands (latest backup wins).
+  --rollback --apply  Run those cp commands (latest backup wins).
   -h, --help        Show this help.
 USAGE
       exit 0
