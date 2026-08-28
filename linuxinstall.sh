@@ -53,11 +53,17 @@ record_backup() {
 }
 
 print_recovery_cmd() {
-  printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
-  printf "\033[1;33m│  RECOVERY COMMAND — copy this BEFORE anything that might disconnect:  \033[0m\n"
-  printf "\033[1;33m│\033[0m                                                                      \033[1;36m%s\033[0m\n" "$RECOVERY_CMD"
-  printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
-  printf "%s\n\n" "  After reconnecting over SSH, run the command above to resume the run."
+  _c '1;33m' "----------------------------------------------------------------------"
+  printf '\n'
+  _c '1;33m' "|  RECOVERY COMMAND -- copy this BEFORE anything that might disconnect:"
+  printf '\n'
+  _c '1;33m' '|'
+  printf '                                                                      '
+  _c '1;36m' "$RECOVERY_CMD"
+  printf '\n'
+  _c '1;33m' "----------------------------------------------------------------------"
+  printf '\n'
+  printf "  After reconnecting over SSH, run the command above to resume the run.\n\n"
 }
 
 _warn_if_not_tmux() {
@@ -114,13 +120,30 @@ INNER_EOF
     "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
 }
 
-bold() { printf "\033[1m%s\033[0m\n" "$*"; }
-warn() { printf "\033[1;33m[WARNING]\033[0m %s\n" "$*"; }
-err()  { printf "\033[1;31m[ERROR]\033[0m %s\n" "$*"; }
-ok()   { printf "\033[1;32m[OK]\033[0m %s\n" "$*"; }
+bold() { printf "%s\n" "$(_c '1m' "$*")"; }
+warn() { printf "%s %s\n" "$(_c '1;33m' '[WARNING]')" "$*"; }
+err()  { printf "%s %s\n" "$(_c '1;31m' '[ERROR]')"   "$*"; }
+ok()   { printf "%s %s\n" "$(_c '1;32m' '[OK]')"      "$*"; }
 info() { printf "  %s\n" "$*"; }
 
 msg() { echo "=> $*"; }
+
+# --- color gating: only emit ANSI when the terminal actually supports it ---
+# Tailscale SSH and many remote PTYs report TERM=dumb, which renders
+# CSI escapes as literal garbage. NO_COLOR is the XDG standard.
+_USE_COLOR=1
+case "${TERM:-}" in
+  dumb|"") _USE_COLOR=0 ;;
+esac
+[ -n "${NO_COLOR:-}" ] && _USE_COLOR=0
+# _c <color> <text> -- wrap in ANSI only if supported, else print plain.
+_c() {
+  if [ "$_USE_COLOR" = "1" ]; then
+    printf '\033[%sm%s\033[0m' "$1" "$2"
+  else
+    printf '%s' "$2"
+  fi
+}
 
 # STRICT_RUN=1 makes run() propagate the actual exit code (default is 0,
 # so a single failed command does not abort the whole interactive run).
@@ -164,7 +187,8 @@ _restore_etc_snapshot() {
   local size
   size=$(sudo du -h "$latest" 2>/dev/null | awk '{print $1}')
   info "Size: ${size:-unknown}"
-  printf "\033[1;31m  WARNING: This will OVERWRITE /etc with the snapshot contents.\033[0m\n"
+  _c '1;31m' "  WARNING: This will OVERWRITE /etc with the snapshot contents."
+  printf '\n'
   printf "  Any hardening changes made since the snapshot was taken will be lost.\n"
   printf "  DNS, SSH, firewall, and all other settings will be restored.\n\n"
   if ! prompt_yn "Restore /etc from $latest?" "n"; then
@@ -512,8 +536,17 @@ fw_allow() {
 fw_default_incoming_deny() {
   _fw_detect || return 0
   case "$FW_CMD" in
-    ufw)          run sudo ufw default deny incoming ;;
-    firewall-cmd) : ;;
+    ufw)
+      run sudo ufw default deny incoming
+      run sudo ufw default allow outgoing
+      ;;
+    firewall-cmd)
+      local zone
+      zone=$(sudo firewall-cmd --get-default-zone 2>/dev/null || echo public)
+      run sudo firewall-cmd --zone="$zone" --add-service=ssh --permanent
+      run sudo firewall-cmd --zone="$zone" --add-service=dhcpv6-client --permanent
+      run sudo firewall-cmd --set-default-zone=drop
+      ;;
   esac
 }
 
@@ -559,11 +592,7 @@ metrics_add() {
 # --- dynamic progress checklist (printed before each step) ---
 # Order matches the call order in main(). Status: pending | running | done | skip
 # UTF-8 detection: use box-drawing chars on UTF-8 terminals, ASCII fallback otherwise.
-_BAR_Filled='█'; _BAR_Empty='░'
-case "${LC_ALL:-${LANG:-}}" in
-  *UTF-8*|*utf8*|*UTF8*) ;;
-  *) _BAR_Filled='#'; _BAR_Empty='-' ;;
-esac
+_BAR_Filled='#'; _BAR_Empty='-'
 declare -A CHECKLIST=(
   [tmux_wrap]=pending
   [env_detect]=pending
@@ -621,19 +650,24 @@ show_progress() {
   local bar_filled bar_empty
   bar_filled="$(printf '%*s' "$filled" '' | tr ' ' "$_BAR_Filled")"
   bar_empty="$(printf '%*s' "$empty" '' | tr ' ' "$_BAR_Empty")"
-  printf '\n\033[1;36m━━━ PROGRESS \033[1;32m%s\033[1;36m%s\033[0m \033[1;37m%d/%d (%d%%)\033[0m ━━━\n' \
-    "$bar_filled" "$bar_empty" "$done" "$total" "$pct"
+  printf '\n'
+  _c '1;36m' "=== PROGRESS "
+  _c '1;32m' "$bar_filled"
+  _c '1;30m' "$bar_empty"
+  printf ' %d/%d (%d%%) ===\n' "$done" "$total" "$pct"
   for key in tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary; do
     local status="${CHECKLIST[$key]:-pending}"
     local icon color
     case "$status" in
-      done)    icon='✔'; color='\033[1;32m' ;;
-      running) icon='▶'; color='\033[1;33m' ;;
-      skip)    icon='⊘'; color='\033[1;30m' ;;
-      *)       icon='○'; color='\033[1;30m' ;;
+      done)    icon='[x]'; color='1;32m' ;;
+      running) icon='[>]'; color='1;33m' ;;
+      skip)    icon='[ ]'; color='1;30m' ;;
+      *)       icon='[ ]'; color='1;30m' ;;
     esac
     local label_var="CHECKLIST_LABEL_${key}"
-    printf '  %s%s\033[0m  %s\n' "$color" "$icon" "${!label_var}"
+    printf '  '
+    _c "$color" "$icon "
+    printf '%s\n' "${!label_var}"
   done
   printf '\n'
 }
@@ -647,7 +681,7 @@ _metrics_bar() {
   local bar empty_str
   bar="$(printf '%*s' "$filled" '' | tr ' ' "$_BAR_Filled")"
   empty_str="$(printf '%*s' "$empty" '' | tr ' ' "$_BAR_Empty")"
-  printf '  %-28s \033[1;32m%s\033[0m\033[1;30m%s\033[0m  %d\n' "$label" "$bar" "$empty_str" "$value"
+  printf '  %-28s %s%s  %d\n' "$label" "$(_c '1;32m' "$bar")" "$(_c '1;30m' "$empty_str")" "$value"
 }
 
 print_metrics_summary() {
@@ -666,42 +700,42 @@ print_metrics_summary() {
     [ "$v" -gt "$max_val" ] 2>/dev/null && max_val="$v"
   done
 
-  printf '\n\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-  printf '\033[1;36m  RUN SUMMARY  \033[0m'
-  [ "$USE_REMOTE_SSH" = "yes" ] && printf ' \033[1;33m[SSH HARDENED]\033[0m'
-  [ "$ENV_TYPE" = "server" ]  && printf ' \033[1;35m[SERVER MODE]\033[0m'
-  printf '\n'
-  printf '\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
-  printf '\n'
-  printf '  \033[1;37mPACKAGES\033[0m\n'
+  local _hr
+  _hr="$(printf '=%.0s' {1..69})"
+  printf '\n%s\n' "$_hr"
+  printf '  %s' "$(_c '1;36m' 'RUN SUMMARY')"
+  [ "$USE_REMOTE_SSH" = "yes" ] && printf ' %s' "$(_c '1;33m' '[SSH HARDENED]')"
+  [ "$ENV_TYPE" = "server" ]  && printf ' %s' "$(_c '1;35m' '[SERVER MODE]')"
+  printf '\n%s\n\n' "$_hr"
+  printf '  %s\n' "$(_c '1;37m' 'PACKAGES')"
   _metrics_bar "  Packages upgraded"   "${METRICS[pkgs_upgraded]}"   "$max_val"
   _metrics_bar "  Packages installed"  "${METRICS[pkgs_installed]}"  "$max_val"
   printf '\n'
-  printf '  \033[1;37mSECURITY\033[0m\n'
+  printf '  %s\n' "$(_c '1;37m' 'SECURITY')"
   _metrics_bar "  Services hardened"  "${METRICS[services_hardened]}" "$max_val"
   _metrics_bar "  Services stopped"   "${METRICS[services_stopped]}"  "$max_val"
   _metrics_bar "  sysctls applied"     "${METRICS[sysctls_applied]}"  "$max_val"
   _metrics_bar "  Firewall rules added" "${METRICS[fw_rules_added]}" "$max_val"
   printf '\n'
-  printf '  \033[1;37mSSH & AUTHENTICATION\033[0m\n'
+  printf '  %s\n' "$(_c '1;37m' 'SSH & AUTHENTICATION')"
   _metrics_bar "  Auth keys added"     "${METRICS[auth_keys_added]}"   "$max_val"
   printf '\n'
-  printf '  \033[1;37mTOR\033[0m\n'
+  printf '  %s\n' "$(_c '1;37m' 'TOR')"
   _metrics_bar "  Tor services enabled" "${METRICS[tor_services_enabled]}" "$max_val"
   printf '\n'
-  printf '  \033[1;37mBACKUPS & ROLLBACK\033[0m\n'
+  printf '  %s\n' "$(_c '1;37m' 'BACKUPS & ROLLBACK')"
   _metrics_bar "  Config files backed up" "${METRICS[configs_backed_up]}" "$max_val"
   _metrics_bar "  Rollback entries logged" "${METRICS[rollback_logged]}" "$max_val"
   printf '\n'
-  printf '  \033[1;37mSTORAGE\033[0m\n'
+  printf '  %s\n' "$(_c '1;37m' 'STORAGE')"
   printf '  %-28s %s\n' "  Disk freed (approximate)" "$disk_freed_str"
   printf '\n'
   if [ "${METRICS[configs_backed_up]}" -gt 0 ]; then
-    printf '  \033[1;33m⚠ Rollback log:\033[0m %s\n' "$ROLLBACK_LOG"
-    printf '  \033[1;30m  Format: original_path    backup_path\033[0m\n'
-    printf '  \033[1;30m  To restore: sudo cp backup_path original_path\033[0m\n'
+    printf '  %s %s\n' "$(_c '1;33m' '[!] Rollback log:')" "$ROLLBACK_LOG"
+    printf '  %s\n' "$(_c '1;30m' '  Format: original_path<TAB>backup_path')"
+    printf '  %s\n' "$(_c '1;30m' '  To restore: sudo cp backup_path original_path')"
   fi
-  printf '\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m\n'
+  printf '%s\n' "$_hr"
 }
 
 detect_or_ask_env() {
@@ -1139,7 +1173,6 @@ setup_firewall() {
   esac
   _fw_detect
   fw_default_incoming_deny
-  [ "$PKG_MGR" = "apt" ] && run sudo ufw default allow outgoing
   if [ "$USE_REMOTE_SSH" = "yes" ] || [ "$ENV_TYPE" = "server" ]; then
     warn "Allowing SSH (22) -- required for remote access."
     fw_allow "22/tcp"
@@ -1600,7 +1633,9 @@ setup_authorized_keys_with_validation() {
     if ! sudo -u "$target_user" ssh-keygen -t ed25519 -N "" -f "$recovery_key" -C "linux-install-recovery@$(hostname)" 2>/dev/null; then
       err "Could not generate recovery key."
     else
-      printf "\n\033[1;33m[!] EMERGENCY RECOVERY KEY\033[0m (printed in case you get locked out):\n"
+      printf '\n'
+  _c '1;33m' '[!] EMERGENCY RECOVERY KEY (printed in case you get locked out):'
+  printf '\n'
       printf "  Path on server: %s\n" "$recovery_key"
       printf "  Copy it to your laptop now:  scp %s@%s:%s ~/\n" "$target_user" "$(hostname)" "$recovery_key"
       printf "  Then 'ssh-add ~/id_ed25519_recovery' before disconnecting.\n"
@@ -1614,10 +1649,16 @@ setup_authorized_keys_with_validation() {
     sudo -u "$target_user" tee -a "$target_ak" >/dev/null < "$recovery_key.pub"
   fi
 
-  printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
-  printf "\033[1;33m│  PASTE YOUR LAPTOP'S PUBLIC SSH KEY BELOW.\033[0m\n"
-  printf "\033[1;33m│  Format: ssh-ed25519 AAAA... user@host  OR  ssh-rsa AAAA... user@host\033[0m\n"
-  printf "\033[1;33m│  Press Enter on an empty line when done, or type 'skip' to abort.\033[0m\n"
+  _c '1;33m' "----------------------------------------------------------------------"
+  printf '\n'
+  _c '1;33m' "|  PASTE YOUR LAPTOP'S PUBLIC SSH KEY BELOW."
+  printf '\n'
+  _c '1;33m' "|  Format: ssh-ed25519 AAAA... user@host  OR  ssh-rsa AAAA... user@host"
+  printf '\n'
+  _c '1;33m' "|  Press Enter on an empty line when done, or type 'skip' to abort."
+  printf '\n'
+  _c '1;33m' "----------------------------------------------------------------------"
+  printf ''
   printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m"
   printf "> "
 
@@ -1707,8 +1748,10 @@ harden_ssh() {
 
   if [ "$interactive" = "1" ] && prompt_yn "Change SSH port from 22 to 2222?" "n"; then
     _warn_if_not_tmux
-    printf "\033[1;31m[!] SSH port change — losing connection?\033[0m  Reconnect with:\n"
-    printf "  \033[1;36mssh -p 2222 %s@%s\033[0m\n" "$USER" "$(hostname -I 2>/dev/null | awk '{print $1}')"
+  _c '1;33m' "[!] SSH port change -- losing connection?"
+  printf '  Reconnect with:\n'
+  _c '1;36m' "  ssh -p 2222 $USER@$(hostname -I 2>/dev/null | awk '{print $1}')"
+  printf '\n'
     read -r -p "Press Enter to continue, or Ctrl-C to abort... " _
     _set_or_append_sshd_config "Port" "2222" "$SSHCFG"
     run sudo ufw allow 2222/tcp
@@ -1773,10 +1816,14 @@ _ssh_disable_password_auth() {
       _set_or_append_sshd_config "PasswordAuthentication" "no" "$cfg"
       metrics_add services_hardened 1
     else
-      printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
-      printf "\033[1;33m│  Confirm your pubkey is one of the $ak_count listed above.         \033[0m\n"
-      printf "\033[1;33m│  If you are NOT sure, type 'no' to keep password auth enabled.     \033[0m\n"
-      printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
+      _c '1;33m' "----------------------------------------------------------------------"
+      printf '\n'
+      _c '1;33m' "|  Confirm your pubkey is one of the $ak_count listed above."
+      printf '\n'
+      _c '1;33m' "|  If you are NOT sure, type 'no' to keep password auth enabled."
+      printf '\n'
+      _c '1;33m' "----------------------------------------------------------------------"
+      printf '\n'
       if ! prompt_yn "Disable PasswordAuthentication? (type 'yes' to confirm)" "no"; then
         warn "Leaving PasswordAuthentication unchanged."; return 1
       fi
@@ -2356,8 +2403,8 @@ _print_run_summary() {
   mark_step summary "done"
   show_progress
   if [ -n "$_ETC_SNAPSHOT_PATH" ]; then
-    printf '\n  \033[1;36m━━━ /etc SNAPSHOT\033[0m\n'
-    printf '  Full /etc snapshot: \033[1;37m%s\033[0m\n' "$_ETC_SNAPSHOT_PATH"
+    printf '\n  %s\n' "$(_c '1;36m' '== /etc SNAPSHOT')"
+    printf '  Full /etc snapshot: %s\n' "$(_c '1;37m' "$_ETC_SNAPSHOT_PATH")"
     printf '  Restore whole /etc:  sudo bash %q --restore-etc-snapshot\n' "$SCRIPT_PATH"
   fi
   # If update_kernel staged a new image, offer a reboot once we are
@@ -2369,13 +2416,13 @@ _print_run_summary() {
     printf '  Currently running: \033[1;37m%s\033[0m\n' "$(uname -r)"
     local _boot_kernel
     _boot_kernel="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -n1)"
-    printf '  Highest installed: \033[1;37m%s\033[0m\n' "${_boot_kernel:-unknown}"
+    printf '  Highest installed: %s\n' "$(_c '1;37m' "${_boot_kernel:-unknown}")"
     if [ -t 0 ] && prompt_yn "Reboot now to activate the new kernel?" "n"; then
       warn "Rebooting in 5 seconds — Ctrl-C to cancel."
       sleep 5
       run sudo systemctl reboot
     else
-      info "Skipped reboot. Run \033[1;36msudo systemctl reboot\033[0m when ready."
+      info "Skipped reboot. Run $(_c '1;36m' 'sudo systemctl reboot') when ready."
     fi
   fi
   if [ "$_FAIL_COUNT" -gt 0 ]; then
