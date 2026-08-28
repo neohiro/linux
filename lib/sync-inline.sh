@@ -32,11 +32,13 @@ for script in linuxinstall.sh restore_ssh.sh DeepClean.sh OptimizeLinuxASR.sh; d
   if [ -n "$c_start" ] && [ -n "$c_end" ] && [ "$c_end" -gt "$c_start" ]; then
     inline=$(sed -n "${c_start},${c_end}p" "$script")
     # Canonical lib body: every non-blank, non-comment line from the _c()
-    # function through the msg() function in lib/color.sh.
+    # function to the last line of lib/color.sh (msg is the final function).
+    # Stop at the msg() single-line function (e.g. "msg()  { echo ... }") so
+    # awk exits as soon as it hits the closing "}" of that line.
     canonical=$(awk '
       /^_c\(\) /{p=1}
-      p && /^msg\(\) \{$/{p=0; exit}
       p && !/^#/ && !/^[[:space:]]*$/ {print}
+      p && /^msg\(\)  \{ .* \}$/{p=0; exit}
     ' "$LIB/color.sh")
     while IFS= read -r line; do
       [ -n "$line" ] || continue

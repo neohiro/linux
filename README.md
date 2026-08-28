@@ -15,7 +15,8 @@ Offers a more secure starting point for any new super user.
 |--------------|---------------------------------------------------|----------------|-------------|-------|
 | Debian       | Ubuntu (incl. 24.04 LTS, 22.04, 20.04), Debian 12/11 | `apt`      | `ufw`       | full feature set (unattended-upgrades, AppArmor) |
 | RHEL         | RHEL 8/9, AlmaLinux 8/9, Rocky 8/9, CentOS Stream | `dnf`    | `firewalld` | AppArmor replaced by SELinux |
-| Legacy RHEL  | CentOS 7, RHEL 7, Amazon Linux 2023              | `yum` / `dnf` | `firewalld` | CentOS 7 / RHEL 7 use `yum`; Amazon Linux 2023 uses `dnf` |
+| Legacy RHEL  | CentOS 7, RHEL 7                                  | `yum`          | `firewalld` | legacy; no `dnf` |
+| Amazon Linux | Amazon Linux 2023                                 | `dnf`          | `firewalld` | RHEL-compatible; SELinux enforcing by default |
 | Fedora       | Fedora 39+                                       | `dnf`          | `firewalld` | AppArmor not on by default — uses SELinux |
 | SUSE         | openSUSE Leap 15, SLES 15                       | `zypper`       | `firewalld` | AppArmor profile packages available |
 | Arch         | Arch Linux, Manjaro                              | `pacman`       | `firewalld` | AppArmor / fail2ban via AUR |
