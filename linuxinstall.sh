@@ -12,7 +12,18 @@ REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/
 TMP_DIR="$(mktemp -d)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 ORIG_CWD="$(pwd)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+# _TMP_FILES tracks any per-function temp files so we can clean them on
+# exit, even if the user hits Ctrl+C mid-step.
+_TMP_FILES=()
+trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
+# Track a temp file so it is removed on exit.  Use this instead of bare
+# `mktemp` for any temp file that holds sensitive content (e.g. GPG output).
+_tmpfile() {
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/linuxinstall.XXXXXX")
+  _TMP_FILES+=("$f")
+  printf '%s' "$f"
+}
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
 ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
@@ -354,7 +365,7 @@ _verify_remote_gpg_signature() {
   # Verify with the system pubring. If the signer's key is not in the
   # pubring, gpg still validates the cryptographic signature but warns
   # about the unknown key. We capture all output to report it.
-  gpg_out=$(mktemp)
+  gpg_out=$(_tmpfile)
   rc=0
   gpg --batch --verify "$url_dst" "$script" >"$gpg_out" 2>&1 || rc=$?
   if [ $rc -ne 0 ] && ! grep -qi 'gpg: no signer information' "$gpg_out" 2>/dev/null; then
@@ -670,7 +681,11 @@ _should_run_step() {
   info "[STEP] Skipping: $1 (--step=${SELECTED_STEP})"
   return 1
 }
-_VALID_STEPS="system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean"
+# Valid step keys for --step.  These MUST match the keys passed to
+# ask_category_enabled() in main(), otherwise --step will be rejected as
+# "unknown" even for legitimate steps.  Aliases (e.g. system_update,
+# ssh_hardening) are accepted alongside the short keys for convenience.
+_VALID_STEPS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
 _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
