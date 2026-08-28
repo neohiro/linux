@@ -1507,7 +1507,7 @@ _set_or_append_sshd_config() {
 }
 
 backup_and_report_authorized_keys() {
-  local bakdir="/var/backups/ubuntu-install-ssh"
+  local bakdir="/var/backups/linux-install-ssh"
   run sudo mkdir -p "$bakdir"
   local f count
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
@@ -1566,7 +1566,7 @@ setup_authorized_keys_with_validation() {
   # sudo -u so the file lookup matches the owner.
   if ! sudo -u "$target_user" test -f "$recovery_key"; then
     info "Generating a server-side recovery key (ed25519) at $recovery_key"
-    if ! sudo -u "$target_user" ssh-keygen -t ed25519 -N "" -f "$recovery_key" -C "ubuntu-install-recovery@$(hostname)" 2>/dev/null; then
+    if ! sudo -u "$target_user" ssh-keygen -t ed25519 -N "" -f "$recovery_key" -C "linux-install-recovery@$(hostname)" 2>/dev/null; then
       err "Could not generate recovery key."
     else
       printf "\n\033[1;33m[!] EMERGENCY RECOVERY KEY\033[0m (printed in case you get locked out):\n"
