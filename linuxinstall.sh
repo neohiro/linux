@@ -803,7 +803,9 @@ _firewall_allows() {
 # already permits, or rule added); returns 1 if the user declined and
 # the listener stays unreachable.
 _ensure_firewall_open() {
-  local spec="$1" desc="${2:-service on $spec}" is_ssh=0
+  local spec="$1"
+  local desc="${2:-service on $spec}"
+  local is_ssh=0
   case "$spec" in 22|22/tcp|22/udp|ssh) is_ssh=1 ;; esac
   if ! _is_listening "$spec"; then
     return 0   # nothing listening -> nothing to lock out
