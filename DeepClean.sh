@@ -13,7 +13,7 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
 fi
 
 # If lib/color.sh was sourced, emit GREEN/BLUE/YELLOW/CYAN/NC from USE_COLOR.
-if [ "$USE_COLOR" = "1" ]; then
+if [ "${USE_COLOR:-0}" = "1" ]; then
   GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 else
   GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""

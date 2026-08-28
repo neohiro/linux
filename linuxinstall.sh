@@ -36,10 +36,8 @@ else
   msg()  { echo "=> $*"; }
   TMP_DIR="$(mktemp -d)"
   _TMP_FILES=()
-  if [ "${STRICT_RUN:-0}" = "1" ] || [ -n "${CI:-}" ]; then
-    _log_error() { :; }
-    trap '_log_error $?; rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' ERR
-  fi
+  # _log_error is not defined in the inline fallback (no NEOHIRO_DEBUG_LOG);
+  # run() calls it conditionally via declare -F so this is safe to omit.
   trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
   _tmpfile() {
     local f
@@ -174,6 +172,7 @@ run() {
   if [ $rc -ne 0 ]; then
     err "Command failed (exit $rc): $*"
     _FAIL_COUNT=$((_FAIL_COUNT + 1))
+    if declare -F _log_error >/dev/null 2>&1; then _log_error "$rc"; fi
   fi
   if [ "$STRICT_RUN" = "1" ]; then
     return $rc

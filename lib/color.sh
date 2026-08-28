@@ -17,10 +17,9 @@
 #   3. TERM != dumb              (Tailscale SSH, screen capture, etc.)
 # Any failure -> USE_COLOR=0 -> plain text only.
 
-# Guard against double-sourcing.
-if [ -n "${__NEOHIRO_COLOR_SOURCED:-}" ]; then
-  return 0 2>/dev/null || true
-fi
+# Guard against double-sourcing. Bail out silently so a script can
+# safely `source lib/color.sh` more than once.
+[ -n "${__NEOHIRO_COLOR_SOURCED:-}" ] && return 0 2>/dev/null || true
 __NEOHIRO_COLOR_SOURCED=1
 
 USE_COLOR=1
