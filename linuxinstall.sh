@@ -327,9 +327,9 @@ _prompt_failure_recovery() {
   fi
   printf '\n  %s %s\n' "$(_c '1;31m' '[FAIL]')" "Step '$step_label' exited with code $rc."
   printf '  %s\n' "$(_c '1;37m' 'What do you want to do?')"
-  printf '  %s  %s\n' "$(_c '1;32m' '  1)') "Retry this step"
-  printf '  %s  %s\n' "$(_c '1;33m' '  2)') "Skip this step and continue"
-  printf '  %s  %s\n' "$(_c '1;31m' '  3)') "Abort the entire run"
+  printf '  %s  %s\n' "$(_c '1;32m' '  1)')" "Retry this step"
+  printf '  %s  %s\n' "$(_c '1;33m' '  2)')" "Skip this step and continue"
+  printf '  %s  %s\n' "$(_c '1;31m' '  3)')" "Abort the entire run"
   local a
   if [ -t 0 ]; then
     read -r -p "Choose 1 to 3 - default 2 skips: " a
