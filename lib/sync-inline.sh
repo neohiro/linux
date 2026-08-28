@@ -9,6 +9,15 @@
 #
 # Run from the repo root:  bash lib/sync-inline.sh
 # CI:                   exit 1 on any missing statement.
+#
+# DESIGN NOTE — temp.sh block:
+#   linuxinstall.sh inline: includes NEOHIRO_DEBUG_LOG, install -m 0600, _log_error,
+#   and the prefix-argument form of _tmpfile() because run() calls _log_error.
+#   ubuntuinstall.sh inline: intentionally omits all of the above — ubuntu's run()
+#   never calls _log_error (no debug log is written). Any temp.sh-side drift
+#   reported for ubuntuinstall.sh reflects this deliberate divergence and does
+#   not indicate a bug. Maintainers adding _log_error to ubuntu's run() must
+#   also add the missing lines to the inline block and update this note.
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 LIB="$(pwd)/lib"
@@ -22,16 +31,17 @@ for script in linuxinstall.sh restore_ssh.sh DeepClean.sh OptimizeLinuxASR.sh; d
   c_end=$(awk -v s="${c_start:-0}" 'NR>s && /^  TMP_DIR=/{print NR-1; exit}' "$script")
   if [ -n "$c_start" ] && [ -n "$c_end" ] && [ "$c_end" -gt "$c_start" ]; then
     inline=$(sed -n "${c_start},${c_end}p" "$script")
-    # Canonical lib body: every non-blank, non-comment line from _c() through msg()
+    # Canonical lib body: every non-blank, non-comment line from the _c()
+    # function through the msg() function in lib/color.sh.
     canonical=$(awk '
-      /^. _c\(\)/{p=1}
-      p && /^msg\(\)/{p=0; exit}
+      /^_c\(\) /{p=1}
+      p && /^msg\(\) \{$/{p=0; exit}
       p && !/^#/ && !/^[[:space:]]*$/ {print}
     ' "$LIB/color.sh")
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       if ! grep -qF "$line" <<< "$inline"; then
-        echo "DRIFT: $script missing: $line"
+        echo "DRIFT: $script color.sh block missing: $line"
         FAIL=1
       fi
     done <<< "$canonical"
@@ -47,14 +57,14 @@ for script in linuxinstall.sh restore_ssh.sh DeepClean.sh OptimizeLinuxASR.sh; d
     # Canonical lib body: every non-blank, non-comment line from
     # TMP_DIR="$(mktemp -d)" through the end of _tmpfile.
     canonical=$(awk '
-      /^.TMP_DIR="\$\(mktemp/{p=1}
-      p && /^.}$/ {p=0; exit}
+      /^TMP_DIR="\$\(mktemp/{p=1}
+      p && /^\}$/{p=0; exit}
       p && !/^#/ && !/^[[:space:]]*$/ {print}
     ' "$LIB/temp.sh")
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       if ! grep -qF "$line" <<< "$inline"; then
-        echo "DRIFT: $script missing: $line"
+        echo "DRIFT: $script temp.sh block missing: $line"
         FAIL=1
       fi
     done <<< "$canonical"
