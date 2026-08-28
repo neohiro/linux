@@ -437,6 +437,12 @@ sudo aide --check                                       # file integrity
 ss -tulnp                                               # re-check listeners
 ```
 
+## Additional helpers
+
+- **[Corrade.md](Corrade.md)** — Docker-based IR bot gateway (Docker required; works on all distros with `docker` installed).
+- **[DNSPROXY.md](DNSPROXY.md)** — AdGuard dnsproxy in Docker, with cross-distro firewall commands (UFW for apt, firewalld for dnf/yum/zypper/pacman).
+- **[SHADOWSOCKS-LIBEV.md](SHADOWSOCKS-LIBEV.md)** — Shadowsocks-libev SOCKS5 proxy, with cross-distro package names and firewall commands.
+
 ⭐ Stargaze to help others secure their Linux install
 
 🔗 [frenzypenguin.media](https://linktr.ee/frenzypenguin.media)
