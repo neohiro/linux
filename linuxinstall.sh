@@ -12,8 +12,9 @@ REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/
 TMP_DIR="$(mktemp -d)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 ORIG_CWD="$(pwd)"
-# _TMP_FILES tracks any per-function temp files so we can clean them on
-# exit, even if the user hits Ctrl+C mid-step.
+# _TMP_FILES is reserved for any future per-function temp files that need
+# guaranteed cleanup on exit (e.g. sensitive content). The EXIT trap
+# removes $TMP_DIR and any tracked files even if the user hits Ctrl+C.
 _TMP_FILES=()
 trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
 # Track a temp file so it is removed on exit.  Use this instead of bare
@@ -301,7 +302,9 @@ prompt_choice() {
     printf 'Choose [1-%d] (default 1): ' "${#opts[@]}" >/dev/tty
     read -r a </dev/tty
   else
-    warn "stdin is not a TTY and /dev/tty is unavailable; defaulting to 1 for: $q"
+    if [ "${QUIET_PROMPTS:-0}" != "1" ]; then
+      warn "stdin is not a TTY and /dev/tty is unavailable; defaulting to 1 for: $q"
+    fi
     a=1
   fi
   a="${a:-1}"

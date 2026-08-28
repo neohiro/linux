@@ -188,8 +188,12 @@ ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
 ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
 ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 
-GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; NC='\033[0m'
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+  GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'; NC='\033[0m'
+else
+  GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
+fi
 
 echo -e "\n${BLUE}=================================================================${NC}"
 echo -e "${GREEN}             DEEPCLEAN AND AUTO-PRUNE COMPLETE!                  ${NC}"

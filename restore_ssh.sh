@@ -17,7 +17,7 @@ PROG_NAME="restore_ssh"
 ROLLBACK_LOG="/var/log/linux-install-rollback.log"
 
 # --- minimal styling (no dependency on parent script) ---
-if [ -t 1 ]; then
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
   C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
   C_CYA=$'\033[1;36m'; C_BLD=$'\033[1;37m'; C_RST=$'\033[0m'
 else
