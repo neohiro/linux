@@ -15,7 +15,7 @@ ORIG_CWD="$(pwd)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
-ROLLBACK_LOG="/var/log/ubuntu-install-rollback.log"
+ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
 
 # Ensure the rollback log exists and is writable before any backup is recorded.
 # Creates it with 0600 mode (owner-only) to avoid leaking paths to other users.
@@ -57,7 +57,7 @@ print_recovery_cmd() {
   printf "\033[1;33m│  RECOVERY COMMAND — copy this BEFORE anything that might disconnect:  \033[0m\n"
   printf "\033[1;33m│\033[0m                                                                      \033[1;36m%s\033[0m\n" "$RECOVERY_CMD"
   printf "\033[1;33m──────────────────────────────────────────────────────────────────────\033[0m\n"
-  printf "  After reconnecting over SSH, run the command above to resume the run.\n\n"
+  printf "%s\n\n" "  After reconnecting over SSH, run the command above to resume the run."
 }
 
 _warn_if_not_tmux() {
@@ -161,7 +161,7 @@ _restore_etc_snapshot() {
   fi
   if sudo tar -xzf "$latest" -C / 2>&1; then
     ok "/etc restored from $latest"
-    info "You may need to: sudo systemctl restart ssh   (if SSH was changed)"
+    info "You may need to: sudo systemctl restart sshd   (if SSH was changed)"
     info "                  sudo systemctl restart systemd-resolved   (if DNS was changed)"
     info "                  sudo reboot   (to reload all services)"
   else
@@ -735,7 +735,7 @@ maintenance_menu() {
       "Password & lockout policy" \
       "OptimizeLinuxASR (attack-surface reduction)" \
       "DeepClean (cleanup + auto-prune)" \
-      "Other helpers (ubuntusocks / server extras)" \
+       "Other helpers (reserved for future cross-distro helpers)" \
       "Back to main menu"
     choice=$REPLY_CHOICE
     rc=0
@@ -753,7 +753,7 @@ maintenance_menu() {
      10) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
      11) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
      12) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     13) mark_step other_scripts "running";show_progress; ask_other_scripts|| rc=$?; mark_step other_scripts "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      13) info "No other helpers in the linux repo yet."; break;;
      14) info "Returning to main menu."; break;;
     esac
     if [ $rc -eq 0 ]; then
@@ -1710,7 +1710,9 @@ harden_ssh() {
   if [ "$interactive" = "1" ]; then
     _warn_if_not_tmux
   fi
-  run sudo systemctl restart ssh
+  local ssh_unit
+  ssh_unit=$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)
+  run sudo systemctl restart "$ssh_unit"
   ok "SSH hardened and restarted."
 }
 
@@ -1940,18 +1942,11 @@ run_deepclean() {
   run_remote_script "DeepClean.sh"
 }
 
-ask_other_scripts() {
-  msg "Other helpers in the repo (optional)"
-  if prompt_yn "Run ubuntusocks.sh (Shadowsocks-libev install)?" "n"; then
-    run_remote_script "ubuntusocks.sh"
-  fi
-  if [ "$ENV_TYPE" = "server" ] && prompt_yn "Also run linuxinstallserver.sh (server-specific extras)?" "n"; then
-    run_remote_script "linuxinstallserver.sh"
-  fi
-}
+# ask_other_scripts() removed — linux repo does not carry ubuntusocks.sh
+# or linuxinstallserver.sh. Expand via PR when those are cross-distro-ported.
 
 # --- Rollback mode ---
-# Reads /var/log/ubuntu-install-rollback.log (format: original<TAB>backup)
+# Reads /var/log/linux-install-rollback.log (format: original<TAB>backup)
 # and either dry-prints the inverse `cp` commands or, with --apply, runs
 # them in reverse order so the latest backup wins. Skips entries whose
 # backup no longer exists, logs everything it does.
@@ -2079,7 +2074,18 @@ restore_ssh_mode() {
   fi
 
   # 2) Firewall blocks the port?
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qE 'Status: active'; then
+  _fw_detect
+  if [ "$FW_CMD" = "firewall-cmd" ] && systemctl is-active --quiet firewalld 2>/dev/null; then
+    local port
+    port=$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' "$SSHCFG" 2>/dev/null)
+    port=${port:-22}
+    if firewall-cmd --list-ports 2>/dev/null | grep -qE "${port}/tcp"; then
+      ok "firewalld allows port $port/tcp."
+    else
+      FIXES+=("fw-allow-current-port")
+      warn "firewalld does not allow port $port/tcp."
+    fi
+  elif [ "$FW_CMD" = "ufw" ] && ufw status 2>/dev/null | grep -qE 'Status: active'; then
     local port
     port=$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' "$SSHCFG" 2>/dev/null)
     port=${port:-22}
@@ -2090,7 +2096,7 @@ restore_ssh_mode() {
       warn "UFW does not seem to allow port $port/tcp."
     fi
   else
-    info "UFW not active; skipping firewall check."
+    info "No active firewalld or UFW; skipping firewall check."
   fi
 
   # 3) PasswordAuthentication no without a pubkey?
@@ -2126,14 +2132,14 @@ restore_ssh_mode() {
   fi
 
   # 5) Restore from rollback log if present
-  if [ -f /var/log/ubuntu-install-rollback.log ]; then
+  if [ -f /var/log/linux-install-rollback.log ]; then
     info "Rollback log present:"
-    grep -E 'ssh' /var/log/ubuntu-install-rollback.log 2>/dev/null | sed 's/^/    /' || true
+    grep -E 'ssh' /var/log/linux-install-rollback.log 2>/dev/null | sed 's/^/    /' || true
   fi
 
   # 6) Apply proposed fixes
   if [ "${#FIXES[@]}" -eq 0 ]; then
-    ok "No obvious SSH lockout detected. Try: sudo sshd -t && sudo systemctl restart ssh"
+    ok "No obvious SSH lockout detected. Try: sudo sshd -t && sudo systemctl restart \$(systemctl is-active --quiet sshd && echo sshd || echo ssh)"
     return 0
   fi
 
@@ -2141,7 +2147,7 @@ restore_ssh_mode() {
   info "Proposed fixes:"
   for f in "${FIXES[@]}"; do
     case "$f" in
-      restart-ssh)                  printf "  - Restart sshd service (sudo systemctl restart ssh)\n" ;;
+      restart-ssh)                  printf "  - Restart sshd service (sudo systemctl restart ssh|sshd)\n" ;;
       ufw-allow-current-port)       printf "  - Open current SSH port in UFW\n" ;;
       reenable-password-auth)       printf "  - Re-enable PasswordAuthentication (set 'yes')\n" ;;
       disable-sshd-config.d-password-no) printf "  - Comment out PasswordAuthentication no in drop-ins\n" ;;
@@ -2156,7 +2162,9 @@ restore_ssh_mode() {
   for f in "${FIXES[@]}"; do
     case "$f" in
       restart-ssh)
-        run sudo systemctl restart ssh
+        local ssh_unit
+        ssh_unit=$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)
+        run sudo systemctl restart "$ssh_unit"
         ok "sshd restarted."
         ;;
       ufw-allow-current-port)
@@ -2165,6 +2173,14 @@ restore_ssh_mode() {
         port=${port:-22}
         run sudo ufw allow "${port}/tcp"
         ok "UFW: opened $port/tcp."
+        ;;
+      fw-allow-current-port)
+        local port
+        port=$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' "$SSHCFG" 2>/dev/null)
+        port=${port:-22}
+        run sudo firewall-cmd --add-port="${port}/tcp" --permanent
+        run sudo firewall-cmd --reload
+        ok "firewalld: opened $port/tcp."
         ;;
       reenable-password-auth)
         _set_or_append_sshd_config "PasswordAuthentication" "yes" "$SSHCFG"
@@ -2183,7 +2199,9 @@ restore_ssh_mode() {
   done
 
   if sudo sshd -t 2>&1; then
-    run sudo systemctl restart ssh
+    local ssh_unit
+    ssh_unit=$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)
+    run sudo systemctl restart "$ssh_unit"
     ok "sshd config valid. Service restarted."
   else
     err "sshd -t still fails. Check /var/log/auth.log for the exact error."
@@ -2231,7 +2249,7 @@ Usage: sudo bash linuxinstall.sh [--restore-ssh] [--restore-etc-snapshot] [--rol
                     not cover the damage.
                     Usage: sudo bash linuxinstall.sh --restore-etc-snapshot
   --rollback        Dry-prints the inverse `cp` commands needed to undo
-                    every change recorded in /var/log/ubuntu-install-rollback.log.
+                    every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those `cp` commands (latest backup wins).
   -h, --help        Show this help.
 USAGE
@@ -2286,9 +2304,6 @@ USAGE
   ask_category_enabled "pam"         "Password & lockout policy" "n"           && { mark_step pam "running"; show_progress; harden_passwords; mark_step pam "done"; }
   ask_category_enabled "optimize"    "Run OptimizeLinuxASR.sh (new helper)" "n" && { mark_step optimize_asr "running"; show_progress; run_optimize_asr; mark_step optimize_asr "done"; }
   ask_category_enabled "deepclean"   "Run DeepClean.sh (new helper)" "n"       && { mark_step deepclean "running"; show_progress; run_deepclean; mark_step deepclean "done"; }
-
-  ask_other_scripts
-  mark_step other_scripts "done"
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then
     info "Because SSH was changed, verify a SECOND session can log in BEFORE closing this one."
