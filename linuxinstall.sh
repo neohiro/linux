@@ -172,7 +172,7 @@ run() {
   if [ $rc -ne 0 ]; then
     err "Command failed (exit $rc): $*"
     _FAIL_COUNT=$((_FAIL_COUNT + 1))
-    if declare -F _log_error >/dev/null 2>&1; then _log_error "$rc"; fi
+    if declare -F _log_error >/dev/null 2>&1; then _log_error "$rc" "$*"; fi
   fi
   if [ "$STRICT_RUN" = "1" ]; then
     return $rc

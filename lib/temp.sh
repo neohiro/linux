@@ -42,18 +42,18 @@ _tmpfile() {
 }
 
 # Internal: write a breadcrumb to the debug log.
-# Call this explicitly from `run()` on failure, or wire into ERR if needed.
-# NOTE: The ERR trap is intentionally omitted. In STRICT_RUN=1 mode, the script
-# handles failure tracking via run() + _FAIL_COUNT and exits at the end of
-# _print_run_summary. A per-command ERR trap would abort on the FIRST failing
-# sub-command rather than collecting _FAIL_COUNT and reporting at end-of-run.
+# Usage: _log_error <rc> <command-string>
+# Call this from your run() implementation on each non-zero exit. The
+# $BASH_COMMAND variable is not reliable outside of a trap, so callers
+# must pass the actual command text.
 _log_error() {
   local rc=$1
+  local cmd=${2:-?}
   {
     printf '[%s] exit=%d cmd=%s pid=%d\n' \
       "$(date -Iseconds 2>/dev/null || date)" \
       "$rc" \
-      "${BASH_COMMAND:-?}" \
+      "$cmd" \
       "$$" \
       >> "$NEOHIRO_DEBUG_LOG" 2>/dev/null
   }
