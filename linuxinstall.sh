@@ -469,7 +469,7 @@ pkg_autoremove() {
 
 pkg_is_installed() {
   case "$PKG_MGR" in
-    apt)    dpkg -l "$1" 2>/dev/null | grep -q '^ii' ;;
+    apt)    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q '^ii' ;;
     dnf|yum) rpm -q "$1" >/dev/null 2>&1 ;;
     zypper) rpm -q "$1" >/dev/null 2>&1 ;;
     pacman) pacman -Q "$1" >/dev/null 2>&1 ;;
@@ -493,6 +493,10 @@ _fw_detect() {
 
 fw_allow() {
   _fw_detect || return 0
+  if [ -z "$FW_CMD" ]; then
+    info "No active firewall (UFW or firewalld) detected; rule for '$1' not applied."
+    return 0
+  fi
   # Normalize "22" to "22/tcp" so firewalld does not reject bare port numbers.
   local spec="$1"
   case "$spec" in
@@ -1124,6 +1128,7 @@ setup_firewall() {
     fw_status; return 0
   fi
   _warn_if_not_tmux
+  FW_CMD=""  # clear cache so _fw_detect re-probes after potential install
   case "$PKG_MGR" in
     apt)    pkg_install ufw ;;
     dnf|yum|zypper|pacman) pkg_install firewalld ;;
@@ -1132,6 +1137,7 @@ setup_firewall() {
       info "Install firewalld or ufw manually and re-run."
       return 1 ;;
   esac
+  _fw_detect
   fw_default_incoming_deny
   [ "$PKG_MGR" = "apt" ] && run sudo ufw default allow outgoing
   if [ "$USE_REMOTE_SSH" = "yes" ] || [ "$ENV_TYPE" = "server" ]; then

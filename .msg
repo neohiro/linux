@@ -1,0 +1,1 @@
+pass 3 correctness: pkg_is_installed apt now uses dpkg-query (exact match) instead of dpkg -l (pattern). robustness: setup_firewall clears FW_CMD cache before install and re-detects so fw_allow etc. work after ufw firewalld install. visibility: fw_allow logs info when no firewall tool found instead of silent no-op.  
