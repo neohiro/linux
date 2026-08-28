@@ -543,9 +543,28 @@ fw_default_incoming_deny() {
     firewall-cmd)
       local zone
       zone=$(sudo firewall-cmd --get-default-zone 2>/dev/null || echo public)
+      # Permit SSH and DHCPv6 in the active zone BEFORE switching the default
+      # zone to drop, otherwise the active interface's ruleset (which still
+      # has the old zone) is fine, but new interfaces get drop and the next
+      # firewall-cmd --reload re-evaluates from default. So we also switch
+      # the runtime default and rebind active interfaces to drop after
+      # whitelisting ssh on the new default zone.
       run sudo firewall-cmd --zone="$zone" --add-service=ssh --permanent
       run sudo firewall-cmd --zone="$zone" --add-service=dhcpv6-client --permanent
+      # Make the drop zone the new permanent + runtime default.
       run sudo firewall-cmd --set-default-zone=drop
+      # Allow SSH and DHCPv6 on drop too, so the next interface bound to
+      # the default zone still has basic connectivity. dhcpv6-client is
+      # needed for SLAAC + DHCPv6 in IPv6 deployments.
+      run sudo firewall-cmd --zone=drop --add-service=ssh --permanent
+      run sudo firewall-cmd --zone=drop --add-service=dhcpv6-client --permanent
+      # Rebind active interfaces so they all live under the drop zone, not the
+      # old public zone. awk extracts interface names from the "interfaces:" lines.
+      local iface
+      for iface in $(sudo firewall-cmd --get-active-zones 2>/dev/null \
+                       | awk '/^  interfaces: / {for(i=2;i<=NF;i++) print $i}'); do
+        run sudo firewall-cmd --zone=drop --change-interface="$iface" --permanent
+      done
       ;;
   esac
 }
@@ -739,7 +758,9 @@ print_metrics_summary() {
 }
 
 detect_or_ask_env() {
-  if dpkg -l ubuntu-desktop >/dev/null 2>&1 || dpkg -l kubuntu-desktop >/dev/null 2>&1 || dpkg -l xubuntu-desktop >/dev/null 2>&1; then
+  if pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
+     pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
+     2>/dev/null; then
     ENV_TYPE="desktop"
   elif systemctl list-unit-files 2>/dev/null | grep -qE '^(ssh|sshd)\.service'; then
     ENV_TYPE="server"
