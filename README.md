@@ -1,4 +1,4 @@
-# neohiro/linux
+﻿# neohiro/linux
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgray.svg)](https://github.com/)
 [![Supported distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Debian%20%7C%20RHEL%20%7C%20Fedora%20%7C%20SUSE%20%7C%20Arch%20%7C%20Amazon%20Linux-blue.svg)](#supported-distributions)
 
@@ -386,7 +386,7 @@ PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
 MaxAuthTries 3
-LoginGraceTime 20
+LoginGraceTime 30s
 X11Forwarding no
 AllowUsers <youruser>
 ```
@@ -453,3 +453,4 @@ ss -tulnp                                               # re-check listeners
   <a href="https://github.com/sponsors/neohiro"><img src="https://img.shields.io/badge/Sponsor%20on%20GitHub-%E2%9D%A4-EA4AAA?logo=githubsponsors&style=for-the-badge" alt="GitHub Sponsors"></a>&nbsp;&nbsp;
   <a href="https://www.patreon.com/frenzypenguin_media"><img src="https://img.shields.io/badge/Patreon-frenzypenguin__media-F96854?logo=patreon&style=for-the-badge" alt="Support on Patreon"></a>
 </p>
+

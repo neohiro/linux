@@ -44,7 +44,8 @@ install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DE
 _tmpfile() {
   local prefix="${1:-neohiro}"
   local f
-  f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+  f=$(install -m 0600 /dev/null "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null \
+      || mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
   _TMP_FILES+=("$f")
   printf '%s' "$f"
 }

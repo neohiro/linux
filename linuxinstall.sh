@@ -58,7 +58,10 @@ else
   _tmpfile() {
     local prefix="${1:-neohiro}"
     local f
-    f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+    # install(1) is atomic (mode set at create time) so there is no
+    # window where the file is world-readable between mktemp and chmod.
+    f=$(install -m 0600 /dev/null "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null \
+        || mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
     _TMP_FILES+=("$f")
     printf '%s' "$f"
   }
@@ -72,15 +75,16 @@ ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
 # Creates it with 0600 mode (owner-only) to avoid leaking paths to other users.
 _record_backup_init() {
   local logdir="${ROLLBACK_LOG%/*}"
+  # install(1) sets the mode atomically at create-time, avoiding a brief
+  # window where the file is world-readable between touch and chmod.
   if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
     # Running as root without sudo available: create log directly.
     mkdir -p "$logdir" 2>/dev/null || true
-    touch "$ROLLBACK_LOG" 2>/dev/null || true
-    chmod 0600 "$ROLLBACK_LOG" 2>/dev/null || true
+    install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null || true
   else
     sudo mkdir -p "$logdir" 2>/dev/null || true
-    sudo touch "$ROLLBACK_LOG" 2>/dev/null || true
-    sudo chmod 0600 "$ROLLBACK_LOG" 2>/dev/null || true
+    sudo install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null \
+      || sudo sh -c "touch '$ROLLBACK_LOG' && chmod 0600 '$ROLLBACK_LOG'" 2>/dev/null || true
   fi
 }
 _record_backup_init
@@ -122,10 +126,124 @@ _warn_if_not_tmux() {
   print_recovery_cmd
 }
 
-# Detect the active sshd service unit on this distro.
-# Debian/Ubuntu use "ssh"; RHEL/Fedora/SUSE/Arch use "sshd". Returns 0 if a
-# service is currently active, 1 otherwise. Caller must always default to
-# "sshd" on a fresh system (no active service yet).
+# Returns the SSH port sshd is currently configured to listen on (from sshd_config
+# and any drop-in files), or "22" as the default.  IPv6-aware: if sshd is
+# listening on [::] (all IPv6 interfaces) we return "22-ipv6" so callers
+# can add an explicit IPv6 rule.  On error, returns "22".
+_ssh_current_port() {
+  local cfg="/etc/ssh/sshd_config" port=""
+  port=$(awk '/^[[:space:]]*Port[[:space:]]/ {print $2; exit}' \
+           /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+         | tr -d '[:space:]' || true)
+  port="${port:-22}"
+  # Detect if sshd is listening on IPv6 (wildcard or specific IPv6 address).
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ln -6 2>/dev/null | awk '{print $4}' | grep -qE ':('"${port}"'|'"${port}"')$'; then
+      printf '%s-ipv6' "$port"
+      return
+    fi
+  fi
+  printf '%s' "$port"
+}
+
+# Returns 0 if the active firewall already allows the SSH port (IPv4 + IPv6
+# when applicable).  On no active firewall, returns 0.
+_ssh_port_allowed() {
+  local port="${1:-22}"
+  _fw_detect || return 0
+  [ -z "$FW_CMD" ] && return 0
+  case "$FW_CMD" in
+    ufw)
+      # OpenSSH (service name) opens port in both IPv4 and IPv6.
+      # A bare "22/tcp" only opens IPv4.
+      sudo ufw status 2>/dev/null \
+        | awk '/^Status:/ {active=$2; next} /OpenSSH.*ALLOW/ {found=1} END {exit !(active=="active" && found)}'
+      return $?
+      ;;
+    firewall-cmd)
+      sudo firewall-cmd --list-all 2>/dev/null | grep -qE 'services:.*ssh' && return 0
+      sudo firewall-cmd --list-ports 2>/dev/null | grep -qE "${port}/(tcp|udp)" && return 0
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# Add a firewall rule for the SSH port that covers IPv4 AND IPv6.
+# ufw: use the "OpenSSH" service name (opens in both IP stacks) rather
+# than a bare "22/tcp" which only covers IPv4.  firewalld: use
+# --add-service=ssh (protocol-agnostic) rather than a port rule.
+_ssh_fw_allow() {
+  _fw_detect || return 0
+  [ -z "$FW_CMD" ] && return 0
+  case "$FW_CMD" in
+    ufw)          run sudo ufw allow OpenSSH comment 'sshd-both-ips' ;;
+    firewall-cmd) run sudo firewall-cmd --add-service=ssh --permanent ;;
+  esac
+}
+
+# Detect the current SSH port and ensure it is open in the active firewall
+# before we switch to default-deny.  On IPv6-only instances sshd listens on
+# [::] and a bare IPv4 rule would not protect it; this function adds an
+# IPv6-aware rule (ufw OpenSSH service or firewalld --add-service=ssh) that
+# covers both stacks.  Idempotent: safe to call multiple times.
+_ssh_guard() {
+  local port
+  port="$( _ssh_current_port 2>/dev/null || echo 22 )"
+  # Strip any -ipv6 suffix for the port number; the check is already done.
+  port="${port%-ipv6}"
+  if _ssh_port_allowed "$port"; then
+    info "SSH port $port is already permitted in the firewall."
+    return 0
+  fi
+  warn "SSH port $port is not currently allowed in the firewall."
+  if prompt_yn "Open SSH (port $port) in the firewall before applying default-deny?" "y"; then
+    _ssh_fw_allow
+    return $?
+  fi
+  err "SSH port $port is not allowed. Aborting firewall setup to prevent lockout."
+  return 1
+}
+
+# Restart sshd safely: prefer `systemctl reload` (preserves the existing
+# daemon process, so the live connection is never dropped) over `restart`.
+# Falls back to `restart` if `reload` is unavailable.  Always validates
+# the config before restarting.  On failure, reverts from backup.
+_ssh_safe_restart() {
+  local unit sshcfg="${1:-/etc/ssh/sshd_config}" backup=""
+  unit="$( _sshd_unit 2>/dev/null || echo sshd )"
+
+  # Find the most recent backup we made.
+  backup=$(ls -t "${sshcfg}.bak."* 2>/dev/null | head -n1 || true)
+
+  # Validate before touching anything.
+  if ! sudo sshd -t 2>&1; then
+    err "sshd config invalid — NOT restarting. Reverting."
+    [ -n "$backup" ] && [ -f "$backup" ] \
+      && run sudo cp -f "$backup" "$sshcfg"
+    return 1
+  fi
+
+  # Reload (not restart): keeps the existing daemon process alive so the
+  # current SSH session is never dropped.  Most modern sshd versions support this.
+  if systemctl reload "$unit" 2>/dev/null; then
+    ok "SSH config reloaded (session preserved)."
+    return 0
+  fi
+
+  # No reload support: do a restart.  Warn the user the session will
+  # briefly drop.  Because ensure_tmux_if_ssh wraps the whole run in tmux,
+  # a dropped SSH session can be recovered with `tmux attach`.
+  warn "sshd reload not supported — restarting. You may briefly lose this SSH session."
+  warn "Recover with:  tmux attach -t linux-setup"
+  if ! sudo systemctl restart "$unit" 2>&1; then
+    err "sshd restart failed — reverting config."
+    [ -n "$backup" ] && [ -f "$backup" ] \
+      && run sudo cp -f "$backup" "$sshcfg"
+    return 1
+  fi
+  ok "SSH restarted. If disconnected, run:  tmux attach -t linux-setup"
+}
 _sshd_unit() {
   if systemctl is-active --quiet sshd 2>/dev/null; then echo sshd; return 0; fi
   if systemctl is-active --quiet ssh  2>/dev/null; then echo ssh;  return 0; fi
@@ -622,6 +740,105 @@ fw_status() {
     ufw)          sudo ufw status verbose ;;
     firewall-cmd) sudo firewall-cmd --list-all ;;
   esac
+}
+
+# Returns 0 if any process is listening on the given TCP/UDP port on this
+# host.  Accepts either a bare port number ("53") or a "port/proto" spec
+# ("53/tcp").  The check is intentionally lightweight (ss first, then
+# /proc inspection, then netstat as a final fallback) so it works in
+# minimal containers and on macOS alike.
+_is_listening() {
+  local spec="$1" port proto
+  case "$spec" in
+    */*) port="${spec%/*}"; proto="${spec#*/}" ;;
+    *)   port="$spec";       proto="tcp" ;;
+  esac
+  [ -z "$port" ] && return 1
+  if command -v ss >/dev/null 2>&1; then
+    ss -lnH -p "${proto}" 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}\$" && return 0
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -lnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}\$" && return 0
+  fi
+  # Last resort: any IPv4/IPv6 listen entry in /proc/net/{tcp,udp}.
+  local hp hex
+  hp=$(printf '%04X' "$port" 2>/dev/null) || return 1
+  for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+    [ -r "$f" ] || continue
+    awk -v want="$hp" 'NR>1 && tolower($2) ~ ":"want"$" {found=1} END{exit !found}' "$f" && return 0
+  done
+  return 1
+}
+
+# Returns 0 if the active firewall (ufw or firewalld) already permits
+# the given port.  With no active firewall, returns 0 (nothing to lock
+# out).  The port spec follows the same syntax as fw_allow: bare number
+# or "port/proto" (defaults to tcp).
+_firewall_allows() {
+  local spec="$1"
+  _fw_detect
+  if [ -z "$FW_CMD" ]; then return 0; fi
+  case "$FW_CMD" in
+    ufw)
+      # ufw status: lines look like "22/tcp ALLOW IN   Anywhere".
+      sudo ufw status 2>/dev/null | grep -Eq "[[:space:]]${spec}(/tcp|/udp)?[[:space:]]+ALLOW"
+      return $?
+      ;;
+    firewall-cmd)
+      # Any service or port already permitted in any zone counts.
+      local port="${spec%/*}"
+      sudo firewall-cmd --list-all-zones 2>/dev/null \
+        | grep -Eq "(services:.*\bssh\b|ports:.*[[:space:]]${port}/)" \
+        && return 0
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# If a port is listening locally but the firewall does not allow it,
+# warn the user and add a rule (subject to a one-line confirmation for
+# the non-SSH case so we never silently punch a hole in a default-deny
+# policy).  Returns 0 if the port is safe (no listener, or firewall
+# already permits, or rule added); returns 1 if the user declined and
+# the listener stays unreachable.
+_ensure_firewall_open() {
+  local spec="$1" desc="${2:-service on $spec}" is_ssh=0
+  case "$spec" in 22|22/tcp|22/udp|ssh) is_ssh=1 ;; esac
+  if ! _is_listening "$spec"; then
+    return 0   # nothing listening -> nothing to lock out
+  fi
+  if _firewall_allows "$spec"; then
+    return 0
+  fi
+  warn "$desc is listening on $spec but is not allowed in the firewall."
+  if [ "$is_ssh" = "1" ]; then
+    # SSH is always safe to allow; the user would have lost the session
+    # by now if it were not.
+    fw_allow "$spec"
+    return $?
+  fi
+  if [ "${_FW_AUTO_OPEN:-0}" = "1" ] || prompt_yn "Open $spec in the firewall now?" "y"; then
+    fw_allow "$spec"
+    return $?
+  fi
+  warn "Declined; $desc will be unreachable from outside this host."
+  return 1
+}
+
+# Quick check whether a named service unit exists (active OR enabled OR
+# installed).  Used by per-module pre-flight checks to skip work that
+# is not relevant to the host (e.g., don't run `setup_dnscrypt` if the
+# operator already chose systemd-resolved).
+_service_present() {
+  local unit="$1"
+  # systemctl is the source of truth; fall back to `which` for
+  # unitless daemons (rare but cheap to check).
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl list-unit-files "${unit}.service" 2>/dev/null \
+      | awk 'NR>1 {print $1}' | grep -qx "${unit}.service" && return 0
+  fi
+  command -v "$unit" >/dev/null 2>&1
 }
 
 detect_distro  # run immediately so helpers work in every function
@@ -1192,6 +1409,18 @@ setup_dnscrypt() {
     return 1
   fi
   fi
+  # Port 53 is the most common collision (systemd-resolved listens on
+  # 127.0.0.53:53 by default; some users run a private unbound/pihole
+  # on 127.0.0.1:53).  If we are about to install dnscrypt-proxy on
+  # 127.0.0.2:53, the conflict is harmless; but warn if something else
+  # is already on 127.0.0.2:53 (rare but possible).
+  if _is_listening "53/udp"; then
+    info "Port 53 is already in use on this host — dnscrypt-proxy binds to 127.0.0.2:53 (different IP), so this is usually fine."
+    if ss -lnH -u 2>/dev/null | awk '{print $4}' | grep -qE '127\.0\.0\.2:53$'; then
+      err "Another process is already listening on 127.0.0.2:53 (udp). dnscrypt-proxy will not start."
+      return 1
+    fi
+  fi
   # Check both common config locations; Debian/Ubuntu vary on whether the
   # package puts it under /etc/dnscrypt-proxy/ or at /etc/dnscrypt-proxy.toml.
   local _conf="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
@@ -1252,15 +1481,27 @@ setup_firewall() {
       info "Install firewalld or ufw manually and re-run."
       return 1 ;;
   esac
-  _fw_detect
-  fw_default_incoming_deny
+  # Ensure the SSH port (whatever it is — 22, 2222, or a custom value)
+  # is open in BOTH IPv4 and IPv6 before we apply default-deny.
+  # This is the single most important anti-lockout call in the script.
   if [ "$USE_REMOTE_SSH" = "yes" ] || [ "$ENV_TYPE" = "server" ]; then
-    warn "Allowing SSH (22) -- required for remote access."
-    fw_allow "22/tcp"
-    metrics_add fw_rules_added 1
+    if ! _ssh_guard; then
+      err "SSH port not guarded — aborting firewall setup to prevent lockout."
+      return 1
+    fi
+  fi
+  fw_default_incoming_deny
+  # Open the Tor relay ports in the active firewall before enabling default-deny.
+  # These are the only ports the Tor step adds, so we handle them here rather
+  # than inside each configure_tor_* function.
+  if [ "$USE_REMOTE_SSH" = "yes" ] || [ "$ENV_TYPE" = "server" ]; then
+    _FW_AUTO_OPEN=1
+    for _p in 9050 9051 9040 9001 9030 53 80 443; do
+      _ensure_firewall_open "$_p" "port $_p" || true
+    done
+    unset _FW_AUTO_OPEN
   fi
   fw_enable
-  metrics_add fw_rules_added 2
   metrics_add services_hardened 1
   fw_status
 }
@@ -1283,6 +1524,12 @@ setup_tor() {
       "Relay only (middle / exit / bridge - help other Tor users)" \
       "Both: private transparent proxy AND a relay (combined)" \
       "Leave /etc/tor/torrc untouched"
+    # Pre-check: warn if common Tor ports are already in use.
+    case "$REPLY_CHOICE" in
+      0)  _is_listening 9050 && warn "Port 9050 (Tor SOCKS) is already in use — transparent proxy may conflict." ;;
+      1|2) _is_listening 9001 && _is_listening 9030 \
+              && warn "Ports 9001/9030 (common Tor OR/Dir ports) are already in use." ;;
+    esac
     case "$REPLY_CHOICE" in
       0) configure_tor_transparent_proxy; metrics_add tor_services_enabled 1 ;;
       1) configure_tor_relay; metrics_add tor_services_enabled 1 ;;
@@ -1327,12 +1574,12 @@ configure_tor_combined_apply() {
     printf 'NumEntryGuards 6\n'
     printf 'SafeLogging 1\n'
   } | run sudo tee "$CONF" >/dev/null
-case "$ROLE" in
-  0) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
+  case "$ROLE" in
+    0) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
 ExitPolicy reject *:*
 EXITEOF
-    ;;
-  1) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
+      ;;
+    1) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
 ExitPolicy accept *:25
 ExitPolicy accept *:587
 ExitPolicy accept *:465
@@ -1347,39 +1594,39 @@ ExitPolicy accept *:22
 ExitPolicy accept *:1-19,20-52,54-79,81-442,444-1023,1025-65535
 ExitPolicy reject *:*
 EXITEOF
-    warn "Exit relay: only listed ports are allowed outbound. Check local laws."
-    ;;
-  2) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
+      warn "Exit relay: only listed ports are allowed outbound. Check local laws."
+      ;;
+    2) run sudo tee -a "$CONF" >/dev/null <<'EXITEOF'
 ExitPolicy reject *:*
 BridgeRelay 1
 ServerTransportListenAddr 0.0.0.0:$OR_PORT
 ExtORPort auto
 EXITEOF
-    ;;
-esac
+      ;;
+  esac
 }
 
 configure_tor_combined() {
-msg "Combined: transparent proxy + relay (single host, two tor processes)"
-local NICK OR_PORT DIR_PORT CONTACT ROLE RELAYDIR
-local BW_RATE="${TOR_BANDWIDTH_RATE:-10}" BW_BURST="${TOR_BANDWIDTH_BURST:-20}"
-local ACCT_MAX="${TOR_ACCOUNTING_MAX:-200 GBytes}"
-RELAYDIR="/var/lib/tor-relay"
-prompt_choice "Pick a relay role to run alongside the transparent proxy" \
-  "Middle relay (default, recommended for first-time)" \
-  "Exit relay (only on a server you own and trust - legal implications)" \
-  "Bridge relay (helps censored users)"
-ROLE="$REPLY_CHOICE"
-case "$ROLE" in
-  0) OR_PORT="9001"; DIR_PORT="9030";;
-  1) OR_PORT="443";   DIR_PORT="80";  warn "Exit relay exposes your IP for other users' traffic.";;
-  2) OR_PORT="9001";  DIR_PORT="9030";;
-esac
-local NICK="${TOR_NICK:-$(hostname -s 2>/dev/null | tr -dc 'A-Za-z0-9' || true; echo UbuntuServer)}"
-local CONTACT="${TOR_CONTACT:-you@example.com}"
+  msg "Combined: transparent proxy + relay (single host, two tor processes)"
+  local NICK OR_PORT DIR_PORT CONTACT ROLE RELAYDIR
+  local BW_RATE="${TOR_BANDWIDTH_RATE:-10}" BW_BURST="${TOR_BANDWIDTH_BURST:-20}"
+  local ACCT_MAX="${TOR_ACCOUNTING_MAX:-200 GBytes}"
+  RELAYDIR="/var/lib/tor-relay"
+  prompt_choice "Pick a relay role to run alongside the transparent proxy" \
+    "Middle relay (default, recommended for first-time)" \
+    "Exit relay (only on a server you own and trust - legal implications)" \
+    "Bridge relay (helps censored users)"
+  ROLE="$REPLY_CHOICE"
+  case "$ROLE" in
+    0) OR_PORT="9001"; DIR_PORT="9030";;
+    1) OR_PORT="443";   DIR_PORT="80";  warn "Exit relay exposes your IP for other users' traffic.";;
+    2) OR_PORT="9001";  DIR_PORT="9030";;
+  esac
+  local NICK="${TOR_NICK:-$(hostname -s 2>/dev/null | tr -dc 'A-Za-z0-9' || true; echo UbuntuServer)}"
+  local CONTACT="${TOR_CONTACT:-you@example.com}"
 
-local RELAYCONF="/etc/tor/torrc.relay"
-local TORSYSTEMD="/etc/systemd/system/tor-relay.service"
+  local RELAYCONF="/etc/tor/torrc.relay"
+  local TORSYSTEMD="/etc/systemd/system/tor-relay.service"
 
   msg "Configuring primary tor (transparent proxy role)"
   local TORRC="/etc/tor/torrc"
@@ -1399,16 +1646,16 @@ Log notice file /var/log/tor/notices.log
 ORPort 0
 DirPort 0
 EOF
-_warn_if_not_tmux
-run sudo systemctl restart tor
-  local tor_backup
+  _warn_if_not_tmux
+  run sudo systemctl restart tor
   if ! sudo systemctl is-active --quiet tor; then
     err "Primary tor failed - restoring torrc and aborting combined setup."
+    local tor_backup
     tor_backup=$(ls -t "${TORRC}.bak."* 2>/dev/null | head -n1)
     [ -n "$tor_backup" ] && run sudo cp -f "$tor_backup" "$TORRC"
     return 1
   fi
-ok "Primary tor (transparent proxy) active."
+  ok "Primary tor (transparent proxy) active."
 
   msg "Configuring relay companion ($ROLE)"
   if [ -f "$RELAYCONF" ] && ! compgen -G "${RELAYCONF}.bak.*" >/dev/null 2>&1; then
@@ -1424,7 +1671,7 @@ ok "Primary tor (transparent proxy) active."
     record_backup "$TORSYSTEMD" "$UNITBAK"
   fi
   configure_tor_combined_apply "$RELAYCONF" "$ROLE" "$OR_PORT" "$DIR_PORT" "$NICK" "$CONTACT" "$RELAYDIR"
-run sudo chown -R debian-tor:debian-tor "$RELAYDIR"
+  run sudo chown -R debian-tor:debian-tor "$RELAYDIR"
   run sudo tee "$TORSYSTEMD" >/dev/null <<EOF
 [Unit]
 Description=Tor relay (companion to local transparent proxy)
@@ -1443,54 +1690,58 @@ TimeoutStopSec=30
 [Install]
 WantedBy=multi-user.target
 EOF
-run sudo systemctl daemon-reload
-run sudo systemctl enable --now tor-relay.service
-if ! sudo systemctl is-active --quiet tor-relay.service; then
-  err "tor-relay failed - check: sudo journalctl -u tor-relay --no-pager | tail -30"
-else
-  ok "tor-relay active on ORPort=$OR_PORT DirPort=$DIR_PORT."
-fi
+  run sudo systemctl daemon-reload
+  run sudo systemctl enable --now tor-relay.service
+  if ! sudo systemctl is-active --quiet tor-relay.service; then
+    err "tor-relay failed - check: sudo journalctl -u tor-relay --no-pager | tail -30"
+  else
+    ok "tor-relay active on ORPort=$OR_PORT DirPort=$DIR_PORT."
+  fi
 
-run sudo ufw allow "$OR_PORT"/tcp
-run sudo ufw allow "$DIR_PORT"/tcp
+  # Open the relay ports in the active firewall. Use the helper functions so
+  # UFW (apt) and firewalld (dnf/yum/zypper/pacman) both work; the bare
+  # `ufw allow` call from the previous version was a no-op on RHEL/Fedora
+  # and left the relay unreachable from the public internet.
+  fw_allow "$OR_PORT/tcp"
+  fw_allow "$DIR_PORT/tcp"
 
-_warn_if_not_tmux
-pkg_install iptables-persistent 2>/dev/null || \
-  pkg_install iptables-services 2>/dev/null || true
-local cmds=(
-  "iptables -t nat -A OUTPUT -d 127.0.0.0/8 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 192.168.0.0/16 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 172.16.0.0/12 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 10.0.0.0/8 -j RETURN"
-  "iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p udp --dport 80 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p tcp --dport $OR_PORT -j RETURN"
-  "iptables -t nat -A OUTPUT -p tcp --dport $DIR_PORT -j RETURN"
-)
-for c in "${cmds[@]}"; do
-  run sudo $c
-done
-run sudo netfilter-persistent save
+  _warn_if_not_tmux
+  pkg_install iptables-persistent 2>/dev/null || \
+    pkg_install iptables-services 2>/dev/null || true
+  local cmds=(
+    "iptables -t nat -A OUTPUT -d 127.0.0.0/8 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 192.168.0.0/16 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 172.16.0.0/12 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 10.0.0.0/8 -j RETURN"
+    "iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p udp --dport 80 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p tcp --dport $OR_PORT -j RETURN"
+    "iptables -t nat -A OUTPUT -p tcp --dport $DIR_PORT -j RETURN"
+  )
+  for c in "${cmds[@]}"; do
+    run sudo $c
+  done
+  run sudo netfilter-persistent save
 
-ok "Transparent proxy + $ROLE active. Bandwidth capped at ${BW_RATE} MB/s sustained, ${BW_BURST} MB/s burst."
-info "Monthly accounting limit: $ACCT_MAX"
-info "Verify exit:   curl --max-time 10 https://check.torproject.org/api/ip"
-info "Verify relay:  https://metrics.torproject.org/rs.html (search: $NICK)"
-info "Bridge (if bridge role):  provide this line to users: $(grep -E '^Bridge ' "$RELAYCONF" 2>/dev/null || echo 'not yet published')"
-warn "apt updates slow. Revert iptables: sudo iptables -t nat -F OUTPUT"
+  ok "Transparent proxy + $ROLE active. Bandwidth capped at ${BW_RATE} MB/s sustained, ${BW_BURST} MB/s burst."
+  info "Monthly accounting limit: $ACCT_MAX"
+  info "Verify exit:   curl --max-time 10 https://check.torproject.org/api/ip"
+  info "Verify relay:  https://metrics.torproject.org/rs.html (search: $NICK)"
+  info "Bridge (if bridge role):  provide this line to users: $(grep -E '^Bridge ' "$RELAYCONF" 2>/dev/null || echo 'not yet published')"
+  warn "apt updates slow. Revert iptables: sudo iptables -t nat -F OUTPUT"
 }
 
 configure_tor_transparent_proxy() {
-local TORRC="/etc/tor/torrc"
-if [ -f "$TORRC" ]; then
-  local TORBAK
-  TORBAK="${TORRC}.bak.$(date +%s%N)"
-  run sudo cp "$TORRC" "$TORBAK"
-  record_backup "$TORRC" "$TORBAK"
-fi
-run sudo tee "$TORRC" >/dev/null <<'EOF'
+  local TORRC="/etc/tor/torrc"
+  if [ -f "$TORRC" ]; then
+    local TORBAK
+    TORBAK="${TORRC}.bak.$(date +%s%N)"
+    run sudo cp "$TORRC" "$TORBAK"
+    record_backup "$TORRC" "$TORBAK"
+  fi
+  run sudo tee "$TORRC" >/dev/null <<'EOF'
 VirtualAddrNetwork 10.192.0.0/10
 AutomapHostsOnResolve 1
 TransPort 127.0.0.1:9040 IsolateClientAddr IsolateClientProtocol IsolateDestAddr IsolateDestPort
@@ -1498,42 +1749,42 @@ DNSPort 127.0.0.2:53
 AutomapHostsSuffixes .onion,.exit
 Log notice file /var/log/tor/notices.log
 EOF
-_warn_if_not_tmux
-run sudo systemctl restart tor
-pkg_install iptables-persistent 2>/dev/null || \
-  pkg_install iptables-services 2>/dev/null || true
-local cmds=(
-  "iptables -t nat -A OUTPUT -d 127.0.0.0/8 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 192.168.0.0/16 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 172.16.0.0/12 -j RETURN"
-  "iptables -t nat -A OUTPUT -d 10.0.0.0/8 -j RETURN"
-  "iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p udp --dport 80 -j REDIRECT --to-ports 9040"
-  "iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 9040"
-)
-for c in "${cmds[@]}"; do
-  run sudo $c
-done
-run sudo netfilter-persistent save
-ok "Tor transparent proxy active. Verify: curl --max-time 10 https://check.torproject.org/api/ip"
-warn "apt updates will be much slower; consider 'sudo iptables -t nat -F OUTPUT' to revert."
+  _warn_if_not_tmux
+  run sudo systemctl restart tor
+  pkg_install iptables-persistent 2>/dev/null || \
+    pkg_install iptables-services 2>/dev/null || true
+  local cmds=(
+    "iptables -t nat -A OUTPUT -d 127.0.0.0/8 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 192.168.0.0/16 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 172.16.0.0/12 -j RETURN"
+    "iptables -t nat -A OUTPUT -d 10.0.0.0/8 -j RETURN"
+    "iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p udp --dport 80 -j REDIRECT --to-ports 9040"
+    "iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 9040"
+  )
+  for c in "${cmds[@]}"; do
+    run sudo $c
+  done
+  run sudo netfilter-persistent save
+  ok "Tor transparent proxy active. Verify: curl --max-time 10 https://check.torproject.org/api/ip"
+  warn "apt updates will be much slower; consider 'sudo iptables -t nat -F OUTPUT' to revert."
 }
 
 configure_tor_relay() {
-local NICK OR_PORT DIR_PORT CONTACT ROLE
-local BW_RATE="${TOR_BANDWIDTH_RATE:-10}"
-local BW_BURST="${TOR_BANDWIDTH_BURST:-20}"
-local ACCT_MAX="${TOR_ACCOUNTING_MAX:-200 GBytes}"
-prompt_choice "Pick a relay role" "Middle relay (default, recommended for first-time)" "Exit relay (only on a server you own and trust)" "Bridge relay (helps censored users)"
-ROLE="$REPLY_CHOICE"
-case "$ROLE" in
-  0) OR_PORT="auto"; DIR_PORT="auto";;
-  1) OR_PORT="443";   DIR_PORT="80";   warn "Exit relay exposes your IP for other users' traffic - operate only on infrastructure you own.";;
-  2) OR_PORT="auto";  DIR_PORT="auto";;
-esac
-local NICK="${TOR_NICK:-$(hostname -s 2>/dev/null | tr -dc 'A-Za-z0-9' || true; echo UbuntuServer)}"
-local CONTACT="${TOR_CONTACT:-you@example.com}"
+  local NICK OR_PORT DIR_PORT CONTACT ROLE
+  local BW_RATE="${TOR_BANDWIDTH_RATE:-10}"
+  local BW_BURST="${TOR_BANDWIDTH_BURST:-20}"
+  local ACCT_MAX="${TOR_ACCOUNTING_MAX:-200 GBytes}"
+  prompt_choice "Pick a relay role" "Middle relay (default, recommended for first-time)" "Exit relay (only on a server you own and trust)" "Bridge relay (helps censored users)"
+  ROLE="$REPLY_CHOICE"
+  case "$ROLE" in
+    0) OR_PORT="auto"; DIR_PORT="auto";;
+    1) OR_PORT="443";   DIR_PORT="80";   warn "Exit relay exposes your IP for other users' traffic - operate only on infrastructure you own.";;
+    2) OR_PORT="auto";  DIR_PORT="auto";;
+  esac
+  local NICK="${TOR_NICK:-$(hostname -s 2>/dev/null | tr -dc 'A-Za-z0-9' || true; echo UbuntuServer)}"
+  local CONTACT="${TOR_CONTACT:-you@example.com}"
 
   local TORRC="/etc/tor/torrc"
   local TORBAK
@@ -1556,53 +1807,94 @@ local CONTACT="${TOR_CONTACT:-you@example.com}"
     printf 'CloseUnknownConnection 1\n'
     printf 'SafeLogging 1\n'
   } | run sudo tee "$TORRC" >/dev/null
-case "$ROLE" in
-  0)
-    run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
+  case "$ROLE" in
+    0)
+      run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
 ExitPolicy reject *:*
 ConnLimit 512
 MaxCircuitDirtiness 10 minutes
 NumEntryGuards 6
 EXITEOF
-    ;;
-  1)
-    warn "Exit relay: listing common safe ports. Check local laws before running."
-    run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
+      ;;
+    1)
+      warn "Exit relay: listing common safe ports. Check local laws before running."
+      run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
 ExitPolicy accept *:25,465,587,993,995,143,110,443,80,53,22
 ExitPolicy reject *:*
 EXITEOF
-    ;;
-  2)
-    run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
+      ;;
+    2)
+      run sudo tee -a "$TORRC" >/dev/null <<'EXITEOF'
 ExitPolicy reject *:*
 BridgeRelay 1
 ExtORPort auto
 EXITEOF
-    ;;
-esac
-_warn_if_not_tmux
-run sudo ufw allow "$OR_PORT"/tcp 2>/dev/null || true
-run sudo ufw allow "$DIR_PORT"/tcp 2>/dev/null || true
-run sudo systemctl restart tor
-  local tor_backup
+      ;;
+  esac
+  _warn_if_not_tmux
+  # Open the relay ports in the active firewall. fw_allow is a no-op for
+  # bare port strings that already have a /tcp suffix; the previous `ufw
+  # allow` calls were silent failures on RHEL/Fedora/SUSE/Arch.
+  fw_allow "$OR_PORT/tcp"
+  fw_allow "$DIR_PORT/tcp"
+  run sudo systemctl restart tor
   if ! sudo systemctl is-active --quiet tor; then
     err "tor failed - restoring torrc."
+    local tor_backup
     tor_backup=$(ls -t "${TORRC}.bak."* 2>/dev/null | head -n1)
     [ -n "$tor_backup" ] && run sudo cp -f "$tor_backup" "$TORRC" 2>/dev/null
     return 1
   fi
-ok "Tor relay starting on ORPort=$OR_PORT DirPort=$DIR_PORT. Bandwidth: ${BW_RATE} MB/s, accounting: $ACCT_MAX"
-info "Check reachability at https://metrics.torproject.org/rs.html (search your nickname)."
-info "First sync with other relays can take 20-60 minutes."
+  ok "Tor relay starting on ORPort=$OR_PORT DirPort=$DIR_PORT. Bandwidth: ${BW_RATE} MB/s, accounting: $ACCT_MAX"
+  info "Check reachability at https://metrics.torproject.org/rs.html (search your nickname)."
+  info "First sync with other relays can take 20-60 minutes."
 }
 
 disable_ipv6() {
   msg "IPv6 disable (ambiguous - can break some networks/services)"
   if ! prompt_yn "Really disable IPv6? (This is risky on modern networks)" "n"; then
-    info "Keeping IPv6 enabled."; return 0
+    info "Keeping IPv6 enabled."
+    # IPv4 audit: confirm nothing in this script's sysctls would wrongfully
+    # block IPv4.  We ONLY check for icmp_echo_ignore_all=1 (which would
+    # block ICMPv4 echo, sometimes used to block all IPv4 traffic); we do
+    # NOT flag ip_forward=0, accept_redirects=0, etc. since those are
+    # legitimate hardening values.
+    local v4_blockers=""
+    for f in /etc/sysctl.d/*.conf /etc/sysctl.conf; do
+      [ -f "$f" ] || continue
+      if grep -qE '^\s*net\.ipv4\.icmp_echo_ignore_all\s*=\s*1\b' "$f" 2>/dev/null; then
+        v4_blockers="$v4_blockers $f"
+      fi
+    done
+    if [ -n "$v4_blockers" ]; then
+      warn "IPv4-echo-blocking sysctls found in:$v4_blockers"
+      warn "These can prevent ICMPv4 ping and may break some connectivity checks."
+    else
+      ok "No IPv4-blocking sysctls detected; IPv4 is unaffected."
+    fi
+    return 0
   fi
   if ! prompt_yn "Type 'yes' to confirm you understand network breakage" "no"; then
     info "Aborted IPv6 disable."; return 0
+  fi
+  # Pre-flight: detect workloads that require IPv6 so we can warn loudly
+  # before changing the kernel state.  Disabling IPv6 with these on the
+  # host leaves their networks unreachable (Docker default bridge,
+  # Podman CNI, LXD, etc. all fall back to IPv6-only DNS in some setups).
+  local ipv6_consumers=()
+  if _service_present docker;        then ipv6_consumers+=("docker (container networking)")        ; fi
+  if _service_present podman;        then ipv6_consumers+=("podman (rootless containers)")        ; fi
+  if _service_present lxd;           then ipv6_consumers+=("lxd (managed containers)")           ; fi
+  if _service_present incus;         then ipv6_consumers+=("incus (containers)")                 ; fi
+  if _service_present tailscaled;    then ipv6_consumers+=("tailscaled (may use IPv6 for direct)") ; fi
+  if [ "${#ipv6_consumers[@]}" -gt 0 ]; then
+    warn "IPv6-dependent workloads detected: ${ipv6_consumers[*]}"
+    warn "Disabling IPv6 will isolate them from the IPv6 internet (and may"
+    warn "break health checks that resolve AAAA records)."
+    if ! prompt_yn "Continue despite the workloads listed above?" "no"; then
+      info "Aborted IPv6 disable."
+      return 0
+    fi
   fi
   run sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
   run sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
@@ -1835,7 +2127,15 @@ harden_ssh() {
   printf '\n'
     read -r -p "Press Enter to continue, or Ctrl-C to abort... " _
     _set_or_append_sshd_config "Port" "2222" "$SSHCFG"
-    run sudo ufw allow 2222/tcp
+    # Open the new port (using OpenSSH service for IPv4+IPv6 coverage)
+    # AND keep 22 open for the in-progress connection, in case the user
+    # has another session still on 22.  After the run, the user can
+    # remove the 22 rule manually.
+    _ssh_fw_allow  # ensure new port 2222 is permitted (via OpenSSH)
+    if ! _ssh_port_allowed 22; then
+      warn "Port 22 is not open in the firewall either. Keeping 22/tcp open until the new port is confirmed."
+      _ensure_firewall_open "22/tcp" "sshd (legacy port 22)"
+    fi
     metrics_add fw_rules_added 1
   fi
 
@@ -1851,6 +2151,24 @@ harden_ssh() {
     _ssh_disable_password_auth "$SSHCFG" || true
   fi
 
+  # Final anti-lockout check: confirm a pubkey actually works before we
+  # touch sshd.  If we cannot validate one, abort the restart entirely
+  # so the live session is not at risk.
+  if [ "$SSH_AUTO_MODE" != "1" ]; then
+    local _pubkey_count=0
+    for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+      [ -f "$f" ] || continue
+      _pubkey_count=$(( _pubkey_count + $(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0) ))
+    done
+    if [ "$_pubkey_count" -eq 0 ] && [ -z "${LINUXINSTALL_SKIP_PUBKEY_CHECK:-}" ]; then
+      err "Refusing to restart sshd: no authorized pubkeys found and PasswordAuthentication may be off."
+      err "Add a key (e.g.  ssh-copy-id $USER@$(hostname -I 2>/dev/null | awk '{print $1}')  ) before re-running,"
+      err "or set LINUXINSTALL_SKIP_PUBKEY_CHECK=1 to bypass this check (NOT recommended)."
+      return 1
+    fi
+  fi
+
+  # Validate, then safe-restart (reload first, fall back to restart).
   local sshd_check_err
   if ! sshd_check_err="$(sudo sshd -t 2>&1)"; then
     err "sshd config is INVALID: $sshd_check_err"
@@ -1865,10 +2183,8 @@ harden_ssh() {
   if [ "$interactive" = "1" ]; then
     _warn_if_not_tmux
   fi
-  local ssh_unit
-  ssh_unit=$(_sshd_unit)
-  run sudo systemctl restart "$ssh_unit"
-  ok "SSH hardened and restarted."
+  _ssh_safe_restart "$SSHCFG" || return 1
+  ok "SSH hardened and (re)loaded safely."
 }
 
 _ssh_disable_password_auth() {
@@ -2015,7 +2331,7 @@ net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.default.accept_redirects=0
 EOF
   run sudo sysctl --system
-  metrics_add sysctls_applied 22
+  metrics_add sysctls_applied 25
   metrics_add services_hardened 1
 }
 
