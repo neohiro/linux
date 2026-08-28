@@ -295,6 +295,7 @@ INNER_EOF
 # so a single failed command does not abort the whole interactive run).
 # Set this in CI / unattended deployments to detect partial-failure runs.
 STRICT_RUN="${STRICT_RUN:-0}"
+QUICK_MODE="${QUICK_MODE:-0}"
 _FAIL_COUNT=0
 
 run() {
@@ -313,6 +314,37 @@ run() {
     return $rc
   fi
   return 0
+}
+
+# Offer a Retry / Skip / Abort choice after a step failure.
+# Only prompts when running interactively (tty + not QUIET_PROMPTS).
+# Returns: 0 = retry, 1 = skip, 2 = abort.
+_prompt_failure_recovery() {
+  local step_label="$1" rc="$2"
+  if [ "${QUIET_PROMPTS:-0}" = "1" ] || [ ! -t 0 ]; then
+    warn "Step '$step_label' failed (exit $rc). Continuing (non-interactive)."
+    return 1
+  fi
+  printf '\n  %s %s\n' "$(_c '1;31m' '[FAIL]')" "Step '$step_label' exited with code $rc."
+  printf '  %s\n' "$(_c '1;37m' 'What do you want to do?')"
+  printf '  %s  %s\n' "$(_c '1;32m' '  1)') "Retry this step"
+  printf '  %s  %s\n' "$(_c '1;33m' '  2)') "Skip this step and continue"
+  printf '  %s  %s\n' "$(_c '1;31m' '  3)') "Abort the entire run"
+  local a
+  if [ -t 0 ]; then
+    read -r -p "Choose [1-3] (default 2 = skip): " a
+  elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
+    printf 'Choose [1-3] (default 2 = skip): ' >/dev/tty
+    read -r a </dev/tty
+  else
+    a=2
+  fi
+  a="${a:-2}"
+  case "$a" in
+    1) return 0 ;;
+    3) err "Aborted by user after step '$step_label'."; exit 1 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Restore /etc from the latest snapshot.  Callable via --restore-etc-snapshot.
@@ -873,10 +905,13 @@ _BAR_Filled='#'; _BAR_Empty='-'
 declare -A CHECKLIST=(
   [tmux_wrap]=pending
   [env_detect]=pending
+  [system]=pending
   [system_update]=pending
+  [dns]=pending
   [dnscrypt]=pending
   [firewall]=pending
   [tor]=pending
+  [ssh]=pending
   [ssh_hardening]=pending
   [fail2ban]=pending
   [unattended]=pending
@@ -884,6 +919,7 @@ declare -A CHECKLIST=(
   [sysctl]=pending
   [apparmor]=pending
   [pam]=pending
+  [optimize]=pending
   [optimize_asr]=pending
   [deepclean]=pending
   [other_scripts]=pending
@@ -891,10 +927,13 @@ declare -A CHECKLIST=(
 )
 CHECKLIST_LABEL_tmux_wrap="Auto-wrap SSH session in tmux"
 CHECKLIST_LABEL_env_detect="Detect environment (desktop/server)"
+CHECKLIST_LABEL_system="System update + base packages"
 CHECKLIST_LABEL_system_update="System update + base packages"
+CHECKLIST_LABEL_dns="DNSCrypt + DNS routing"
 CHECKLIST_LABEL_dnscrypt="DNSCrypt + DNS routing"
 CHECKLIST_LABEL_firewall="Firewall (UFW / firewalld)"
 CHECKLIST_LABEL_tor="Tor daemon"
+CHECKLIST_LABEL_ssh="SSH hardening (lockout-prone)"
 CHECKLIST_LABEL_ssh_hardening="SSH hardening (lockout-prone)"
 CHECKLIST_LABEL_fail2ban="Fail2ban"
 CHECKLIST_LABEL_unattended="Unattended security upgrades"
@@ -902,6 +941,7 @@ CHECKLIST_LABEL_ipv6="Disable IPv6"
 CHECKLIST_LABEL_sysctl="Kernel/sysctl hardening"
 CHECKLIST_LABEL_apparmor="AppArmor"
 CHECKLIST_LABEL_pam="Password & lockout policy"
+CHECKLIST_LABEL_optimize="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_optimize_asr="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_deepclean="DeepClean.sh (cleanup)"
 CHECKLIST_LABEL_other_scripts="Other helpers (Shadowsocks / server extras)"
@@ -909,6 +949,35 @@ CHECKLIST_LABEL_summary="Print run summary"
 
 mark_step() {
   CHECKLIST[$1]="${2:-done}"
+}
+
+# Print a one-line step header with preview text.
+# Usage: _step_begin <key> <label> <preview>
+_step_begin() {
+  local key="$1" label="$2" preview="$3"
+  mark_step "$key" running
+  show_progress
+  local _hr="────────────────────────────────────────────────────────────────"
+  printf '\n%s\n' "$(_c '1;1;36m' "  ▸ $label")"
+  [ -n "$preview" ] && printf '  %s %s\n' "$(_c '1;30m' '→')" "$(_c '1;37m' "$preview")"
+  printf '%s\n' "$_hr"
+}
+
+# Print elapsed time after a step completes.
+# Usage: _step_end <key> <label>
+_step_end() {
+  local key="$1" label="$2"
+  mark_step "$key" done
+  local elapsed=$SECONDS
+  local min=$(( elapsed / 60 ))
+  local sec=$(( elapsed % 60 ))
+  local time_str
+  if [ "$min" -gt 0 ]; then
+    time_str="${min}m ${sec}s"
+  else
+    time_str="${sec}s"
+  fi
+  ok "($label done in ${time_str})"
 }
 
 # When --step STEP is set, run() is a no-op and ask_category_enabled returns 1
@@ -930,6 +999,28 @@ _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
 }
+
+# Short preview text for each step — printed before the step runs.
+# Keep entries under ~70 chars so the terminal doesn't wrap.
+declare -A _STEP_PREVIEWS
+_STEP_PREVIEWS["system"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
+_STEP_PREVIEWS["system_update"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
+_STEP_PREVIEWS["dns"]="install dnscrypt-proxy; you choose between DoH, DNSCrypt, and DoT."
+_STEP_PREVIEWS["dnscrypt"]="install dnscrypt-proxy; you choose between DoH, DNSCrypt, and DoT."
+_STEP_PREVIEWS["firewall"]="install + enable UFW (or firewalld); allow OpenSSH; default-deny inbound."
+_STEP_PREVIEWS["tor"]="install + enable tor.service; configure SOCKS5 on 9050."
+_STEP_PREVIEWS["ssh"]="lockout-proof hardening: password off, key-only, no root, fail2ban, no IPv4 block."
+_STEP_PREVIEWS["ssh_hardening"]="lockout-proof hardening: password off, key-only, no root, fail2ban, no IPv4 block."
+_STEP_PREVIEWS["fail2ban"]="enable fail2ban with sshd jail; 5 retries / 10 min ban / 1h window."
+_STEP_PREVIEWS["unattended"]="enable unattended security upgrades; daily update + auto-reboot at 4am if needed."
+_STEP_PREVIEWS["ipv6"]="disable IPv6 system-wide (kernel + sysctl). Warned: may break IPv4 ping if not careful."
+_STEP_PREVIEWS["sysctl"]="apply hardened kernel/network sysctls (no IPv4 icmp-echo-block on deny)."
+_STEP_PREVIEWS["apparmor"]="enable AppArmor; enforce default profiles."
+_STEP_PREVIEWS["pam"]="tighten pam_faillock: 5 retries / 15 min lockout."
+_STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
+_STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
+_STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
+
 show_progress() {
   local done=0 total=0 i key
   for key in tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary; do
@@ -1035,6 +1126,56 @@ print_metrics_summary() {
   printf '%s\n' "$_hr"
 }
 
+print_welcome() {
+  local _hr
+  _hr="$(printf '─%.0s' {1..58})"
+  local _os_label _kernel _hostname
+  _os_label="$(awk -F= '/^NAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || uname -s)"
+  _kernel="$(uname -r)"
+  _hostname="$(hostname 2>/dev/null || echo unknown)"
+  local _step_count _ssh_note
+  case "$REPLY_PROFILE" in
+    1) _step_count=6 _ssh_note="(no SSH changes)" ;;
+    2) _step_count=10 _ssh_note="(includes SSH hardening)" ;;
+    3) _step_count=12 _ssh_note="(includes SSH hardening + Tor)" ;;
+    *) _step_count=0 _ssh_note="" ;;
+  esac
+  printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
+  printf '%s\n' "$(_c '1;36m' "  ║          neohiro/linux  —  Setup & Hardening             ║")"
+  printf '%s\n' "$(_c '1;36m' "  ╚══════════════════════════════════════════════════════════╝")"
+  printf '\n  %-14s %s\n' "$(_c '1;30m' 'Host:')" "$(_c '1;37m' "$_hostname")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'OS:')" "$(_c '1;37m' "$_os_label")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Kernel:')" "$(_c '1;37m' "$_kernel")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Arch:')" "$(_c '1;37m' "$(uname -m)")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Run as:')" "$(_c '1;37m' "root ($(whoami))")"
+  printf '\n  %s\n' "$_hr"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Environment:')" "$ENV_TYPE"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Remote SSH:')" "$(_c '1;37m' "$USE_REMOTE_SSH")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Profile:')" "$(_c '1;37m' "Profile $REPLY_PROFILE — $(_profile_label)")"
+  if [ "$_step_count" -gt 0 ]; then
+    printf '  %-14s %s\n' "$(_c '1;30m' 'Steps:')" "$(_c '1;37m' "~$_step_count hardening steps $_ssh_note")"
+  fi
+  if [ "$QUICK_MODE" = "1" ]; then
+    printf '  %-14s %s\n' "$(_c '1;32m' 'Quick mode:')" "$(_c '1;32m' 'ON — using defaults, no individual prompts')"
+  fi
+  printf '  %s\n' "$_hr"
+  if [ -n "${TMUX:-}" ]; then
+    info "Running inside tmux — your session is protected against SSH disconnection."
+  fi
+}
+
+_profile_label() {
+  case "$REPLY_PROFILE" in
+    1) echo "Recommended" ;;
+    2) echo "Standard" ;;
+    3) echo "Full" ;;
+    4) echo "Custom" ;;
+    5) echo "Restore SSH" ;;
+    6) echo "Maintenance" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
 detect_or_ask_env() {
   if pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
      pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
@@ -1060,6 +1201,29 @@ detect_or_ask_env() {
 }
 
 ask_profile() {
+  local _hr="──────────────────────────────────────────────────────────"
+  bold "Profile selection"
+  info "Choose how much hardening to apply. All changes are logged and reversible."
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;32m' '1) Recommended')" "$(_c '1;37m' 'Safe defaults — firewall, system updates, unattended upgrades.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'No risk of SSH lockout.  ~6 steps.  Takes 1-3 min.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;36m' '2) Standard')"   "$(_c '1;37m' 'Recommended + SSH hardening, Fail2ban, kernel sysctls,')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'AppArmor, password policies.  ~10 steps.  Takes 3-5 min.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;35m' '3) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~12 steps.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Most aggressive.  Takes 5-10 min.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;33m' '4) Custom')"     "$(_c '1;37m' 'Choose each step individually.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Run as: QUICK_MODE=1 bash linuxinstall.sh to skip individual prompts.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;31m' '5) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes. Safe recovery tool.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Also reinstalls the SSH self-heal watchdog if you want.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;1;35m' '6) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
+  printf '\n'
+  printf '  %s\n' "$_hr"
   prompt_choice "Apply which set of categories?" \
     "Recommended (safe, no SSH-lockout risk)" \
     "Standard (includes SSH hardening, Fail2ban, sysctl, AppArmor)" \
@@ -1068,11 +1232,19 @@ ask_profile() {
     "Restore SSH (diagnose & fix common lockout causes; option-only menu)" \
     "Maintenance suite (pick individual categories, return to this menu)"
   REPLY_PROFILE=$REPLY_CHOICE
+  if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
+    info "Quick mode: individual prompts skipped — using recommended defaults."
+    info "Override individual steps with STRICT_RUN=1 if needed."
+  fi
 }
 
 ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
   _should_run_step "$key" || return 1
+  # In QUICK_MODE with Custom profile (4), skip individual prompts — use defaults.
+  if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
+    [ "$default" = "y" ] && return 0 || return 1
+  fi
   case "$REPLY_PROFILE" in
     1) [ "$default" = "y" ]; return $?;;
     2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ]; return $?;;
@@ -3154,6 +3326,9 @@ USAGE
 
   detect_or_ask_env
   ask_profile
+  RUN_START_TIME=${SECONDS:-0}
+  print_welcome
+  printf '\n'
 
   # Full + server => run SSH hardening in auto mode (no interactive lockout-prone prompts)
   if [ "$REPLY_PROFILE" = "3" ] && [ "$ENV_TYPE" = "server" ]; then
@@ -3194,19 +3369,58 @@ USAGE
     return $?
   fi
 
-  ask_category_enabled "system"      "System update + base packages" "y"      && { mark_step system_update "running"; show_progress; update_system;  mark_step system_update "done"; update_kernel; }
-  ask_category_enabled "dns"         "DNSCrypt (DNS method is ambiguous - you'll be asked)" "n" && { mark_step dnscrypt "running"; show_progress; setup_dnscrypt; mark_step dnscrypt "done"; }
-  ask_category_enabled "firewall"    "Firewall (UFW)" "y"                      && { mark_step firewall "running"; show_progress; setup_firewall; mark_step firewall "done"; }
-  ask_category_enabled "tor"         "Tor daemon" "n"                          && { mark_step tor "running"; show_progress; setup_tor; mark_step tor "done"; }
-  ask_category_enabled "ssh"         "SSH hardening (lockout-prone)" "n"       && { mark_step ssh_hardening "running"; show_progress; harden_ssh; mark_step ssh_hardening "done"; }
-  ask_category_enabled "fail2ban"    "Fail2ban" "n"                            && { mark_step fail2ban running; show_progress; setup_fail2ban; mark_step fail2ban done; }
-  ask_category_enabled "unattended"  "Unattended security upgrades" "y"        && { mark_step unattended "running"; show_progress; configure_unattended_upgrades; mark_step unattended "done"; }
-  ask_category_enabled "ipv6"        "Disable IPv6 (risky)" "n"                && { mark_step ipv6 running; show_progress; disable_ipv6; mark_step ipv6 done; }
-  ask_category_enabled "sysctl"      "Kernel/sysctl hardening profile" "n"     && { mark_step sysctl "running"; show_progress; harden_sysctl; mark_step sysctl "done"; }
-  ask_category_enabled "apparmor"    "AppArmor" "n"                            && { mark_step apparmor "running"; show_progress; setup_apparmor; mark_step apparmor "done"; }
-  ask_category_enabled "pam"         "Password & lockout policy" "n"           && { mark_step pam "running"; show_progress; harden_passwords; mark_step pam "done"; }
-  ask_category_enabled "optimize"    "Run OptimizeLinuxASR.sh (new helper)" "n" && { mark_step optimize_asr "running"; show_progress; run_optimize_asr; mark_step optimize_asr "done"; }
-  ask_category_enabled "deepclean"   "Run DeepClean.sh (new helper)" "n"       && { mark_step deepclean "running"; show_progress; run_deepclean; mark_step deepclean "done"; }
+  # Each step shows a one-line preview + elapsed time.  Wrapped in a
+  # function-call so any failure (set -e) stops the whole run, but the
+  # inline `|| { ...; }` shape below keeps set -e OFF for the main flow
+  # so a single failure does not abort subsequent steps.
+  _run_step() {
+    local key="$1" label="$2" preview="$3" fn="$4"
+    if ! ask_category_enabled "$key" "$label" "${5:-n}"; then return 0; fi
+    local p="${_STEP_PREVIEWS[$key]:-$preview}"
+    while true; do
+      _step_begin "$key" "$label" "$p"
+      SECONDS=0
+      local rc=0
+      "$fn" || rc=$?
+      _step_end "$key" "$label"
+      if [ "$rc" -eq 0 ]; then return 0; fi
+      # Failure recovery: offer retry / skip / abort.
+      if _prompt_failure_recovery "$label" "$rc"; then
+        # user picked retry -- loop again
+        continue
+      fi
+      # user picked skip -- mark step as skip so progress bar is honest
+      mark_step "$key" skip
+      return 0
+    done
+  }
+  # System step is special: it always follows with update_kernel so the
+  # new kernel can be detected before the run ends.
+  if ask_category_enabled "system" "System update + base packages" "y"; then
+    while true; do
+      _step_begin "system_update" "System update + base packages" "${_STEP_PREVIEWS[system]}"
+      SECONDS=0
+      local _rc=0
+      update_system || _rc=$?
+      update_kernel || _rc=$?
+      _step_end "system_update" "System update + base packages"
+      if [ "$_rc" -eq 0 ]; then break; fi
+      if _prompt_failure_recovery "System update" "$_rc"; then continue; fi
+      mark_step "system_update" skip; break
+    done
+  fi
+  _run_step dnscrypt     "DNSCrypt (DNS method is ambiguous)"         "" setup_dnscrypt            n
+  _run_step firewall     "Firewall (UFW)"                             "" setup_firewall            y
+  _run_step tor          "Tor daemon"                                 "" setup_tor                 n
+  _run_step ssh          "SSH hardening (lockout-prone)"              "" harden_ssh                n
+  _run_step fail2ban    "Fail2ban"                                   "" setup_fail2ban            n
+  _run_step unattended  "Unattended security upgrades"               "" configure_unattended_upgrades y
+  _run_step ipv6        "Disable IPv6 (risky)"                       "" disable_ipv6              n
+  _run_step sysctl      "Kernel/sysctl hardening profile"            "" harden_sysctl             n
+  _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
+  _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
+  _run_step optimize_asr "Run OptimizeLinuxASR.sh (new helper)"       "" run_optimize_asr         n
+  _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then
     info "Because SSH was changed, verify a SECOND session can log in BEFORE closing this one."
@@ -3221,9 +3435,22 @@ USAGE
 # Common end-of-run summary: print metrics and exit with the right code
 # under STRICT_RUN. Non-strict runs always exit 0 (interactive default).
 _print_run_summary() {
-  bold "Done."
   mark_step summary "running"
   show_progress
+  local total_sec=$(( SECONDS - RUN_START_TIME ))
+  local total_min=$(( total_sec / 60 ))
+  local total_rem=$(( total_sec % 60 ))
+  local total_time_str
+  if [ "$total_min" -gt 0 ]; then
+    total_time_str="${total_min}m ${total_rem}s"
+  else
+    total_time_str="${total_sec}s"
+  fi
+  local _hr="════════════════════════════════════════════════════════════"
+  printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
+  printf '%s\n' "$(_c '1;36m' "  ║               ✓  Run complete  —  $total_time_str                 ║")"
+  printf '%s\n' "$(_c '1;36m' "  ╚══════════════════════════════════════════════════════════╝")"
+  printf '\n'
   print_metrics_summary
   mark_step summary "done"
   show_progress
