@@ -332,9 +332,9 @@ _prompt_failure_recovery() {
   printf '  %s  %s\n' "$(_c '1;31m' '  3)') "Abort the entire run"
   local a
   if [ -t 0 ]; then
-    read -r -p "Choose 1-3 (default 2 = skip): " a
+    read -r -p "Choose 1 to 3 - default 2 skips: " a
   elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
-    printf 'Choose 1-3 (default 2 = skip): ' >/dev/tty
+    printf 'Choose 1 to 3 - default 2 skips: ' >/dev/tty
     read -r a </dev/tty
   else
     a=2
