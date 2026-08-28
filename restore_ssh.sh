@@ -137,7 +137,8 @@ _sshd_unit() {
 }
 
 restart_sshd() {
-  local unit=$(_sshd_unit)
+  local unit
+  unit=$(_sshd_unit)
   run sudo systemctl restart "$unit"
 }
 

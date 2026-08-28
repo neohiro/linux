@@ -65,6 +65,17 @@ _warn_if_not_tmux() {
   print_recovery_cmd
 }
 
+# Detect the active sshd service unit on this distro.
+# Debian/Ubuntu use "ssh"; RHEL/Fedora/SUSE/Arch use "sshd". Returns 0 if a
+# service is currently active, 1 otherwise. Caller must always default to
+# "sshd" on a fresh system (no active service yet).
+_sshd_unit() {
+  if systemctl is-active --quiet sshd 2>/dev/null; then echo sshd; return 0; fi
+  if systemctl is-active --quiet ssh  2>/dev/null; then echo ssh;  return 0; fi
+  if [ -f /etc/debian_version ]; then echo ssh;  return 1; fi
+  echo sshd; return 1
+}
+
 print_recovery_if_ssh() {
   [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] || return 0
   print_recovery_cmd
@@ -407,8 +418,16 @@ detect_distro() {
 pkg_update() {
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get update ;;
-    dnf)    run sudo dnf check-update || true ;;
-    yum)    run sudo yum check-update || true ;;
+    dnf)    info "Checking for updates (dnf check-update)..."
+               sudo dnf check-update >/dev/null 2>&1; rc=$?
+               [ "$rc" -eq 100 ] && ok "Updates available — will upgrade." \
+               || [ "$rc" -eq 0 ] && ok "System up to date." \
+               || info "dnf check-update exited $rc." ;;
+    yum)    info "Checking for updates (yum check-update)..."
+               sudo yum check-update >/dev/null 2>&1; rc=$?
+               [ "$rc" -eq 100 ] && ok "Updates available — will upgrade." \
+               || [ "$rc" -eq 0 ] && ok "System up to date." \
+               || info "yum check-update exited $rc." ;;
     zypper) run sudo zypper --quiet refresh ;;
     pacman) run sudo pacman -Sy ;;
     *)      info "  pkg_update: no-op on $PKG_MGR" ;;
@@ -474,9 +493,15 @@ _fw_detect() {
 
 fw_allow() {
   _fw_detect || return 0
+  # Normalize "22" to "22/tcp" so firewalld does not reject bare port numbers.
+  local spec="$1"
+  case "$spec" in
+    */*) ;;                       # already has /tcp or /udp
+    *)   spec="${spec}/tcp" ;;
+  esac
   case "$FW_CMD" in
-    ufw)          run sudo ufw allow "$1" ;;
-    firewall-cmd) run sudo firewall-cmd --add-port="$1" --permanent ;;
+    ufw)          run sudo ufw allow "$spec" ;;
+    firewall-cmd) run sudo firewall-cmd --add-port="$spec" --permanent ;;
   esac
 }
 
@@ -1711,7 +1736,7 @@ harden_ssh() {
     _warn_if_not_tmux
   fi
   local ssh_unit
-  ssh_unit=$(systemctl is-active --quiet sshd 2>/dev/null && echo sshd || echo ssh)
+  ssh_unit=$(_sshd_unit)
   run sudo systemctl restart "$ssh_unit"
   ok "SSH hardened and restarted."
 }

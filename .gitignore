@@ -31,3 +31,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Build / dev helpers (not shipped in releases)
+build.py
+lint.js
