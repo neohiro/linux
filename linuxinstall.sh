@@ -332,9 +332,9 @@ _prompt_failure_recovery() {
   printf '  %s  %s\n' "$(_c '1;31m' '  3)') "Abort the entire run"
   local a
   if [ -t 0 ]; then
-    read -r -p "Choose [1-3] (default 2 = skip): " a
+    read -r -p "Choose 1-3 (default 2 = skip): " a
   elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
-    printf 'Choose [1-3] (default 2 = skip): ' >/dev/tty
+    printf 'Choose 1-3 (default 2 = skip): ' >/dev/tty
     read -r a </dev/tty
   else
     a=2
@@ -977,7 +977,7 @@ _step_end() {
   else
     time_str="${sec}s"
   fi
-  ok "($label done in ${time_str})"
+  printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $time_str"
 }
 
 # When --step STEP is set, run() is a no-op and ask_category_enabled returns 1
