@@ -20,9 +20,16 @@
 # "bad substitution" error otherwise.  Surface this clearly rather
 # than failing in an opaque way.
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
-  printf '%s %s\n' "$(printf '\033[1;31m%s\033[0m' '[ERROR]')" \
+  local _err_tag
+  if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+    _err_tag=$(printf '\033[1;31m%s\033[0m' '[ERROR]')
+  else
+    _err_tag='[ERROR]'
+  fi
+  printf '%s %s\n' "$_err_tag" \
     "lib/updater.sh requires Bash 4.0+; found ${BASH_VERSION:-unknown}." >&2
   printf '  macOS users: install Homebrew bash:  brew install bash\n' >&2
+  unset _err_tag
   return 1 2>/dev/null || exit 1
 fi
 
@@ -40,7 +47,7 @@ if [ -z "${USE_COLOR:-}" ]; then USE_COLOR=0; fi
 _c()  { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 msg() { echo "=> $*"; }
 info(){ printf '  %s\n' "$*"; }
-ok()  { printf "%s %s\n" "$(_c '1;32m' '[OK]')" "$1"; }
+ok()  { printf "%s %s\n" "$(_c '1;32m' '[OK]')" "$*"; }
 warn(){ local m="$(_c '1;33m' '[WARN]') $*" && printf '%s\n' "$m" >&2; }
 err() { local m="$(_c '1;31m' '[ERROR]') $*" && printf '%s\n' "$m" >&2; }
 
@@ -152,13 +159,21 @@ _update_pacman() {
 _update_snap() {
   command -v snap >/dev/null 2>&1 || return 0
   msg "snap: refreshing all snaps..."
-  if ! run sudo snap refresh; then
+  if run sudo snap refresh; then
+    _track
+  else
     warn "snap refresh returned non-zero (may be intentionally held snaps)"
   fi
-  local stale;   stale=$(snap list --all 2>/dev/null | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
+  # `snap list --all` requires root in some configurations; use sudo for
+  # both the count and the prune to keep the output consistent.
+  # Run the command once; count from it and pipe the same output to the
+  # while-read loop so the prune pass doesn't call `snap list` a second time.
+  local stale all_snaps
+  all_snaps=$(sudo snap list --all 2>/dev/null || echo "")
+  stale=$(printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
   if [ "$stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
     info "snap: pruning $stale disabled revision(s)..."
-    snap list --all 2>/dev/null | awk '/disabled/{print $1 "@" $3}' | while read -r snaprev; do
+    printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}' | while read -r snaprev; do
       run sudo snap remove "${snaprev%%@*}" --revision="${snaprev##*@}" 2>/dev/null || true
     done
   fi
@@ -207,7 +222,7 @@ _update_docker() {
   local failed=0
   while IFS= read -r img; do
     [ -z "$img" ] && continue
-    if docker pull "$img" >/dev/null 2>&1; then
+    if run docker pull "$img" >/dev/null 2>&1; then
       _log "docker: updated $img"
       UPDATED=$((UPDATED+1))
     else
@@ -215,7 +230,7 @@ _update_docker() {
       failed=$((failed+1))
     fi
   done <<< "$images"
-  docker image prune -f >/dev/null 2>&1 || true
+  run docker image prune -f >/dev/null 2>&1 || true
   if [ $failed -gt 0 ]; then
     FAILED=$((FAILED+failed))
     return 1

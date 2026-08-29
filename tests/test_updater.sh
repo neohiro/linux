@@ -94,18 +94,15 @@ else
   fail_t "_run_all_updates on bare host" "got rc=$rc, expected 0"
 fi
 
-# --- Test 5: dispatcher continues after a sub-step fails ---
-# Inject a controlled failure by overriding _update_pihole (which is invoked
-# last) to return 1, but call it directly to verify a single failure does
-# not abort. We do this by setting the variable FAILED and observing the
-# dispatcher's continuation: the FAILED counter is surfaced in the summary.
-UPDATED=0; FAILED=0
-# Manually mark a failure then call the dispatcher to confirm the summary
-# path handles it.
+# --- Test 5: dispatcher returns 1 when FAILED > 0 ---
+# Save/restore FAILED so we don't bleed state into other tests. We deliberately
+# inject a failure count and verify the summary path returns 1.
+UPDATED=0
+FAILED_SAVED=$FAILED
 FAILED=1
-# _run_all_updates should now return 1 (FAILED > 0).
 result=0
 _run_all_updates >/dev/null 2>&1 || result=$?
+FAILED=$FAILED_SAVED
 if [ "$result" = "1" ]; then
   ok_t "_run_all_updates with FAILED=1: returns 1 (summary path works)"
 else
