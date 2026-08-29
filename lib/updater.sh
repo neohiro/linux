@@ -338,7 +338,10 @@ _update_geoip() {
       FAILED=$((FAILED+1))
     fi
   else
+    # curl exit codes: 6=host, 7=connect, 22=HTTP 4xx/5xx, 28=timeout.
+    # All of these are real failures the user should see in the summary.
     warn "geoip: download failed — skipping"
+    FAILED=$((FAILED+1))
   fi
   rm -f "$tmp_db" 2>/dev/null || true
   trap - RETURN
@@ -380,10 +383,11 @@ _update_virsh() {
   done < <(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
   if [ $virsh_failed -gt 0 ]; then
     FAILED=$((FAILED+virsh_failed))
+    warn "virsh: $virsh_failed pool/net operation(s) failed"
+    return 1
   else
-    _track
+    _track; ok "virsh"
   fi
-  ok "virsh"
 }
 
 # ── Distro-specific tooling ───────────────────────────────────────────────
