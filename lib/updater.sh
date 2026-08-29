@@ -29,16 +29,19 @@ if [ -z "${USE_COLOR:-}" ]; then USE_COLOR=0; fi
 _c()  { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 msg() { echo "=> $*"; }
 info(){ printf '  %s\n' "$*"; }
-ok()  { printf "%s\n" "$(_c '1;32m' '[OK]') $1"; }
-warn(){ printf "%s %s\n" "$(_c '1;33m' '[WARN]')" "$*" >&2; }
-err() { printf "%s %s\n" "$(_c '1;31m' '[ERROR]')" "$*" >&2; }
+ok()  { printf "%s %s\n" "$(_c '1;32m' '[OK]')" "$1"; }
+warn(){ local m="$(_c '1;33m' '[WARN]') $*" && printf '%s\n' "$m" >&2; }
+err() { local m="$(_c '1;31m' '[ERROR]') $*" && printf '%s\n' "$m" >&2; }
 
 VERBOSE="${VERBOSE:-0}"
 FAILED=0
 UPDATED=0
 
 _log()  { [ "$VERBOSE" = "1" ] && info "$*" || true; }
-_track() { local rc=$?; [ $rc -ne 0 ] && FAILED=$((FAILED+1)) || UPDATED=$((UPDATED+1)); return $rc; }
+# _track() records success/failure for the summary. Callers should be
+# wrapped in `... || true` so a single failed sub-step does not abort
+# the dispatcher; the count is still surfaced in the final summary.
+_track() { local rc=$?; [ $rc -ne 0 ] && FAILED=$((FAILED+1)) || UPDATED=$((UPDATED+1)); return 0; }
 
 # `run` is normally provided by linuxinstall.sh. When this lib is run
 # standalone (sudo bash lib/updater.sh), we shim a local copy that
@@ -130,7 +133,7 @@ _update_snap() {
   if ! run sudo snap refresh; then
     warn "snap refresh returned non-zero (may be intentionally held snaps)"
   fi
-  local stale; stale=$(snap list --all 2>/dev/null | awk '/disabled/{print $1"@"$3}' | wc -l || echo 0)
+  local stale;   stale=$(snap list --all 2>/dev/null | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
   if [ "$stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
     info "snap: pruning $stale disabled revision(s)..."
     snap list --all 2>/dev/null | awk '/disabled/{print $1"@"$3}' | while read -r snaprev; do
@@ -263,12 +266,14 @@ _update_virsh() {
     return 0
   fi
   msg "virsh: updating libvirt storage pool and network definitions..."
-  for pool in $(virsh pool-list --all --name 2>/dev/null | grep -v '^$' | grep -v '^Name'); do
+  # virsh pool/net --name prints a "Name" header followed by one name per
+  # line. Strip blank lines and the literal "Name" header to get a clean
+  # list of pool/net names.
+  for pool in $(virsh pool-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d'); do
     _log "virsh: refreshing pool $pool"
     run sudo virsh pool-refresh "$pool" 2>/dev/null || true
   done
-  # Update defined networks.
-  for net in $(virsh net-list --all --name 2>/dev/null | grep -v '^$' | grep -v '^Name'); do
+  for net in $(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d'); do
     _log "virsh: auto-starting network $net"
     run sudo virsh net-autostart "$net" 2>/dev/null || true
   done
@@ -331,21 +336,24 @@ _run_all_updates() {
   msg "=== Comprehensive system update ==="
   local start_sec=$SECONDS
 
-  _update_apt
-  _update_dnf
-  _update_yum
-  _update_zypper
-  _update_pacman
-  _update_snap
-  _update_flatpak
-  _update_docker
-  _update_brew
-  _update_firmware
-  _update_geoip
-  _update_virsh
-  _update_suse_snapper
-  _update_btrfs_balance
-  _update_pihole
+  # Each sub-routine is called with `|| true` so a failure in one tool
+  # (e.g. dnf not installed) does not abort the rest of the dispatcher.
+  # Errors are surfaced via the FAILED counter and the final summary.
+  _update_apt             || true
+  _update_dnf             || true
+  _update_yum             || true
+  _update_zypper          || true
+  _update_pacman          || true
+  _update_snap            || true
+  _update_flatpak         || true
+  _update_docker          || true
+  _update_brew            || true
+  _update_firmware        || true
+  _update_geoip           || true
+  _update_virsh           || true
+  _update_suse_snapper    || true
+  _update_btrfs_balance   || true
+  _update_pihole          || true
 
   local elapsed=$((SECONDS - start_sec))
   printf '\n'

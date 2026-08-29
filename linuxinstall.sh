@@ -117,10 +117,16 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
   _run_all_updates() {
     msg "=== Comprehensive system update ==="
-    _update_apt; _update_dnf; _update_yum
-    _update_zypper; _update_pacman
-    _update_snap; _update_flatpak
-    _update_docker; _update_brew; _update_firmware
+    _update_apt || true
+    _update_dnf || true
+    _update_yum || true
+    _update_zypper || true
+    _update_pacman || true
+    _update_snap || true
+    _update_flatpak || true
+    _update_docker || true
+    _update_brew || true
+    _update_firmware || true
     printf '\n'; ok "Update engine complete."; }
 fi
 
