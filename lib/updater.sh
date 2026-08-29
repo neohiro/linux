@@ -13,7 +13,7 @@
 # distro-specific tooling (e.g. snapper on SUSE, btrfs balance).
 # Skips unavailable tools silently unless VERBOSE=1 is set.
 #
-# Exit: 0 = all succeeded, 1 = one or more failed, 2 = nothing to update.
+# Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
 
 [ -n "${__NEOHIRO_UPDATER_SOURCED:-}" ] && return 0 2>/dev/null || true
 __NEOHIRO_UPDATER_SOURCED=1
@@ -73,8 +73,11 @@ _update_apt() {
   count=$(apt list --upgradable 2>/dev/null | grep -c '/' || echo 0)
   if [ "$count" -gt 0 ]; then
     msg "apt: upgrading $count package(s)..."
-    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade
-    _track
+    if ! run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade; then
+      err "apt upgrade failed"; _track
+    else
+      _track
+    fi
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
     run sudo apt-get -y clean -qq
   else
@@ -89,6 +92,7 @@ _update_dnf() {
   if ! run sudo dnf upgrade --refresh -y -q; then
     err "dnf upgrade failed"; _track; return 1
   fi
+  _track
   run sudo dnf autoremove -y -q
   ok "dnf"
 }
@@ -99,6 +103,7 @@ _update_yum() {
   if ! run sudo yum update -y -q; then
     err "yum update failed"; _track; return 1
   fi
+  _track
   run sudo yum autoremove -y -q
   ok "yum"
 }
@@ -106,10 +111,13 @@ _update_yum() {
 _update_zypper() {
   command -v zypper >/dev/null 2>&1 || return 0
   msg "zypper: refreshing + updating..."
-  run sudo zypper --quiet refresh
+  if ! run sudo zypper --quiet refresh; then
+    err "zypper refresh failed"; _track; return 1
+  fi
   if ! run sudo zypper update -y --quiet; then
     err "zypper update failed"; _track; return 1
   fi
+  _track
   run sudo zypper --quiet clean
   ok "zypper"
 }
@@ -120,6 +128,7 @@ _update_pacman() {
   if ! run sudo pacman -Syu --noconfirm --quiet; then
     err "pacman update failed"; _track; return 1
   fi
+  _track
   # Clean cache: remove all cached packages not currently installed.
   run sudo pacman -Scc --noconfirm -q
   ok "pacman"
@@ -136,7 +145,7 @@ _update_snap() {
   local stale;   stale=$(snap list --all 2>/dev/null | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
   if [ "$stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
     info "snap: pruning $stale disabled revision(s)..."
-    snap list --all 2>/dev/null | awk '/disabled/{print $1"@"$3}' | while read -r snaprev; do
+    snap list --all 2>/dev/null | awk '/disabled/{print $1 "@" $3}' | while read -r snaprev; do
       run sudo snap remove "${snaprev%%@*}" --revision="${snaprev##*@}" 2>/dev/null || true
     done
   fi
@@ -148,14 +157,27 @@ _update_snap() {
 _update_flatpak() {
   command -v flatpak >/dev/null 2>&1 || return 0
   msg "flatpak: updating remote repos + all installations..."
-  if ! run flatpak remote-ls --updates 2>/dev/null | grep -q .; then
-    _log "flatpak: no updates available"
+  local rc=0
+  # `flatpak remote-ls --updates` exits 0 whether or not there are updates
+  # available, so we count lines to decide. Use process substitution to
+  # avoid SIGPIPE under set -o pipefail.
+  if mapfile -t _flatpak_updates < <(flatpak remote-ls --updates 2>/dev/null); then
+    if [ "${#_flatpak_updates[@]}" -gt 0 ]; then
+      if ! run flatpak update -y --assumeyes; then
+        err "flatpak update failed"; _track; rc=1
+      else
+        _track
+      fi
+    else
+      _log "flatpak: no updates available"
+    fi
   else
-    run flatpak update -y --assumeyes
-    _track
+    _log "flatpak: remote-ls failed — skipping"
   fi
+  unset _flatpak_updates
   run flatpak uninstall --unused -y --assumeyes 2>/dev/null || true
   ok "flatpak"
+  return $rc
 }
 
 # ── Docker ────────────────────────────────────────────────────────────────
@@ -163,24 +185,28 @@ _update_flatpak() {
 _update_docker() {
   command -v docker >/dev/null 2>&1 || return 0
   msg "docker: pulling latest images..."
-  local images rc=0
+  local images
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' || true)
   if [ -z "$images" ]; then
     _log "docker: no local images to update"
     return 0
   fi
+  local failed=0
   while IFS= read -r img; do
     [ -z "$img" ] && continue
     if docker pull "$img" >/dev/null 2>&1; then
       _log "docker: updated $img"
+      UPDATED=$((UPDATED+1))
     else
       warn "docker: failed to pull $img"
-      rc=1
+      failed=$((failed+1))
     fi
   done <<< "$images"
-  # Prune dangling images.
   docker image prune -f >/dev/null 2>&1 || true
-  if [ $rc -eq 0 ]; then ok "docker images"; else _track; fi
+  if [ $failed -gt 0 ]; then
+    FAILED=$((FAILED+failed))
+    return 1
+  fi
 }
 
 # ── Homebrew ─────────────────────────────────────────────────────────────
@@ -234,23 +260,29 @@ _update_geoip() {
     return 0
   fi
   # Check age: skip if newer than 30 days.
-  if [ -n "$geoip_db" ] && [ -f "$geoip_db" ]; then
-    local age
-    age=$(find "$geoip_db" -mtime -30 2>/dev/null | wc -l || echo 0)
-    if [ "$age" -gt 0 ]; then
-      _log "geoip: database is recent — skipping"
-      return 0
-    fi
+  local age
+  age=$(find "$geoip_db" -mtime -30 2>/dev/null | wc -l || echo 0)
+  if [ "$age" -gt 0 ]; then
+    _log "geoip: database is recent — skipping"
+    return 0
   fi
   msg "geoip: updating MaxMind GeoLite2 database..."
   local tmp_db
-  tmp_db=$(mktemp)
+  tmp_db=$(mktemp) || { warn "geoip: mktemp failed"; return 1; }
+  # Ensure the temp file is removed even on early exit (interrupt, error).
+  trap 'rm -f "$tmp_db" 2>/dev/null || true' RETURN
   if curl -fsSL "$geoip_url" -o "$tmp_db" 2>/dev/null; then
-    run sudo install -m 644 "$tmp_db" "$geoip_db" && ok "geoip" || { warn "geoip: install failed"; _track; }
+    if run sudo install -m 644 "$tmp_db" "$geoip_db"; then
+      ok "geoip"
+    else
+      warn "geoip: install failed"
+      _track
+    fi
   else
     warn "geoip: download failed — skipping"
   fi
-  rm -f "$tmp_db"
+  rm -f "$tmp_db" 2>/dev/null || true
+  trap - RETURN
 }
 
 # ── libvirt / virsh definitions ───────────────────────────────────────────
@@ -268,15 +300,18 @@ _update_virsh() {
   msg "virsh: updating libvirt storage pool and network definitions..."
   # virsh pool/net --name prints a "Name" header followed by one name per
   # line. Strip blank lines and the literal "Name" header to get a clean
-  # list of pool/net names.
-  for pool in $(virsh pool-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d'); do
+  # list of pool/net names. Use `while read` so names with embedded
+  # whitespace are kept intact (a `for x in $(...)` would split them).
+  while IFS= read -r pool; do
+    [ -z "$pool" ] && continue
     _log "virsh: refreshing pool $pool"
     run sudo virsh pool-refresh "$pool" 2>/dev/null || true
-  done
-  for net in $(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d'); do
+  done < <(virsh pool-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
+  while IFS= read -r net; do
+    [ -z "$net" ] && continue
     _log "virsh: auto-starting network $net"
     run sudo virsh net-autostart "$net" 2>/dev/null || true
-  done
+  done < <(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
   ok "virsh"
 }
 
@@ -314,8 +349,13 @@ _update_btrfs_balance() {
     _log "btrfs: requires root — skipping"
     return 0
   fi
-  msg "btrfs: usage at ${usage}% — consider running 'sudo btrfs balance start -dusage=70 /'"
-  ok "btrfs check"
+  msg "btrfs: usage at ${usage}% — running usage-balanced operation..."
+  if run sudo btrfs balance start -dusage=70 / 2>&1; then
+    ok "btrfs balance complete"
+  else
+    warn "btrfs balance returned non-zero — may need manual intervention"
+    _track
+  fi
 }
 
 _update_pihole() {

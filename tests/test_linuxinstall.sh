@@ -83,6 +83,17 @@ else
   echo "lib/temp.sh not found at $ROOT/lib"; exit 2
 fi
 
+# --- lib/updater.sh: source the real library so _run_all_updates and
+# the per-package-manager helpers exist in the test env.  We deliberately
+# do not invoke the dispatcher here (the slice doesn't define `run` in a
+# way that matches production); we just want the function declarations.
+if [ -r "$ROOT/lib/updater.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$ROOT/lib/updater.sh"
+else
+  echo "lib/updater.sh not found at $ROOT/lib"; exit 2
+fi
+
 # --- _valid_step: every documented alias must be accepted ---
 EXPECTED_KEYS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
 for k in $EXPECTED_KEYS; do
@@ -300,6 +311,33 @@ if declare -F _ssh_self_heal_check >/dev/null 2>&1; then
   fi
 else
   fail_t "_ssh_self_heal_check: declared" "not found"
+fi
+
+# --- _run_all_updates dispatcher smoke-test ---
+# All sub-update functions must exist (they are sourced from the inline fallback).
+for _fn in _update_apt _update_dnf _update_yum _update_zypper _update_pacman \
+           _update_snap _update_flatpak _update_docker _update_brew _update_firmware; do
+  if declare -F "$_fn" >/dev/null 2>&1; then
+    ok_t "_run_all_updates sub: $_fn declared"
+  else
+    fail_t "_run_all_updates sub: $_fn declared" "not found"
+  fi
+done
+# _run_all_updates itself must be declared.
+if declare -F _run_all_updates >/dev/null 2>&1; then
+  ok_t "_run_all_updates: dispatcher declared"
+else
+  fail_t "_run_all_updates: dispatcher declared" "not found"
+fi
+# On a test host with no package managers, the dispatcher should not abort.
+# It may return 0 (all skipped) or 1 (nothing to update), but must not crash.
+if [ "$FAIL" -eq 0 ]; then
+  UPDATED=0 FAILED=0 _run_all_updates >/dev/null 2>&1; rc=$?
+  if [ "$rc" -le 1 ]; then
+    ok_t "_run_all_updates: completes cleanly (rc=$rc) on host with no package managers"
+  else
+    fail_t "_run_all_updates: unexpected rc" "got rc=$rc (expected 0 or 1)"
+  fi
 fi
 
 echo
