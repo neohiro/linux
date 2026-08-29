@@ -75,11 +75,13 @@ _update_apt() {
     msg "apt: upgrading $count package(s)..."
     if ! run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade; then
       err "apt upgrade failed"; _track
+      run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq 2>/dev/null || true
+      run sudo apt-get -y clean -qq 2>/dev/null || true
     else
       _track
+      run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
+      run sudo apt-get -y clean -qq
     fi
-    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
-    run sudo apt-get -y clean -qq
   else
     _log "apt: nothing to upgrade"
   fi
@@ -215,11 +217,9 @@ _update_brew() {
   command -v brew >/dev/null 2>&1 || return 0
   msg "brew: updating..."
   HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null || true
-  if command -v brew >/dev/null 2>&1; then
-    run brew upgrade 2>/dev/null || true
-    run brew cleanup -s -q 2>/dev/null || true
-    ok "brew"
-  fi
+  run brew upgrade 2>/dev/null || true
+  run brew cleanup -s -q 2>/dev/null || true
+  ok "brew"
 }
 
 # ── Firmware (fwupdmgr / LVFS) ───────────────────────────────────────────
@@ -232,8 +232,14 @@ _update_firmware() {
   available=$(fwupdmgr get-updates 2>/dev/null | grep -c 'Firmware Update' || echo 0)
   if [ "$available" -gt 0 ]; then
     msg "fwupdmgr: $available update(s) available — installing..."
-    run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true
-    ok "fwupdmgr"
+    if run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null; then
+      _track
+      ok "fwupdmgr"
+    else
+      warn "fwupdmgr: update failed"
+      FAILED=$((FAILED+1))
+      ok "fwupdmgr (partial)"
+    fi
   else
     _log "fwupdmgr: no firmware updates"
   fi
@@ -242,7 +248,9 @@ _update_firmware() {
 # ── GeoIP database (MaxMind) ─────────────────────────────────────────────
 
 _update_geoip() {
-  local geoip_dir="/var/lib/GeoIP"
+  # Update the MaxMind GeoIP database. We look for any of the common
+  # GeoLite2 / legacy GeoIP.dat file locations and update the first match
+  # that is older than 30 days.
   local geoip_url="https://git.io/geoip"
   # Common locations for GeoIP Country database.
   local geoip_db geoip_candidates=(
@@ -302,16 +310,28 @@ _update_virsh() {
   # line. Strip blank lines and the literal "Name" header to get a clean
   # list of pool/net names. Use `while read` so names with embedded
   # whitespace are kept intact (a `for x in $(...)` would split them).
+  local virsh_failed=0
   while IFS= read -r pool; do
     [ -z "$pool" ] && continue
     _log "virsh: refreshing pool $pool"
-    run sudo virsh pool-refresh "$pool" 2>/dev/null || true
+    if ! run sudo virsh pool-refresh "$pool" 2>/dev/null; then
+      warn "virsh: pool-refresh failed for $pool"
+      virsh_failed=$((virsh_failed+1))
+    fi
   done < <(virsh pool-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
   while IFS= read -r net; do
     [ -z "$net" ] && continue
     _log "virsh: auto-starting network $net"
-    run sudo virsh net-autostart "$net" 2>/dev/null || true
+    if ! run sudo virsh net-autostart "$net" 2>/dev/null; then
+      warn "virsh: net-autostart failed for $net"
+      virsh_failed=$((virsh_failed+1))
+    fi
   done < <(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
+  if [ $virsh_failed -gt 0 ]; then
+    FAILED=$((FAILED+virsh_failed))
+  else
+    _track
+  fi
   ok "virsh"
 }
 
@@ -351,10 +371,11 @@ _update_btrfs_balance() {
   fi
   msg "btrfs: usage at ${usage}% — running usage-balanced operation..."
   if run sudo btrfs balance start -dusage=70 / 2>&1; then
+    _track
     ok "btrfs balance complete"
   else
     warn "btrfs balance returned non-zero — may need manual intervention"
-    _track
+    FAILED=$((FAILED+1))
   fi
 }
 
