@@ -22,6 +22,10 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   # shellcheck disable=SC1091
   source "$_NEOHIRO_LIB_DIR/temp.sh"
   # shellcheck disable=SC1091
+  if [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
+    source "$_NEOHIRO_LIB_DIR/runner.sh"
+  fi
+  # shellcheck disable=SC1091
   if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
     source "$_NEOHIRO_LIB_DIR/updater.sh"
   fi
@@ -360,23 +364,13 @@ STRICT_RUN="${STRICT_RUN:-0}"
 QUICK_MODE="${QUICK_MODE:-0}"
 _FAIL_COUNT=0
 
-run() {
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    printf "  %s\n" "DRY: $*"; return 0
+# Source the shared runner helpers. _runner_cmd is the canonical implementation;
+# alias it to `run` so all existing call sites are satisfied.
+  # shellcheck disable=SC1091
+  if [ -n "${_NEOHIRO_LIB_DIR:-}" ] && [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
+    source "$_NEOHIRO_LIB_DIR/runner.sh"
+    run() { _runner_cmd "$@"; }
   fi
-  msg "$*"
-  "$@"
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    err "Command failed (exit $rc): $*"
-    _FAIL_COUNT=$((_FAIL_COUNT + 1))
-    if declare -F _log_error >/dev/null 2>&1; then _log_error "$rc" "$*"; fi
-  fi
-  if [ "$STRICT_RUN" = "1" ]; then
-    return $rc
-  fi
-  return 0
-}
 
 # Offer a Retry / Skip / Abort choice after a step failure.
 # Only prompts when running interactively (tty + not QUIET_PROMPTS).

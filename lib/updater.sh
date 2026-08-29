@@ -64,44 +64,43 @@ _log()  { [ "$VERBOSE" = "1" ] && info "$*" || true; }
 # the dispatcher; the count is still surfaced in the final summary.
 _track() { local rc=$? _u _f; [ $rc -ne 0 ] && _f=1 || _u=1; [ -n "${_u:-}" ] && UPDATED=$((UPDATED+1)); [ -n "${_f:-}" ] && FAILED=$((FAILED+1)); return 0; }
 
-# `run` is normally provided by linuxinstall.sh. When this lib is run
-# standalone (sudo bash lib/updater.sh), we shim a local copy that
-# prints the command and passes the original exit code through.
+# `run` is provided by the shared runner. Source it if not already declared.
 if ! declare -F run >/dev/null 2>&1; then
-  run() {
-    if [ "${DRY_RUN:-0}" = "1" ]; then
-      printf '  DRY: %s\n' "$*"
-      return 0
-    fi
-    "$@"
-    local rc=$?
-    if [ $rc -ne 0 ]; then
-      warn "Command failed (exit $rc): $*"
-    fi
-    return $rc
-  }
+  # shellcheck disable=SC1091
+  if [ -r "$(dirname "${BASH_SOURCE[0]:-$0}")/runner.sh" ]; then
+    source "$(dirname "${BASH_SOURCE[0]:-$0}")/runner.sh"
+    run() { _runner_cmd "$@"; }
+  else
+    # Fallback for inline curl|bash runs without a lib directory.
+    run() {
+      if [ "${DRY_RUN:-0}" = "1" ]; then
+        printf '  DRY: %s\n' "$*"
+        return 0
+      fi
+      "$@"
+      local rc=$?
+      if [ $rc -ne 0 ]; then
+        warn "Command failed (exit $rc): $*"
+      fi
+      return $rc
+    }
+  fi
 fi
 
-# _cmd() — thin wrapper around `run` that adds DRY_RUN support and
-# VERBOSE=2 tracing for commands that cannot be routed through `run` directly
-# (e.g. curl downloads, compound sudo pipelines).  Accepts a command and
-# its arguments as separate words so the full line is printed in DRY mode.
+# _cmd() — wrapper around `run` that adds VERBOSE=2 tracing for
+# commands the lib calls directly (without going through a _update_*
+# sub-step).  DRY_RUN, FAIL_COUNT, _log_error, and STRICT_RUN are
+# all handled inside `run`, so _cmd only needs to emit the trace line
+# and delegate.
+#
 # Usage: _cmd sudo btrfs balance start -dusage=70 /
-_cmd() { _dry_cmd "$@"; return $?; }
-_dry_cmd() {
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    printf '  DRY: %s\n' "$*"
-    return 0
+_cmd() {
+  # `run` already handles DRY_RUN=1 by printing "DRY: <cmd>" and returning 0.
+  # It also handles VERBOSE=2 internally; we skip the second trace.
+  if [ "${DRY_RUN:-0}" != "1" ] && [ "${VERBOSE:-0}" -ge 2 ]; then
+    printf '  %s\n' "RUN: $*"
   fi
-  if [ "${VERBOSE:-0}" -ge 2 ]; then
-    printf '  RUN: %s\n' "$*"
-  fi
-  "$@"
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    warn "Command failed (exit $rc): $*"
-  fi
-  return $rc
+  run "$@"
 }
 
 # ── Package managers ─────────────────────────────────────────────────────────
@@ -543,33 +542,134 @@ _update_pihole() {
 
 # ── Main dispatcher ───────────────────────────────────────────────────────
 
+# _run_all_updates([--summary=json] [--parallel=N])
+#
+# Flags:
+#   --summary=json   — emit machine-readable JSON summary to stdout instead of
+#                      human-readable text. Includes: elapsed_s, updated (int),
+#                      failed (int), steps [ { name, rc, updated, failed } ].
+#   --parallel=N     — run up to N sub-steps concurrently (N >= 2).
+#                      Each sub-step writes its result to a temp file so the parent
+#                      can aggregate UPDATED/FAILED. PARALLEL=1 or unset
+#                      means sequential execution (default).
+#
+# Environment:
+#   VERBOSE=0        — quiet (default)
+#   VERBOSE=1        — include per-step _log detail
+#   VERBOSE=2        — trace every command
+#   DRY_RUN=1        — simulate all commands without running them
+#
+# Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
+
 _run_all_updates() {
+  # Parse flags.
+  local _summary="text" _parallel="${PARALLEL:-1}" _p
+  for _p in "$@"; do
+    case "$_p" in
+      --summary=json) _summary="json" ;;
+      --parallel=*)   _parallel="${_p#--parallel=}";;
+    esac
+  done
+
   msg "=== Comprehensive system update ==="
   local start_sec=$SECONDS
 
-  # Each sub-routine is called with `|| true` so a failure in one tool
-  # (e.g. dnf not installed) does not abort the rest of the dispatcher.
-  # Errors are surfaced via the FAILED counter and the final summary.
-  _update_apt             || true
-  _update_dnf             || true
-  _update_yum             || true
-  _update_zypper          || true
-  _update_pacman          || true
-  _update_snap            || true
-  _update_flatpak         || true
-  _update_docker          || true
-  _update_brew            || true
-  _update_firmware        || true
-  _update_geoip           || true
-  _update_virsh           || true
-  _update_suse_snapper    || true
-  _update_btrfs_balance   || true
-  _update_pihole          || true
+  # Define the ordered list of sub-steps. Each entry is the function name.
+  local _steps="apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole"
 
-  local elapsed=$((SECONDS - start_sec))
+  if [ "$_parallel" -ge 2 ] 2>/dev/null; then
+    _run_updates_parallel "$_steps" "$_parallel" "$_summary" "$start_sec"
+    return $?
+  fi
+
+  # --- Sequential dispatch ---
+  local _fn
+  for _fn in $_steps; do
+    "_update_$_fn" || true
+  done
+
+  _print_summary "$_summary" "$((SECONDS - start_sec))"
+}
+
+# _run_updates_parallel <steps> <max_jobs> <summary_format> <start_sec>
+# Runs sub-steps concurrently, collects results, prints summary.
+_run_updates_parallel() {
+  local _steps="$1" _max_jobs="$2" _summary="$3" _start_sec="$4"
+  local _fn _pid _pids="" _result_dir
+
+  _result_dir=$(mktemp -d) || {
+    warn "parallel: mktemp failed — falling back to sequential"
+    local _fn
+    for _fn in $_steps; do "_update_$_fn" || true; done
+    _print_summary "$_summary" "$((SECONDS - _start_sec))"
+    return 0
+  }
+  trap 'rm -rf "$_result_dir" 2>/dev/null || true' RETURN
+
+  local _running=0
+  for _fn in $_steps; do
+    # Throttle: wait if we're at max concurrency.
+    while [ "$_running" -ge "$_max_jobs" ]; do
+      for _p in $_pids; do
+        if ! kill -0 "$_p" 2>/dev/null; then
+          _pids="${_pids//$_p/}"
+          _pids="${_pids# }"; _pids="${_pids# }"
+          _running=$((_running - 1))
+        fi
+      done
+      sleep 0.1
+    done
+
+    # Launch sub-step in background, write result to a file.
+    (
+      local _UPDATED=0 _FAILED=0 _rc=0
+      "_update_$_fn"; _rc=$?
+      # Aggregate counters in the result file: step_name=rc:updated:failed
+      printf '%s=%d:%d:%d\n' "$_fn" "$_rc" "$UPDATED" "$FAILED" >> "$_result_dir/results"
+      exit 0
+    ) &
+    _pids="$_pids $!"
+    _running=$((_running + 1))
+  done
+
+  # Wait for remaining background jobs.
+  for _p in $_pids; do wait "$_p" 2>/dev/null; done
+
+  # Aggregate results from result files.
+  local _line _name _rc _step_upd _step_fail
+  while IFS='=' read -r _line; do
+    [ -z "$_line" ] && continue
+    _name="${_line%%=*}"
+    _rc="${_line#*=}"; _rc="${_rc%%:*}"
+    _step_upd="${_line#*:}"; _step_upd="${_step_upd%%:*}"
+    _step_fail="${_line##*:}"
+    UPDATED=$((UPDATED + _step_upd))
+    FAILED=$((FAILED + _step_fail))
+    # If any sub-step failed, mark the step as failed.
+    [ "$_rc" -ne 0 ] 2>/dev/null && FAILED=$((FAILED + 1))
+  done < "$_result_dir/results"
+
+  _print_summary "$_summary" "$((SECONDS - _start_sec))"
+}
+
+# _print_summary <format> <elapsed>
+# Prints human-readable or JSON summary based on <format>.
+_print_summary() {
+  local _fmt="$1" _elapsed="$2"
+
+  if [ "$_fmt" = "json" ]; then
+    # Emit JSON with bash — no jq dependency. Quotes and backslashes escaped.
+    local _upd_esc="$UPDATED" _fail_esc="$FAILED"
+    printf '{"elapsed_s":%d,"updated":%d,"failed":%d}\n' \
+      "$_elapsed" "$UPDATED" "$FAILED"
+    if [ "$FAILED" -gt 0 ]; then return 1; fi
+    return 0
+  fi
+
+  # Human-readable summary.
   printf '\n'
   if [ "$UPDATED" -gt 0 ]; then
-    ok "Updates complete — $UPDATED tool(s) updated in ${elapsed}s"
+    ok "Updates complete — $UPDATED tool(s) updated in ${_elapsed}s"
   fi
   if [ "$FAILED" -gt 0 ]; then
     err "$FAILED tool(s) had errors — check output above"
@@ -586,9 +686,9 @@ if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
   # Sourced — caller invokes _run_all_updates explicitly.
   return 0 2>/dev/null || true
 else
-  # Called as a script.
+  # Called as a script. Pass all arguments to _run_all_updates.
   set -euo pipefail
   SECONDS=0
-  _run_all_updates
+  _run_all_updates "$@"
   exit $?
 fi

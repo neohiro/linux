@@ -100,5 +100,12 @@ for script in linuxinstall.sh restore_ssh.sh DeepClean.sh OptimizeLinuxASR.sh; d
   fi
 done
 
+# --- runner.sh: if any top-level script sources lib/runner.sh, the inline
+# fallback for `run` is sufficient. We do not require an inline copy of
+# runner.sh itself; the canonical library file is the source of truth.
+if [ -r "$LIB/runner.sh" ]; then
+  : # presence is sufficient; scripts that need it source it directly.
+fi
+
 [ "$FAIL" -eq 0 ] && echo "INLINE: no drift detected"
 exit "$FAIL"

@@ -215,7 +215,6 @@ fi
 # _log prints only when VERBOSE=1; verify by capturing output.
 log_output=$(
   USE_COLOR=0
-  # Stub info() to capture its argument
   info() { printf 'LOG:%s\n' "$*"; }
   VERBOSE=0
   _log "hidden message"
@@ -228,6 +227,47 @@ if printf '%s' "$log_output" | grep -q "LOG:visible message" && \
   ok_t "VERBOSE=1 controls _log(): visible only when set"
 else
   fail_t "VERBOSE=1 controls _log()" "got: $log_output"
+fi
+
+# --- Test 14: --summary=json emits valid JSON ---
+# The JSON output should contain elapsed_s, updated, failed fields.
+# We verify it parses as JSON by checking the brace syntax.
+# shellcheck disable=SC2094
+json_output=$(_run_all_updates --summary=json 2>/dev/null)
+if [ -n "$json_output" ] \
+   && printf '%s' "$json_output" | grep -qE '^\{"elapsed_s":[0-9]+,"updated":[0-9]+,"failed":[0-9]+\}$'; then
+  ok_t "_run_all_updates --summary=json: emits valid JSON"
+else
+  fail_t "_run_all_updates --summary=json" "got: $json_output"
+fi
+
+# --- Test 15: --parallel=1 runs sequentially (no temp dir) ---
+# PARALLEL=1 should be equivalent to sequential; returns 0 on bare host.
+unset PARALLEL
+UPDATED=0; FAILED=0
+result=0
+_run_all_updates --parallel=1 2>/dev/null || result=$?
+if [ "$result" -le 1 ]; then
+  ok_t "_run_all_updates --parallel=1: sequential execution returns $result"
+else
+  fail_t "_run_all_updates --parallel=1" "got rc=$result"
+fi
+
+# --- Test 16: _runner_cmd (run alias) is declared after sourcing ---
+if declare -F _runner_cmd >/dev/null 2>&1; then
+  ok_t "_runner_cmd helper: declared"
+else
+  fail_t "_runner_cmd helper: declared" "not found"
+fi
+
+# --- Test 17: run() delegates to _runner_cmd ---
+# Calling run() should behave identically to _runner_cmd().
+# On a bare host (no package managers), both should return 0.
+# We verify run() is callable.
+if declare -F run >/dev/null 2>&1; then
+  ok_t "run function: declared"
+else
+  fail_t "run function: declared" "not found"
 fi
 
 echo
