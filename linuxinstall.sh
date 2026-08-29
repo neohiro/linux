@@ -21,6 +21,10 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   source "$_NEOHIRO_LIB_DIR/color.sh"
   # shellcheck disable=SC1091
   source "$_NEOHIRO_LIB_DIR/temp.sh"
+  # shellcheck disable=SC1091
+  if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
+    source "$_NEOHIRO_LIB_DIR/updater.sh"
+  fi
 else
   # Inline fallback for run-from-pipe (curl ... | bash) where the lib
   # directory is not on disk. Same canonical definitions, kept in sync
@@ -67,6 +71,58 @@ else
   }
 fi
 unset _NEOHIRO_LIB_DIR
+
+# Inline fallback for lib/updater.sh (curl|bash path).  Provides
+# _run_all_updates so the Updates-only profile and the main script's update
+# step can use the comprehensive update engine without requiring the lib
+# directory to be on disk.
+if ! declare -F _run_all_updates >/dev/null 2>&1; then
+  VERBOSE="${VERBOSE:-0}"; UPDATED=0; FAILED=0
+  _log() { [ "$VERBOSE" = "1" ] && info "$*" || true; }
+  _update_apt()    { command -v apt >/dev/null 2>&1 || return 0
+    run sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
+    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade
+    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
+    run sudo apt-get clean -qq; }
+  _update_dnf()   { command -v dnf >/dev/null 2>&1 || return 0
+    run sudo dnf upgrade --refresh -y -q || return 1
+    run sudo dnf autoremove -y -q; }
+  _update_yum()   { command -v yum >/dev/null 2>&1 || return 0
+    run sudo yum update -y -q || return 1
+    run sudo yum autoremove -y -q; }
+  _update_zypper(){ command -v zypper >/dev/null 2>&1 || return 0
+    run sudo zypper --quiet refresh
+    run sudo zypper update -y --quiet || return 1
+    run sudo zypper --quiet clean; }
+  _update_pacman(){ command -v pacman >/dev/null 2>&1 || return 0
+    run sudo pacman -Syu --noconfirm --quiet || return 1
+    run sudo pacman -Scc --noconfirm -q; }
+  _update_snap()  { command -v snap >/dev/null 2>&1 || return 0
+    run sudo snap refresh 2>/dev/null || true; }
+  _update_flatpak(){ command -v flatpak >/dev/null 2>&1 || return 0
+    run flatpak update -y --assumeyes 2>/dev/null || true
+    run flatpak uninstall --unused -y --assumeyes 2>/dev/null || true; }
+  _update_docker() { command -v docker >/dev/null 2>&1 || return 0
+    while IFS= read -r img; do
+      [ -z "$img" ] && continue
+      docker pull "$img" >/dev/null 2>&1 || true
+    done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>')
+    docker image prune -f >/dev/null 2>&1 || true; }
+  _update_brew()  { command -v brew >/dev/null 2>&1 || return 0
+    HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null || true
+    run brew upgrade 2>/dev/null || true
+    run brew cleanup -s -q 2>/dev/null || true; }
+  _update_firmware(){ command -v fwupdmgr >/dev/null 2>&1 || return 0
+    run sudo fwupdmgr refresh 2>/dev/null || true
+    run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
+  _run_all_updates() {
+    msg "=== Comprehensive system update ==="
+    _update_apt; _update_dnf; _update_yum
+    _update_zypper; _update_pacman
+    _update_snap; _update_flatpak
+    _update_docker; _update_brew; _update_firmware
+    printf '\n'; ok "Update engine complete."; }
+fi
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
 ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
@@ -1138,6 +1194,7 @@ print_welcome() {
     1) _step_count=6 _ssh_note="(no SSH changes)" ;;
     2) _step_count=10 _ssh_note="(includes SSH hardening)" ;;
     3) _step_count=12 _ssh_note="(includes SSH hardening + Tor)" ;;
+    7|8|9) _step_count=1 _ssh_note="(single-mode)" ;;
     *) _step_count=0 _ssh_note="" ;;
   esac
   printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
@@ -1172,6 +1229,9 @@ _profile_label() {
     4) echo "Custom" ;;
     5) echo "Restore SSH" ;;
     6) echo "Maintenance" ;;
+    7) echo "DeepClean" ;;
+    8) echo "Attack Surface Reduction" ;;
+    9) echo "Updates only" ;;
     *) echo "unknown" ;;
   esac
 }
@@ -1209,7 +1269,7 @@ ask_profile() {
   printf '  %s        %s\n' "" "$(_c '1;30m' 'No risk of SSH lockout.  ~6 steps.  Takes 1-3 min.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;36m' '2) Standard')"   "$(_c '1;37m' 'Recommended + SSH hardening, Fail2ban, kernel sysctls,')"
-  printf '  %s        %s\n' "" "$(_c '1;30m' 'AppArmor, password policies.  ~10 steps.  Takes 3-5 min.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'attack-surface reduction, AppArmor, password policies.  ~11 steps.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;35m' '3) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~12 steps.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Most aggressive.  Takes 5-10 min.')"
@@ -1223,6 +1283,15 @@ ask_profile() {
   printf '  %s  %s\n' "$(_c '1;1;35m' '6) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
   printf '\n'
+  printf '  %s  %s\n' "$(_c '1;32m' '7) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'snap/dock/flatpak cleanup, systemd coredump, logrotate.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;32m' '8) Attack Surface Reduction')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Categories: hardware, networking, legacy protocols, etc.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;32m' '9) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (but do not enable)')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'tor / fail2ban / shadowsocks / dnscrypt. Auto-update opt-in.')"
+  printf '\n'
   printf '  %s\n' "$_hr"
   prompt_choice "Apply which set of categories?" \
     "Recommended (safe, no SSH-lockout risk)" \
@@ -1230,7 +1299,10 @@ ask_profile() {
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
     "Custom (I will be asked per category)" \
     "Restore SSH (diagnose & fix common lockout causes; option-only menu)" \
-    "Maintenance suite (pick individual categories, return to this menu)"
+    "Maintenance suite (pick individual categories, return to this menu)" \
+    "DeepClean (cleanup + auto-prune; no hardening)" \
+    "Attack Surface Reduction (OptimizeLinuxASR.sh; service-by-service)" \
+    "Updates only (system update + kernel + optional packages + auto-update)"
   REPLY_PROFILE=$REPLY_CHOICE
   if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
     info "Quick mode: individual prompts skipped — using recommended defaults."
@@ -1247,7 +1319,7 @@ ask_category_enabled() {
   fi
   case "$REPLY_PROFILE" in
     1) [ "$default" = "y" ]; return $?;;
-    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ]; return $?;;
+    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;
     3) return 0;;
     4) prompt_yn "Run: $desc?" "$default"; return $?;;
     5) return 1;;
@@ -2738,6 +2810,112 @@ run_deepclean() {
   run_remote_script "DeepClean.sh"
 }
 
+# --- Updates-only profile (REPLY_PROFILE=9) ---
+# Updates all system packages, optionally installs (but does not enable)
+# tor / fail2ban / shadowsocks-libev / dnscrypt-proxy, and asks once
+# about enabling automatic (security) updates. Never touches firewall,
+# SSH, sysctl, AppArmor, or any hardening. Use this for a "just sync
+# the system and have the latest binaries" pass.
+updates_only_mode() {
+  bold "=== Updates-only mode ==="
+  info "This runs the comprehensive update engine (every available package"
+  info "manager + snap + flatpak + docker + brew + firmware), then installs"
+  info "(but does not enable) the core service binaries, and optionally"
+  info "enables automatic (security) updates. No firewall, SSH, or hardening."
+  echo
+
+  # 1) Comprehensive system update — every package manager + snap/flatpak
+  # + docker images + brew + firmware. Same engine lives in lib/updater.sh
+  # and is also runnable standalone:  sudo bash lib/updater.sh
+  if ask_category_enabled "system" "Comprehensive system update" "y"; then
+    _step_begin "system_update" "Comprehensive system update" "${_STEP_PREVIEWS[system]}"
+    SECONDS=0
+    local _rc=0
+    _run_all_updates || _rc=$?
+    _step_end "system_update" "Comprehensive system update"
+    if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
+  fi
+
+  # 1b) Kernel update. The update engine above does not touch the kernel
+  # on apt (full-upgrade does, but we want a single explicit pass that
+  # also prunes old kernels). dnf/yum/zypper/pacman get the same single
+  # explicit pass. No reboot is issued — the end-of-run summary offers
+  # one.
+  if ask_category_enabled "system" "Kernel update + prune" "y"; then
+    _step_begin "system_update" "Kernel update + prune" ""
+    SECONDS=0
+    local _rc=0
+    update_kernel || _rc=$?
+    _step_end "system_update" "Kernel update + prune"
+    if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
+  fi
+
+  # 2) Install core service binaries. Each is gated on "y" default and
+  # is installed only (services left disabled) so the user can enable
+  # them on their own schedule. shadowsocks-libev is installed on every
+  # supported family per SHADOWSOCKS-LIBEV.md.
+  local _pkgs=()
+  if prompt_yn "Install shadowsocks-libev (SOCKS5 proxy, kept disabled)?" "n"; then
+    _pkgs+=(shadowsocks-libev)
+  fi
+  if prompt_yn "Install fail2ban (brute-force protection, kept disabled)?" "n"; then
+    _pkgs+=(fail2ban)
+  fi
+  if prompt_yn "Install tor (anonymity relay, kept disabled)?" "n"; then
+    _pkgs+=(tor)
+  fi
+  if prompt_yn "Install dnscrypt-proxy (DoH/DoT resolver, kept disabled)?" "n"; then
+    _pkgs+=(dnscrypt-proxy)
+  fi
+  if [ "${#_pkgs[@]}" -gt 0 ]; then
+    info "Installing: ${_pkgs[*]} (services will NOT be enabled)."
+    if ! pkg_install "${_pkgs[@]}"; then
+      err "One or more package installs failed. Continuing."
+    fi
+  else
+    info "No service packages selected."
+  fi
+
+  # 3) Automatic (security) updates: opt-in, with the actual configure
+  # step delegated to the existing per-distro helper. apt gets the full
+  # unattended-upgrades flow; dnf/yum get dnf-automatic; zypper/pacman
+  # get a one-line suggestion and skip (per the README).
+  echo
+  if prompt_yn "Enable automatic (security) updates on this machine?" "y"; then
+    case "$PKG_MGR" in
+      apt)
+        if ask_category_enabled "unattended" "Unattended security upgrades" "y"; then
+          _step_begin "unattended" "Unattended security upgrades" "${_STEP_PREVIEWS[unattended]}"
+          SECONDS=0
+          local _rc=0
+          configure_unattended_upgrades || _rc=$?
+          _step_end "unattended" "Unattended security upgrades"
+          if [ "$_rc" -ne 0 ]; then mark_step "unattended" skip; fi
+        fi
+        ;;
+      dnf|yum)
+        if pkg_install dnf-automatic; then
+          run sudo systemctl enable --now dnf-automatic.timer
+          ok "dnf-automatic.timer enabled (security updates only)."
+        else
+          err "dnf-automatic install failed."
+        fi
+        ;;
+      zypper)
+        info "openSUSE/SLES: install 'yast2-online-update-configuration' to enable automatic updates via YaST2."
+        ;;
+      pacman)
+        info "Arch: install an AUR helper (yay/paru) and an auto-update package such as 'aur-auto-update' or 'pacman-contrib' / 'systemd-timer-pacman'."
+        ;;
+      *)
+        info "No automatic-update helper defined for $PKG_MGR; skipping."
+        ;;
+    esac
+  else
+    info "Automatic updates left disabled."
+  fi
+}
+
 # ask_other_scripts() removed — linux repo does not carry ubuntusocks.sh
 # or linuxinstallserver.sh. Expand via PR when those are cross-distro-ported.
 
@@ -3369,6 +3547,31 @@ USAGE
     return $?
   fi
 
+  if [ "$REPLY_PROFILE" = "7" ]; then
+    # DeepClean — fetch the script, prompt, run. No hardening steps touched.
+    bold "=== DeepClean (from main menu) ==="
+    run_deepclean
+    _print_run_summary
+    return $?
+  fi
+
+  if [ "$REPLY_PROFILE" = "8" ]; then
+    # Attack Surface Reduction — fetch OptimizeLinuxASR.sh, prompt, run.
+    bold "=== Attack Surface Reduction (from main menu) ==="
+    run_optimize_asr
+    _print_run_summary
+    return $?
+  fi
+
+  if [ "$REPLY_PROFILE" = "9" ]; then
+    # Updates only — system update, optional package installs, optional
+    # automatic-updates. No firewall / SSH / sysctl / AppArmor touched.
+    bold "=== Updates only (from main menu) ==="
+    updates_only_mode
+    _print_run_summary
+    return $?
+  fi
+
   # Each step shows a one-line preview + elapsed time.  Wrapped in a
   # function-call so any failure (set -e) stops the whole run, but the
   # inline `|| { ...; }` shape below keeps set -e OFF for the main flow
@@ -3394,13 +3597,26 @@ USAGE
       return 0
     done
   }
+  # Workflow order, from most aggressive cleaning to most targeted update:
+  #   1) Attack-surface reduction FIRST — stop unneeded services so they are
+  #      no longer holding files / kernel modules when we upgrade.
+  #   2) Comprehensive system update + kernel prune — every package manager,
+  #      snap, flatpak, docker, brew, firmware, geoip.
+  #   3) Hardening layer: firewall, SSH, fail2ban, sysctl, AppArmor, ...
+  # Rationale: dropping unwanted services first means the system-update
+  # transaction does not need to chase daemons that are about to go away.
+  _run_step optimize_asr "Attack-surface reduction (stop unneeded services)"  "" run_optimize_asr   n
   # System step is special: it always follows with update_kernel so the
-  # new kernel can be detected before the run ends.
+  # new kernel can be detected before the run ends. The comprehensive
+  # update engine in lib/updater.sh covers every available package
+  # manager plus snap/flatpak/docker/brew/firmware; update_kernel handles
+  # the kernel prune pass.
   if ask_category_enabled "system" "System update + base packages" "y"; then
     while true; do
       _step_begin "system_update" "System update + base packages" "${_STEP_PREVIEWS[system]}"
       SECONDS=0
       local _rc=0
+      _run_all_updates || _rc=$?
       update_system || _rc=$?
       update_kernel || _rc=$?
       _step_end "system_update" "System update + base packages"
@@ -3419,7 +3635,6 @@ USAGE
   _run_step sysctl      "Kernel/sysctl hardening profile"            "" harden_sysctl             n
   _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
   _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
-  _run_step optimize_asr "Run OptimizeLinuxASR.sh (new helper)"       "" run_optimize_asr         n
   _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then

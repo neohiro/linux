@@ -71,6 +71,33 @@ for script in linuxinstall.sh restore_ssh.sh DeepClean.sh OptimizeLinuxASR.sh; d
       fi
     done <<< "$canonical"
   fi
+
+  # --- updater.sh inline block ---
+  # See DESIGN NOTE above. Does a SUBSET check only: every function the inline
+  # declares must exist in the canonical lib. The lib may have extras.
+  # The inline fallback starts at the "if ! declare -F _run_all_updates"
+  # line and ends at the matching outer "fi". Extract all function names
+  # declared anywhere in that block and verify each is in the lib.
+  inline_start=$(grep -nE "^if ! declare -F _run_all_updates" "$script" 2>/dev/null | head -1 | cut -d: -f1 || true)
+  if [ -n "$inline_start" ]; then
+    # Read from inline_start to EOF, then walk a brace tracker until the
+    # outer "fi" closes the if-block. We use a simple line scan.
+    inline_block=$(tail -n +"$inline_start" "$script" | awk '
+      /^if ! declare -F _run_all_updates/{in_block=1}
+      in_block && /^fi$/{print; exit}
+      in_block{print}
+    ')
+    # Every "  _funcname() {" or "  _funcname(){ ... }" in the block.
+    inline_funcs=$(grep -oE "^  _[a-z_]+\(\)" <<< "$inline_block" 2>/dev/null | sed 's/^  _//;s/()$//' | sort -u || true)
+    canonical_funcs=$(grep -oE "^_[a-z_]+\(\)" "$LIB/updater.sh" 2>/dev/null | sed 's/^_//;s/()$//' | sort -u || true)
+    while IFS= read -r fn; do
+      [ -z "$fn" ] && continue
+      if ! grep -qxF "$fn" <<< "$canonical_funcs" 2>/dev/null; then
+        echo "DRIFT: $script updater.sh inline declares _$fn() but lib/updater.sh does not"
+        FAIL=1
+      fi
+    done <<< "$inline_funcs"
+  fi
 done
 
 [ "$FAIL" -eq 0 ] && echo "INLINE: no drift detected"
