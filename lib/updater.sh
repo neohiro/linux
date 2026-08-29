@@ -11,7 +11,10 @@
 # Updates: apt/dnf/yum/zypper/pacman, snap, flatpak, docker images,
 # Homebrew, fwupdmgr firmware, GeoIP database, libvirt/virsh definitions,
 # distro-specific tooling (e.g. snapper on SUSE, btrfs balance).
-# Skips unavailable tools silently unless VERBOSE=1 is set.
+# Skips unavailable tools silently unless VERBOSE is set.
+#   VERBOSE=0  — quiet (only ok/warn/err messages)
+#   VERBOSE=1  — include _log() per-step detail
+#   VERBOSE=2  — trace every command before running (useful for dry runs)
 #
 # Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
 
@@ -78,6 +81,23 @@ if ! declare -F run >/dev/null 2>&1; then
     return $rc
   }
 fi
+
+# _cmd() — thin wrapper around `run` that adds DRY_RUN support and
+# VERBOSE=2 tracing for commands that cannot be routed through `run` directly
+# (e.g. curl downloads, compound sudo pipelines).  Accepts a command and
+# its arguments as separate words so the full line is printed in DRY mode.
+# Usage: _cmd sudo btrfs balance start -dusage=70 /
+_cmd() { _dry_cmd "$@"; return $?; }
+_dry_cmd() {
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    printf '  DRY: %s\n' "$*"
+    return 0
+  fi
+  if [ "${VERBOSE:-0}" -ge 2 ]; then
+    printf '  RUN: %s\n' "$*"
+  fi
+  "$@"
+}
 
 # ── Package managers ─────────────────────────────────────────────────────────
 
@@ -160,7 +180,7 @@ _update_snap() {
   command -v snap >/dev/null 2>&1 || return 0
   msg "snap: refreshing all snaps..."
   # Track snap refresh outcome so the dispatcher summary is accurate.
-  if run sudo snap refresh; then
+  if _cmd sudo snap refresh; then
     _track
   else
     warn "snap refresh returned non-zero (may be intentionally held snaps)"
@@ -172,26 +192,26 @@ _update_snap() {
   # while-read loop so the prune pass doesn't call `snap list` a second time.
   # Note: UPDATED must be updated in the *current* shell, not a subshell,
   # so we count removals in a named pipe passed via process substitution.
-  local stale all_snaps snap_failed=0 snap_removed=0
-  all_snaps=$(sudo snap list --all 2>/dev/null || echo "")
-  stale=$(printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
-  if [ "$stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
-    info "snap: pruning $stale disabled revision(s)..."
-    while IFS= read -r snaprev; do
-      [ -z "$snaprev" ] && continue
-      if sudo snap remove "${snaprev%%@*}" --revision="${snaprev##*@}" 2>/dev/null; then
-        snap_removed=$((snap_removed+1))
+  local _snap_stale _snap_all _snap_failed=0 _snap_removed=0
+  _snap_all=$(_cmd sudo snap list --all 2>/dev/null || echo "")
+  _snap_stale=$(printf '%s' "$_snap_all" | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
+  if [ "$_snap_stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
+    info "snap: pruning $_snap_stale disabled revision(s)..."
+    while IFS= read -r _snap_rev; do
+      [ -z "$_snap_rev" ] && continue
+      if _cmd sudo snap remove "${_snap_rev%%@*}" --revision="${_snap_rev##*@}" 2>/dev/null; then
+        _snap_removed=$((_snap_removed+1))
       else
-        warn "snap: failed to remove ${snaprev%%@*}@${snaprev##*@}"
-        snap_failed=$((snap_failed+1))
+        warn "snap: failed to remove ${_snap_rev%%@*}@${_snap_rev##*@}"
+        _snap_failed=$((_snap_failed+1))
       fi
-    done < <(printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}')
+    done < <(printf '%s' "$_snap_all" | awk '/disabled/{print $1 "@" $3}')
   fi
-  if [ "$snap_removed" -gt 0 ]; then
-    UPDATED=$((UPDATED+snap_removed))
+  if [ "$_snap_removed" -gt 0 ]; then
+    UPDATED=$((UPDATED+_snap_removed))
   fi
-  if [ "$snap_failed" -gt 0 ]; then
-    FAILED=$((FAILED+snap_failed))
+  if [ "$_snap_failed" -gt 0 ]; then
+    FAILED=$((FAILED+_snap_failed))
   fi
   # ok "snap" is called by _track above on refresh success.
   # On refresh failure the warning already fired; no duplicate message needed.
@@ -300,50 +320,91 @@ _update_firmware() {
 _update_geoip() {
   # Update the MaxMind GeoIP database. We look for any of the common
   # GeoLite2 / legacy GeoIP.dat file locations and update the first match
-  # that is older than 30 days.  Override the download URL with GEOIP_URL.
-  # Example: GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
-  local geoip_url="${GEOIP_URL:-https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb}"
+  # that is older than 30 days.
+  #
+  # Sources (checked in order):
+  #   MAXMIND_LICENSE_KEY  — official MaxMind (requires free account; 30 dl/day).
+  #     Register at https://www.maxmind.com/en/accounts/current/license-key
+  #     Export:  MAXMIND_LICENSE_KEY=your_key
+  #   GEOIP_URL             — arbitrary mirror (any URL returning a .mmdb file).
+  #     Export:  GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
+  #   (default)             — community-maintained fork (no account needed).
+  local _geoip_url=""
+  if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then
+    _geoip_url="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
+  elif [ -n "${GEOIP_URL:-}" ]; then
+    _geoip_url="$GEOIP_URL"
+  else
+    _geoip_url="https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb"
+  fi
   # Common locations for GeoIP Country database.
-  local geoip_db geoip_candidates=(
+  local _geoip_db geoip_candidates=(
     "/usr/share/GeoIP/GeoLite2-Country.mmdb"
     "/usr/share/GeoIP/GeoLite2-City.mmdb"
     "/var/lib/GeoIP/GeoLite2-Country.mmdb"
     "/usr/share/GeoIP/GeoIP.dat"
     "/usr/share/GeoIP/GeoLite.dat"
   )
-  for geoip_db in "${geoip_candidates[@]}"; do
-    [ -f "$geoip_db" ] && break
+  for _geoip_db in "${geoip_candidates[@]}"; do
+    [ -f "$_geoip_db" ] && break
   done
-  if [ ! -f "$geoip_db" ]; then
+  if [ ! -f "$_geoip_db" ]; then
     _log "geoip: no database found — skipping"
     return 0
   fi
-  # Check age: skip if newer than 30 days.
-  local age
-  age=$(find "$geoip_db" -mtime -30 2>/dev/null | wc -l || echo 0)
-  if [ "$age" -gt 0 ]; then
+  # Check age: skip if the file was modified within the last 30 days.
+  local _geoip_age
+  _geoip_age=$(find "$_geoip_db" -mtime -30 2>/dev/null | wc -l || echo 0)
+  if [ "$_geoip_age" -gt 0 ]; then
     _log "geoip: database is recent — skipping"
     return 0
   fi
   msg "geoip: updating MaxMind GeoLite2 database..."
-  local tmp_db
-  tmp_db=$(mktemp) || { warn "geoip: mktemp failed"; return 1; }
-  # Ensure the temp file is removed even on early exit (interrupt, error).
-  trap 'rm -f "$tmp_db" 2>/dev/null || true' RETURN
-  if curl -fsSL "$geoip_url" -o "$tmp_db" 2>/dev/null; then
-    if run sudo install -m 644 "$tmp_db" "$geoip_db"; then
-      _track; ok "geoip"
+  local _geoip_tmpdir
+  _geoip_tmpdir=$(mktemp -d) || { warn "geoip: mktemp failed"; return 1; }
+  trap 'rm -rf "$_geoip_tmpdir" 2>/dev/null || true' RETURN
+  if [[ "$_geoip_url" == *.tar.gz ]]; then
+    # MaxMind distributes .tar.gz. Download, extract, install the .mmdb.
+    local _geoip_tar="$_geoip_tmpdir/geoip.tar.gz"
+    if _cmd curl -fsSL "$_geoip_url" -o "$_geoip_tar" 2>/dev/null; then
+      if _cmd tar -xzf "$_geoip_tar" -C "$_geoip_tmpdir" 2>/dev/null; then
+        local _geoip_mmdb
+        _geoip_mmdb=$(find "$_geoip_tmpdir" -name 'GeoLite2-Country.mmdb' -type f 2>/dev/null | head -1)
+        if [ -n "$_geoip_mmdb" ] && [ -f "$_geoip_mmdb" ]; then
+          if _cmd sudo install -m 644 "$_geoip_mmdb" "$_geoip_db"; then
+            _track; ok "geoip (MaxMind, updated)"
+          else
+            warn "geoip: install failed"
+            FAILED=$((FAILED+1))
+          fi
+        else
+          warn "geoip: archive did not contain expected .mmdb file"
+          FAILED=$((FAILED+1))
+        fi
+      else
+        warn "geoip: tar extraction failed"
+        FAILED=$((FAILED+1))
+      fi
     else
-      warn "geoip: install failed"
+      warn "geoip: download failed (check MAXMIND_LICENSE_KEY)"
       FAILED=$((FAILED+1))
     fi
   else
-    # curl exit codes: 6=host, 7=connect, 22=HTTP 4xx/5xx, 28=timeout.
-    # All of these are real failures the user should see in the summary.
-    warn "geoip: download failed — skipping"
-    FAILED=$((FAILED+1))
+    # Community mirror or custom URL — single .mmdb file.
+    local _geoip_tmpdb="$_geoip_tmpdir/geoip.mmdb"
+    if _cmd curl -fsSL "$_geoip_url" -o "$_geoip_tmpdb" 2>/dev/null; then
+      if _cmd sudo install -m 644 "$_geoip_tmpdb" "$_geoip_db"; then
+        _track; ok "geoip"
+      else
+        warn "geoip: install failed"
+        FAILED=$((FAILED+1))
+      fi
+    else
+      warn "geoip: download failed — skipping"
+      FAILED=$((FAILED+1))
+    fi
   fi
-  rm -f "$tmp_db" 2>/dev/null || true
+  rm -rf "$_geoip_tmpdir" 2>/dev/null || true
   trap - RETURN
 }
 
@@ -399,11 +460,11 @@ _update_suse_snapper() {
     return 0
   fi
   msg "snapper: creating pre-update snapshot..."
-  local snap snap_id
-  snap=$(sudo snapper create -t pre -p -u -c root 2>/dev/null || true)
-  snap_id=$(echo "$snap" | awk '{print $1}' || echo "")
-  if [ -n "$snap_id" ]; then
-    info "snapper: snapshot $snap_id created"
+  local _snap_snap _snap_id
+  _snap_snap=$(_cmd sudo snapper create -t pre -p -u -c root 2>/dev/null || true)
+  _snap_id=$(echo "$_snap_snap" | awk '{print $1}' || echo "")
+  if [ -n "$_snap_id" ]; then
+    info "snapper: snapshot $_snap_id created"
     _track
   else
     warn "snapper: could not create snapshot"
@@ -426,7 +487,7 @@ _update_btrfs_balance() {
     return 0
   fi
   msg "btrfs: usage at ${usage}% — running usage-balanced operation..."
-  if run sudo btrfs balance start -dusage=70 / 2>&1; then
+  if _cmd sudo btrfs balance start -dusage=70 / 2>&1; then
     _track
     ok "btrfs balance complete"
   else
@@ -446,13 +507,13 @@ _update_pihole() {
   # Both are non-fatal in isolation (gravity can fail without affecting
   # pihole-FTL) so we accumulate a per-step _track outcome.
   local pihole_updated=0
-  if run sudo pihole -g 2>/dev/null; then
+  if _cmd sudo pihole -g 2>/dev/null; then
     pihole_updated=1
   else
     warn "pihole: gravity update failed"
     FAILED=$((FAILED+1))
   fi
-  if run sudo pihole -up 2>/dev/null; then
+  if _cmd sudo pihole -up 2>/dev/null; then
     pihole_updated=1
   else
     warn "pihole: pihole-FTL update failed"
