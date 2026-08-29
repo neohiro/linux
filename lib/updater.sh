@@ -15,6 +15,17 @@
 #
 # Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
 
+# Bash 4+ is required: _update_flatpak uses `mapfile` (introduced in
+# Bash 4.0).  The macOS system bash is 3.2 and will fail with a
+# "bad substitution" error otherwise.  Surface this clearly rather
+# than failing in an opaque way.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  printf '%s %s\n' "$(printf '\033[1;31m%s\033[0m' '[ERROR]')" \
+    "lib/updater.sh requires Bash 4.0+; found ${BASH_VERSION:-unknown}." >&2
+  printf '  macOS users: install Homebrew bash:  brew install bash\n' >&2
+  return 1 2>/dev/null || exit 1
+fi
+
 [ -n "${__NEOHIRO_UPDATER_SOURCED:-}" ] && return 0 2>/dev/null || true
 __NEOHIRO_UPDATER_SOURCED=1
 
@@ -41,7 +52,7 @@ _log()  { [ "$VERBOSE" = "1" ] && info "$*" || true; }
 # _track() records success/failure for the summary. Callers should be
 # wrapped in `... || true` so a single failed sub-step does not abort
 # the dispatcher; the count is still surfaced in the final summary.
-_track() { local rc=$?; [ $rc -ne 0 ] && FAILED=$((FAILED+1)) || UPDATED=$((UPDATED+1)); return 0; }
+_track() { local rc=$? _u _f; [ $rc -ne 0 ] && _f=1 || _u=1; [ -n "${_u:-}" ] && UPDATED=$((UPDATED+1)); [ -n "${_f:-}" ] && FAILED=$((FAILED+1)); return 0; }
 
 # `run` is normally provided by linuxinstall.sh. When this lib is run
 # standalone (sudo bash lib/updater.sh), we shim a local copy that
@@ -250,8 +261,9 @@ _update_firmware() {
 _update_geoip() {
   # Update the MaxMind GeoIP database. We look for any of the common
   # GeoLite2 / legacy GeoIP.dat file locations and update the first match
-  # that is older than 30 days.
-  local geoip_url="https://git.io/geoip"
+  # that is older than 30 days.  Override the download URL with GEOIP_URL.
+  # Example: GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
+  local geoip_url="${GEOIP_URL:-https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb}"
   # Common locations for GeoIP Country database.
   local geoip_db geoip_candidates=(
     "/usr/share/GeoIP/GeoLite2-Country.mmdb"
