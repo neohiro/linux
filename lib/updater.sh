@@ -159,25 +159,42 @@ _update_pacman() {
 _update_snap() {
   command -v snap >/dev/null 2>&1 || return 0
   msg "snap: refreshing all snaps..."
+  # Track snap refresh outcome so the dispatcher summary is accurate.
   if run sudo snap refresh; then
     _track
   else
     warn "snap refresh returned non-zero (may be intentionally held snaps)"
+    FAILED=$((FAILED+1))
   fi
   # `snap list --all` requires root in some configurations; use sudo for
   # both the count and the prune to keep the output consistent.
   # Run the command once; count from it and pipe the same output to the
   # while-read loop so the prune pass doesn't call `snap list` a second time.
-  local stale all_snaps
+  # Note: UPDATED must be updated in the *current* shell, not a subshell,
+  # so we count removals in a named pipe passed via process substitution.
+  local stale all_snaps snap_failed=0 snap_removed=0
   all_snaps=$(sudo snap list --all 2>/dev/null || echo "")
   stale=$(printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
   if [ "$stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
     info "snap: pruning $stale disabled revision(s)..."
-    printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}' | while read -r snaprev; do
-      run sudo snap remove "${snaprev%%@*}" --revision="${snaprev##*@}" 2>/dev/null || true
-    done
+    while IFS= read -r snaprev; do
+      [ -z "$snaprev" ] && continue
+      if sudo snap remove "${snaprev%%@*}" --revision="${snaprev##*@}" 2>/dev/null; then
+        snap_removed=$((snap_removed+1))
+      else
+        warn "snap: failed to remove ${snaprev%%@*}@${snaprev##*@}"
+        snap_failed=$((snap_failed+1))
+      fi
+    done < <(printf '%s' "$all_snaps" | awk '/disabled/{print $1 "@" $3}')
   fi
-  ok "snap"
+  if [ "$snap_removed" -gt 0 ]; then
+    UPDATED=$((UPDATED+snap_removed))
+  fi
+  if [ "$snap_failed" -gt 0 ]; then
+    FAILED=$((FAILED+snap_failed))
+  fi
+  # ok "snap" is called by _track above on refresh success.
+  # On refresh failure the warning already fired; no duplicate message needed.
 }
 
 # ── Flatpak ───────────────────────────────────────────────────────────────
@@ -242,10 +259,17 @@ _update_docker() {
 _update_brew() {
   command -v brew >/dev/null 2>&1 || return 0
   msg "brew: updating..."
-  HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null || true
-  run brew upgrade 2>/dev/null || true
-  run brew cleanup -s -q 2>/dev/null || true
-  ok "brew"
+  local brew_failed=0
+  if ! HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null; then
+    warn "brew: brew update failed"; brew_failed=1
+  fi
+  if ! run brew upgrade 2>/dev/null; then
+    warn "brew: brew upgrade failed"; brew_failed=1
+  fi
+  if ! run brew cleanup -s -q 2>/dev/null; then
+    warn "brew: brew cleanup failed"; brew_failed=1
+  fi
+  if [ "$brew_failed" -eq 0 ]; then _track; ok "brew"; else FAILED=$((FAILED+1)); return 1; fi
 }
 
 # ── Firmware (fwupdmgr / LVFS) ───────────────────────────────────────────
@@ -308,10 +332,10 @@ _update_geoip() {
   trap 'rm -f "$tmp_db" 2>/dev/null || true' RETURN
   if curl -fsSL "$geoip_url" -o "$tmp_db" 2>/dev/null; then
     if run sudo install -m 644 "$tmp_db" "$geoip_db"; then
-      ok "geoip"
+      _track; ok "geoip"
     else
       warn "geoip: install failed"
-      _track
+      FAILED=$((FAILED+1))
     fi
   else
     warn "geoip: download failed — skipping"
@@ -376,11 +400,12 @@ _update_suse_snapper() {
   snap_id=$(echo "$snap" | awk '{print $1}' || echo "")
   if [ -n "$snap_id" ]; then
     info "snapper: snapshot $snap_id created"
+    _track
   else
     warn "snapper: could not create snapshot"
+    FAILED=$((FAILED+1))
+    return 1
   fi
-  _log "snapper: update complete"
-  ok "snapper"
 }
 
 _update_btrfs_balance() {
@@ -413,9 +438,24 @@ _update_pihole() {
     return 0
   fi
   msg "pihole: updating gravity + lists + pihole-FTL..."
-  run sudo pihole -g 2>/dev/null || true
-  run sudo pihole -up 2>/dev/null || true
-  ok "pihole"
+  # -g updates the blocklist; -up updates the pihole-FTL binary.
+  # Both are non-fatal in isolation (gravity can fail without affecting
+  # pihole-FTL) so we accumulate a per-step _track outcome.
+  local pihole_updated=0
+  if run sudo pihole -g 2>/dev/null; then
+    pihole_updated=1
+  else
+    warn "pihole: gravity update failed"
+    FAILED=$((FAILED+1))
+  fi
+  if run sudo pihole -up 2>/dev/null; then
+    pihole_updated=1
+  else
+    warn "pihole: pihole-FTL update failed"
+    FAILED=$((FAILED+1))
+  fi
+  [ "$pihole_updated" -gt 0 ] && _track
+  [ "$pihole_updated" -eq 0 ] && [ "$FAILED" -gt 0 ] && return 1 || return 0
 }
 
 # ── Main dispatcher ───────────────────────────────────────────────────────
