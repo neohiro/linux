@@ -506,3 +506,13 @@ ss -tulnp                                               # re-check listeners
   <a href="https://www.patreon.com/frenzypenguin_media"><img src="https://img.shields.io/badge/Patreon-frenzypenguin__media-F96854?logo=patreon&style=for-the-badge" alt="Support on Patreon"></a>
 </p>
 
+
+
+---
+
+## 🔗 Related & Sponsorship
+
+- 💖 [Sponsor neohiro on GitHub](https://github.com/sponsors/neohiro) — covers API + hosting costs
+- 🌐 [neohiro.github.io](https://neohiro.github.io/) — main site
+- 🎬 [FrenzyPenguin Media](https://neohiro.github.io/frenzypenguin-media/) — video deep-dives
+- 🧬 [transhumanists](https://transhumanists.github.io/) — companion dashboard for human progress
