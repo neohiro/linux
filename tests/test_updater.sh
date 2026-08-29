@@ -95,18 +95,23 @@ else
 fi
 
 # --- Test 5: dispatcher returns 1 when FAILED > 0 ---
-# Save/restore FAILED so we don't bleed state into other tests. We deliberately
-# inject a failure count and verify the summary path returns 1.
+# Inject a sentinel failure count and verify the summary path returns 1.
+# Do NOT call real _update_* sub-steps (they may be real commands on some hosts).
+# Instead, override all _update_* to no-ops, then inject FAILED=999 so the
+# dispatcher sees FAILED>0 and returns 1 regardless of the sub-step results.
+for _fn in apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole; do
+  eval "_update_$_fn() { return 0; }"
+done
 UPDATED=0
 FAILED_SAVED=$FAILED
-FAILED=1
+FAILED=999
 result=0
 _run_all_updates >/dev/null 2>&1 || result=$?
 FAILED=$FAILED_SAVED
 if [ "$result" = "1" ]; then
-  ok_t "_run_all_updates with FAILED=1: returns 1 (summary path works)"
+  ok_t "_run_all_updates with FAILED=999: returns 1 (summary path works)"
 else
-  fail_t "_run_all_updates with FAILED=1" "got rc=$result, expected 1"
+  fail_t "_run_all_updates with FAILED=999" "got rc=$result, expected 1"
 fi
 
 # --- Test 6: dispatcher with a stub _update_* that always fails ---
@@ -177,24 +182,21 @@ else
 fi
 # DRY_RUN=1 with _cmd should print "DRY: <args>" and return 0 without
 # executing the command. Verify both: the trace line is printed, and
-# the command was NOT executed.
+# the command was NOT executed (temp file must not exist after).
 DRY_RUN=1
 ran_flag=/tmp/_cmd_test_ran_$$
+[ -e "$ran_flag" ] && rm -f "$ran_flag"
 out=$(_cmd touch "$ran_flag" 2>&1)
 rc=$?
 DRY_RUN=0
-if [ "$rc" = "0" ] \
-   && [ -e "$ran_flag" ] && rm -f "$ran_flag" \
+# The file must NOT exist — that proves the command was skipped.
+if [ "$rc" = "0" ] && [ ! -e "$ran_flag" ] \
    && printf '%s' "$out" | grep -q "DRY:"; then
-  # The "DRY:" trace was printed AND the touch did create the file (expected
-  # because the test harness's underlying shell isn't subject to the dry
-  # guard; the guard only prevents _cmd from calling the real command).
-  ok_t "_cmd under DRY_RUN=1: prints DRY: trace and returns 0"
-elif [ "$rc" = "0" ] && printf '%s' "$out" | grep -q "DRY:"; then
-  ok_t "_cmd under DRY_RUN=1: prints DRY: trace and returns 0"
+  ok_t "_cmd under DRY_RUN=1: prints DRY: and skips execution"
 else
-  fail_t "_cmd under DRY_RUN=1" "rc=$rc output='$out'"
+  fail_t "_cmd under DRY_RUN=1" "rc=$rc file_exists=$([ -e "$ran_flag" ] && echo yes || echo no) output='$out'"
 fi
+rm -f "$ran_flag" 2>/dev/null || true
 unset DRY_RUN
 
 # --- Test 12: _cmd under VERBOSE=2 prints "RUN:" trace ---

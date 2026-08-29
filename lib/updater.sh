@@ -97,6 +97,11 @@ _dry_cmd() {
     printf '  RUN: %s\n' "$*"
   fi
   "$@"
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    warn "Command failed (exit $rc): $*"
+  fi
+  return $rc
 }
 
 # ── Package managers ─────────────────────────────────────────────────────────
@@ -329,12 +334,17 @@ _update_geoip() {
   #   GEOIP_URL             — arbitrary mirror (any URL returning a .mmdb file).
   #     Export:  GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
   #   (default)             — community-maintained fork (no account needed).
-  local _geoip_url=""
+  local _geoip_url="" _key
   if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then
-    _geoip_url="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz"
-  elif [ -n "${GEOIP_URL:-}" ]; then
+    _key=$(printf '%s' "${MAXMIND_LICENSE_KEY}" | tr -d '[:space:]')
+    if [ -n "$_key" ]; then
+      _geoip_url="https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=${_key}&suffix=tar.gz"
+    fi
+  fi
+  if [ -z "$_geoip_url" ] && [ -n "${GEOIP_URL:-}" ]; then
     _geoip_url="$GEOIP_URL"
-  else
+  fi
+  if [ -z "$_geoip_url" ]; then
     _geoip_url="https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb"
   fi
   # Common locations for GeoIP Country database.
@@ -425,7 +435,9 @@ _update_virsh() {
   # line. Strip blank lines and the literal "Name" header to get a clean
   # list of pool/net names. Use `while read` so names with embedded
   # whitespace are kept intact (a `for x in $(...)` would split them).
-  local virsh_failed=0
+  local virsh_failed=0 _virsh_pools _virsh_nets
+  _virsh_pools=$(run virsh pool-list --all --name 2>/dev/null || echo "")
+  _virsh_nets=$(run virsh net-list --all --name 2>/dev/null || echo "")
   while IFS= read -r pool; do
     [ -z "$pool" ] && continue
     _log "virsh: refreshing pool $pool"
@@ -433,7 +445,7 @@ _update_virsh() {
       warn "virsh: pool-refresh failed for $pool"
       virsh_failed=$((virsh_failed+1))
     fi
-  done < <(virsh pool-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
+  done <<< "$(printf '%s' "$_virsh_pools" | sed -e '/^$/d' -e '/^Name$/d')"
   while IFS= read -r net; do
     [ -z "$net" ] && continue
     _log "virsh: auto-starting network $net"
@@ -441,7 +453,7 @@ _update_virsh() {
       warn "virsh: net-autostart failed for $net"
       virsh_failed=$((virsh_failed+1))
     fi
-  done < <(virsh net-list --all --name 2>/dev/null | sed -e '/^$/d' -e '/^Name$/d')
+  done <<< "$(printf '%s' "$_virsh_nets" | sed -e '/^$/d' -e '/^Name$/d')"
   if [ $virsh_failed -gt 0 ]; then
     FAILED=$((FAILED+virsh_failed))
     warn "virsh: $virsh_failed pool/net operation(s) failed"
