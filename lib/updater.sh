@@ -198,13 +198,13 @@ _update_snap() {
   # Note: UPDATED must be updated in the *current* shell, not a subshell,
   # so we count removals in a named pipe passed via process substitution.
   local _snap_stale _snap_all _snap_failed=0 _snap_removed=0
-  _snap_all=$(_cmd sudo snap list --all 2>/dev/null || echo "")
+  _snap_all=$(_cmd sudo snap list --all || echo "")
   _snap_stale=$(printf '%s' "$_snap_all" | awk '/disabled/{print $1 "@" $3}' | wc -l || echo 0)
   if [ "$_snap_stale" -gt 0 ] && [ -n "${SNAP_PRUNE:-}" ]; then
     info "snap: pruning $_snap_stale disabled revision(s)..."
     while IFS= read -r _snap_rev; do
       [ -z "$_snap_rev" ] && continue
-      if _cmd sudo snap remove "${_snap_rev%%@*}" --revision="${_snap_rev##*@}" 2>/dev/null; then
+      if _cmd sudo snap remove "${_snap_rev%%@*}" --revision="${_snap_rev##*@}"; then
         _snap_removed=$((_snap_removed+1))
       else
         warn "snap: failed to remove ${_snap_rev%%@*}@${_snap_rev##*@}"
@@ -245,7 +245,12 @@ _update_flatpak() {
     _log "flatpak: remote-ls failed — skipping"
   fi
   unset _flatpak_updates
-  run flatpak uninstall --unused -y --assumeyes 2>/dev/null || true
+  if run flatpak uninstall --unused -y --assumeyes 2>/dev/null; then
+    _log "flatpak: uninstalled unused refs"
+  else
+    warn "flatpak: uninstall --unused failed"
+    FAILED=$((FAILED+1))
+  fi
   ok "flatpak"
   return $rc
 }
@@ -505,6 +510,7 @@ _update_btrfs_balance() {
   else
     warn "btrfs balance returned non-zero — may need manual intervention"
     FAILED=$((FAILED+1))
+    return 1
   fi
 }
 
