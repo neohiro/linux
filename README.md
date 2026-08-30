@@ -33,7 +33,7 @@ per category (environment type, SSH lockout-prone steps, ambiguous DNS/Tor/
 IPv6 choices, and the new helper scripts are fetched on-demand):
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)"
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash
 ```
 
 > Review it first:
