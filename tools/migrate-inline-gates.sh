@@ -40,8 +40,18 @@ echo "  Generator OK"
 
 extract_consumer_block() {
   local consumer="$1"
-  printf '%s\n' "$GEN_OUT" \
-    | sed -n "/^# BEGIN_INHERIT_COLOR_GATE.*consumer=$consumer/,/^# END_INHERIT_COLOR_GATE/p"
+  local start_line end_line
+  start_line=$(printf '%s\n' "$GEN_OUT" \
+    | grep -n "^# BEGIN_INHERIT_COLOR_GATE.*consumer=$consumer" \
+    | head -1 | cut -d: -f1)
+  # Find the END marker that comes AFTER start_line (not the first one in the file).
+  end_line=$(printf '%s\n' "$GEN_OUT" \
+    | awk -v s="$start_line" 'NR>=s && /^# END_INHERIT_COLOR_GATE/ { print NR; exit }')
+  if [ -z "$start_line" ] || [ -z "$end_line" ]; then
+    echo "ERROR: block not found for $consumer (start=$start_line end=$end_line)" >&2
+    return 1
+  fi
+  printf '%s\n' "$GEN_OUT" | sed -n "${start_line},${end_line}p"
 }
 
 find_gate_line() {
