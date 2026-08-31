@@ -78,14 +78,17 @@ check_consumer() {
   [ "$has_marker" -gt 0 ] 2>/dev/null && { echo "  Status: ALREADY MIGRATED ($has_marker marker(s) found)"; return 0; }
 
   # Verify the gate exists at the expected location.
-  local gate_line
-  gate_line="$(awk 'NR>='$gate_start_line' && NR<='$gate_end_line' && /if.*NEOHIRO_COLOR/{print NR; exit}' "$consumer")"
-  if [ -z "$gate_line" ] || [ "$gate_line" -eq 0 ] 2>/dev/null; then
+  local first_line last_line
+  first_line="$(awk "
+    /BEGIN_INHERIT_COLOR_GATE/ { exit }
+    NR>=$gate_start_line && NR<=$gate_end_line && /NEOHIRO_COLOR.*=.*1.*;.*then/ { print NR; exit }
+  " "$consumer")"
+  if [ -z "$first_line" ] || [ "$first_line" -eq 0 ] 2>/dev/null; then
     echo "  Status: GATE NOT FOUND at expected lines $gate_start_line-$gate_end_line"
     echo "  HINT:  grep -n 'NEOHIRO_COLOR' $consumer"
     return 1
   fi
-  echo "  Gate found at line ~$gate_line (expected $gate_start_line-$gate_end_line)"
+  echo "  Gate found at line ~$first_line (expected $gate_start_line-$gate_end_line)"
 
   if [ "$MODE" = "report" ]; then
     echo "  Status: READY TO MIGRATE"
@@ -100,40 +103,15 @@ check_consumer() {
   fi
 
   if [ "$MODE" = "apply" ]; then
-    # Patch in place using sed address ranges.
-    # We find the first line containing NEOHIRO_COLOR in the gate range
-    # and the closing "}" of the function in that range.
-    local first_line last_line
-    first_line="$(awk 'NR>='$gate_start_line' && NR<='$gate_end_line' && /NEOHIRO_COLOR.*=.*1.*;.*then/{print NR; exit}' "$consumer")"
-    # The end of the gate is the last "}" before the next USE_COLOR= assignment.
-    # For function-based gates: last "}" before USE_COLOR=..._apply_gate)
-    # For inline gates: "fi" or last "}"
-    last_line="$(awk '
-      BEGIN { found=0 }
-      NR>='$gate_start_line' && NR<='$gate_end_line' {
-        if (/^[[:space:]]*}/ && found==0) { found=NR; next }
-        if (found>0 && NR>found+1) { print found; exit }
-      }
-    ' "$consumer")"
-
-    if [ -z "$first_line" ] || [ -z "$last_line" ]; then
-      echo "  ERROR: Could not determine gate boundary lines"
-      return 1
-    fi
-
-    echo "  Patching lines $first_line to $last_line..."
-
-    # Build replacement text: markers + generated block.
+    # Build replacement: lines before gate, new block, lines after gate.
     local tmp="/tmp/migrate.$$.$RANDOM"
     {
       # Lines before the gate
-      head -n $((first_line - 1)) "$consumer"
+      head -n $((first_line - 1)) "$consumer" 2>/dev/null || true
       # New block
-      printf '\n'
-      printf '%s\n' "$block"
-      printf '\n'
-      # Lines after the gate (skip gate lines)
-      tail -n +$((last_line + 1)) "$consumer"
+      printf '\n%s\n\n' "$block"
+      # Lines after the gate
+      tail -n +$((last_line + 1)) "$consumer" 2>/dev/null || true
     } > "$tmp"
 
     if diff -q "$consumer" "$tmp" >/dev/null 2>&1; then
