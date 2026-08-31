@@ -22,6 +22,9 @@ venv/
 *.log
 boot_log.txt
 
+# Test results (generated, not source)
+test-results-*.xml
+
 # OS junk
 .DS_Store
 Thumbs.db

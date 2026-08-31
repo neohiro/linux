@@ -14,15 +14,10 @@ ROOT="$(cd "$HERE/.." && pwd)"
 
 # --- Argument parsing ---
 JUNIT_PATH=""
-# shellcheck disable=SC2034
-# VERBOSE is written by the arg parser below and read by run_suite().
-VERBOSE=0
 for arg in "$@"; do
   case "$arg" in
     --junit=*) JUNIT_PATH="${arg#--junit=}" ;;
     --junit)   JUNIT_PATH="auto" ;;
-    --verbose) # shellcheck disable=SC2034
-               VERBOSE=1 ;;
     --help|-h)
       # HELP_START / HELP_END markers make the range self-documenting.
       sed -n '/^# HELP_START$/,/^# HELP_END$/p' "$SELF" | sed 's/^# *//'
@@ -37,14 +32,21 @@ if [ "$JUNIT_PATH" = "auto" ]; then
 fi
 
 # --- Suite definitions ---
+# Each entry: "name|script|extra-args"
+# Run both fast smoke (50 iter turbo) and full suite (200 iter).
+# TURBO_MODE=1 reduces tput value space to 8 (from 14), further cutting time.
 SUITES=(
   "color_gate|tests/test_color_gate.sh|"
   "curl_pipe_sim|tests/test_curl_pipe_sim.sh|"
+  "fuzz_smoke|tests/test_color_fuzz.sh|50"
   "color_fuzz|tests/test_color_fuzz.sh|200"
   "linuxinstall|tests/test_linuxinstall.sh|"
   "updater|tests/test_updater.sh|"
   "verify_sync|verify_sync.sh|"
 )
+
+# Override for turbo smoke: run with NEOCOLOR_TURBO=1.
+TURBO_SUITES="fuzz_smoke"
 
 # --- Accumulators ---
 TOTAL_PASS=0
@@ -70,7 +72,12 @@ run_suite() {
   fi
 
   local t0=$SECONDS exit_code full_out summary_line
-  full_out="$(cd "$ROOT" && bash "$path" $extra 2>&1)"; exit_code=$?
+  # If this suite is in the turbo list, set NEOCOLOR_TURBO=1.
+  local extra_env=""
+  for turbo_name in $TURBO_SUITES; do
+    [ "$name" = "$turbo_name" ] && extra_env="NEOCOLOR_TURBO=1"
+  done
+  full_out="$(cd "$ROOT" && env $extra_env bash "$path" $extra 2>&1)"; exit_code=$?
 
   # Also capture just the last line for the summary column (printed below).
   # Use bash built-in rather than `tail` which may be missing on Windows.
@@ -106,8 +113,7 @@ run_suite() {
 #
 # Options:
 #   --junit[=path]   Write JUnit XML to path (auto-names if no path given)
-#   --verbose        Echo each suite's full output (default: last line only)
-#   --help, -h      Show this help text
+#   --help, -h       Show this help text
 #
 # Exit code: 0 if all suites pass, 1 if any suite fails or is missing.
 # JUnit XML is consumed by GitHub Actions, GitLab CI, Jenkins, etc.
@@ -127,17 +133,19 @@ printf 'Suite failures: %d\n' "$TOTAL_FAIL"
 printf 'Total runtime:  %ds\n' "$TOTAL_TIME"
 
 if [ -n "$JUNIT_PATH" ]; then
-  # Emit JUnit XML using printf to avoid heredoc word-splitting issues.
-  # Each %s in the template is either a literal (no expansion) or an
-  # already-escaped variable (xml_escape was applied above).
-  printf '<?xml version="1.0" encoding="UTF-8"?>\n' > "$JUNIT_PATH"
-  printf '<testsuites name="neohiro-linux" tests="%d" failures="%d" time="%ds">\n' \
-    "${#SUITES[@]}" "$TOTAL_FAIL" "$TOTAL_TIME" >> "$JUNIT_PATH"
-  printf '  <testsuite name="run-all" tests="%d" failures="%d" time="%ds">\n' \
-    "${#SUITES[@]}" "$TOTAL_FAIL" "$TOTAL_TIME" >> "$JUNIT_PATH"
-  printf '%s\n' "$JUNIT_CASES" >> "$JUNIT_PATH"
-  printf '  </testsuite>\n' >> "$JUNIT_PATH"
-  printf '</testsuites>\n' >> "$JUNIT_PATH"
+  # Emit JUnit XML via a single group-redirected printf block.  This avoids
+  # the > ... >> split pattern (a single-redirect group is more atomic and
+  # leaves no partial file if the script is killed mid-write).
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<testsuites name="neohiro-linux" tests="%d" failures="%d" time="%ds">\n' \
+      "${#SUITES[@]}" "$TOTAL_FAIL" "$TOTAL_TIME"
+    printf '  <testsuite name="run-all" tests="%d" failures="%d" time="%ds">\n' \
+      "${#SUITES[@]}" "$TOTAL_FAIL" "$TOTAL_TIME"
+    printf '%s\n' "$JUNIT_CASES"
+    printf '  </testsuite>\n'
+    printf '</testsuites>\n'
+  } > "$JUNIT_PATH"
   printf 'JUnit XML:      %s\n' "$JUNIT_PATH"
 fi
 

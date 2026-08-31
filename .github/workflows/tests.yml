@@ -29,18 +29,18 @@ jobs:
             test_kind: full
           - label: "4 (docker)"
             pkg: bash:4
-            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:4 bash
+            run: docker run --rm -v ${GITHUB_WORKSPACE}:/work -w /work bash:4 bash
             test_kind: full
           - label: "latest (docker)"
             pkg: bash:latest
-            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:latest bash
+            run: docker run --rm -v ${GITHUB_WORKSPACE}:/work -w /work bash:latest bash
             test_kind: full
           # bash 3.2 is the macOS default. The library's BASH_VERSINFO[0] < 4
           # guard must reject it cleanly; this entry verifies the guard wires
           # up by checking _run_all_updates is NOT declared after sourcing.
           - label: "3.2 (docker, floor)"
             pkg: bash:3.2-alpine3.18
-            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:3.2-alpine3.18 bash
+            run: docker run --rm -v ${GITHUB_WORKSPACE}:/work -w /work bash:3.2-alpine3.18 bash
             test_kind: floor
     steps:
       - name: Checkout
@@ -127,9 +127,11 @@ jobs:
           # Warnings are advisory (non-blocking) per project convention —
           # some shellcheck warnings are unavoidable in defensive bash
           # (e.g. SC2155, SC2015, SC2034 in test harnesses).
-          # Errors (SC1xxx) are always fatal.
+          # Errors (SC1xxx) are always fatal.  SC2218 is a false-positive here
+          # (make_tput is defined immediately before its call).
           set +e
           shellcheck -S warning \
+            --exclude=SC2218 \
             linuxinstall.sh \
             lib/*.sh \
             tests/*.sh \

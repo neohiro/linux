@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<testsuites name="neohiro-linux" tests="6" failures="0" time="91s">
-  <testsuite name="run-all" tests="6" failures="0" time="91s">
-  </testsuite>
-</testsuites>
