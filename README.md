@@ -82,6 +82,39 @@ the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
 
+<<<<<<< HEAD
+=======
+## One-step automated setup
+
+Run the general interactive script directly from the repo — it prompts you
+per category (environment type, SSH lockout-prone steps, ambiguous DNS/Tor/
+IPv6 choices, and the new helper scripts are fetched on-demand):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash
+```
+
+> Review it first:
+> `curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | less`
+
+**Profiles:** the script asks which profile to apply — Recommended (safe),
+Standard (full hardening + SSH), Full (everything including Tor/IPv6/ASR/
+DeepClean), or Custom (you confirm every step). Risky actions (SSH
+hardening, IPv6, DNS method, Tor, attack-surface reduction) always prompt
+individually before touching anything.
+
+**Full profile on a server runs in "auto" mode:** SSH hardening is applied
+without the interactive lockout-prone prompts (it never disables
+`PasswordAuthentication` unless it detects a working pubkey, and it never
+changes the port), so the only way to get locked out is the OpenSSH config
+breaking — in which case the in-script `restore_ssh` routine or Tailscale
+SSH can get you back in.
+
+**Progress checklist:** the script prints a colored bar chart (e.g.
+`━━━ PROGRESS ████████████░░░░ 12/17 (70%) ━━━`) before every step, so you
+always see what's already done and what's coming.
+
+>>>>>>> origin/main
 ### Cross-distro kernel update
 
 `linuxinstall.sh` auto-detects the package manager and updates the kernel
