@@ -172,6 +172,16 @@ out="$(run_gate NEOHIRO_COLOR=0)"
 assert_use_color "NEOHIRO_COLOR=0 forces off (redundant with non-TTY)" 0 "$out"
 assert_out     "NEOHIRO_COLOR=0 emits plain text" "sample" "$out"
 
+# NEOHIRO_COLOR=garbage (any value other than "0" or "1") must fall through
+# to the other gates — not silently treat as "on".  A bug that interprets
+# "2" or "garbage" as truthy would cause colors to leak in unexpected places.
+out="$(run_gate NEOHIRO_COLOR=garbage tput=256 force-tty)"
+assert_use_color "NEOHIRO_COLOR=garbage (not 0/1) falls through" 1 "$out"
+assert_out     "NEOHIRO_COLOR=garbage emits CSI when tput supports" "$ANSI_GREEN_SAMPLE" "$out"
+
+out="$(run_gate NEOHIRO_COLOR=garbage "TERM=dumb")"
+assert_use_color "NEOHIRO_COLOR=garbage + TERM=dumb -> gate closed" 0 "$out"
+
 # FORCE_TTY=1: -t 1 is bypassed
 out="$(run_gate tput=256 force-tty)"
 assert_use_color "FORCE_TTY=1 bypasses -t 1 check" 1 "$out"
