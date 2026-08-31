@@ -1,0 +1,61 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+    open-pull-requests-limit: 5
+    groups:
+      python-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "python"
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "05:00"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "javascript"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "06:00"
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "ci"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+    open-pull-requests-limit: 3
+    groups:
+      go-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    labels:
+      - "dependencies"
+      - "go"

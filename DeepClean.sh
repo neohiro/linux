@@ -17,8 +17,27 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
 fi
 
-# If lib/color.sh was sourced, emit GREEN/BLUE/YELLOW/CYAN/NC from USE_COLOR.
-if [ "${USE_COLOR:-0}" = "1" ]; then
+# If lib/color.sh was sourced, USE_COLOR is already set. If not
+# (run standalone from /tmp), apply the same gate inline so we never
+# emit stray "m" bytes to terminals that strip CSI sequences.
+if [ -z "${USE_COLOR:-}" ]; then
+  if [ "${NEOHIRO_COLOR:-}" = "1" ]; then
+    USE_COLOR=1
+  elif [ "${NEOHIRO_COLOR:-}" = "0" ] || { [ -n "${NO_COLOR:-}" ] && [ "${NO_COLOR:-}" != "0" ]; } || [ "${TERM:-}" = "dumb" ]; then
+    USE_COLOR=0
+  elif { [ "${FORCE_TTY:-}" != "1" ] && [ ! -t 1 ]; } || ! command -v tput >/dev/null 2>&1; then
+    USE_COLOR=0
+  else
+    _tcol=$(tput colors 2>/dev/null) || _tcol=""
+    case "${_tcol}" in
+      ''|*[!0-9]*) USE_COLOR=0 ;;
+      *) [ "${_tcol}" -ge 8 ] || USE_COLOR=0 ;;
+    esac
+  fi
+fi
+# Emit color constants from the validated gate. Single-quoted strings
+# so the backslashes survive verbatim into the terminal.
+if [ "${USE_COLOR}" = "1" ]; then
   GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 else
   GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
@@ -26,9 +45,9 @@ fi
 
 USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
 
-msg()  { echo "[*] $*"; }
-ok()   { echo "[+] $*"; }
-warn() { echo "[!] $*"; }
+msg()  { echo "${CYAN}[*]${NC} $*"; }
+ok()   { echo "${GREEN}[+]${NC} $*"; }
+warn() { echo "${YELLOW}[!]${NC} $*"; }
 
 pkg_mgr() {
   if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then
@@ -206,17 +225,17 @@ ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
 ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
 ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 
-printf '\n%s\n' "$(_c '1;34m' '=================================================================')"
-printf '%s\n' "$(_c '1;32m' '             DEEPCLEAN AND AUTO-PRUNE COMPLETE!')"
-printf '%s\n\n' "$(_c '1;34m' '=================================================================')"
+printf '\n%s\n' "${BLUE}=================================================================${NC}"
+printf '%s\n' "${GREEN}             DEEPCLEAN AND AUTO-PRUNE COMPLETE!${NC}"
+printf '%s\n\n' "${BLUE}=================================================================${NC}"
 
 if [ "$FREED_KB" -gt 1024000 ]; then
-    printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_GB} GB") ($(_c '1;37m' "${FREED_MB} MB"))"
+    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_GB} GB${NC} (${FREED_MB} MB)"
 else
-    printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_MB} MB")"
+    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_MB} MB${NC}"
 fi
 
-printf 'Current Disk (%s):\n' "$(_c '1;36m' "$ROOT_FS")"
-printf '  Total : %s\n' "$(_c '1;34m' "$ROOT_TOTAL")"
-printf '  Used  : %s (%s)\n' "$(_c '1;34m' "$ROOT_USED")" "$ROOT_PERCENT"
-printf '  Free  : %s\n\n' "$(_c '1;32m' "$ROOT_FREE")"
+printf 'Current Disk (%s):\n' "${CYAN}${ROOT_FS}${NC}"
+printf '  Total : %s\n' "${BLUE}${ROOT_TOTAL}${NC}"
+printf '  Used  : %s (%s)\n' "${BLUE}${ROOT_USED}${NC}" "$ROOT_PERCENT"
+printf '  Free  : %s\n\n' "${GREEN}${ROOT_FREE}${NC}"

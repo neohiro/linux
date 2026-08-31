@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="neohiro-linux" tests="6" failures="0" time="93s">
+  <testsuite name="run-all" tests="6" failures="0" time="93s">
+
+    <testcase classname="color_gate" name="color_gate" time="15"><system-out>  [OK]  NO_COLOR=1 disables color (USE_COLOR=0)
+  [OK]  NO_COLOR=1 emits plain text -&gt; _c output matches
+  [OK]  NO_COLOR=0 does NOT disable (XDG: empty non-zero means 'do not disable') (USE_COLOR=1)
+  [OK]  NO_COLOR=0 allows gate to proceed -&gt; _c output matches
+  [OK]  TERM=dumb disables color (USE_COLOR=0)
+  [OK]  TERM=dumb emits plain text -&gt; _c output matches
+  [OK]  tput=0 (broken terminfo) disables color (USE_COLOR=0)
+  [OK]  tput=0 emits plain text -&gt; _c output matches
+  [OK]  tput=7 (monochrome) disables color (USE_COLOR=0)
+  [OK]  tput=7 emits plain text -&gt; _c output matches
+  [OK]  tput missing disables color (USE_COLOR=0)
+  [OK]  tput-missing emits plain text -&gt; _c output matches
+  [OK]  tput=8 (8-color) enables color (USE_COLOR=1)
+  [OK]  tput=8 emits CSI escapes -&gt; _c output matches
+  [OK]  tput=256 enables color (USE_COLOR=1)
+  [OK]  tput=256 emits CSI escapes -&gt; _c output matches
+  [OK]  tput=truecolor (16M) enables color (USE_COLOR=1)
+  [OK]  tput=truecolor emits CSI escapes -&gt; _c output matches
+  [OK]  NEOHIRO_COLOR=1 overrides NO_COLOR+TERM=dumb (USE_COLOR=1)
+  [OK]  NEOHIRO_COLOR=1 emits CSI escapes -&gt; _c output matches
+  [OK]  NEOHIRO_COLOR=0 overrides tput=256 (USE_COLOR=0)
+  [OK]  NEOHIRO_COLOR=0 emits plain text -&gt; _c output matches
+  [OK]  NEOHIRO_COLOR=1 forces on (no TTY needed) (USE_COLOR=1)
+  [OK]  NEOHIRO_COLOR=1 emits CSI escapes -&gt; _c output matches
+  [OK]  NEOHIRO_COLOR=0 forces off (redundant with non-TTY) (USE_COLOR=0)
+  [OK]  NEOHIRO_COLOR=0 emits plain text -&gt; _c output matches
+  [OK]  FORCE_TTY=1 bypasses -t 1 check (USE_COLOR=1)
+  [OK]  FORCE_TTY=1 + tput=256 emits CSI -&gt; _c output matches
+  [OK]  FORCE_TTY=1 + NO_COLOR=1 -&gt; NO_COLOR wins (USE_COLOR=0)
+  [OK]  FORCE_TTY=1 + NO_COLOR=1 emits plain -&gt; _c output matches
+  [OK]  REGRESSION: curl|bash (no overrides) -&gt; USE_COLOR=0 (USE_COLOR=0)
+  [OK]  REGRESSION: curl|bash emits no stray 'm' bytes (the original bug) -&gt; _c output matches
+  [OK]  REGRESSION: no ESC bytes leak into plain output (binary-clean)
+  [OK]  REGRESSION: no leading 'm' on output (terminal-stripped CSI artifact)
+  [OK]  double-sourcing lib/color.sh is idempotent
+  [OK]  all 7 print helpers defined after sourcing lib/color.sh
+  [OK]  tput emitting garbage -&gt; USE_COLOR=0 (USE_COLOR=0)
+  [OK]  tput-garbage emits plain text -&gt; _c output matches
+  [OK]  tput=-1 -&gt; USE_COLOR=0 (case guard catches non-digits) (USE_COLOR=0)
+  [OK]  tput=-1 emits plain text -&gt; _c output matches
+  [OK]  tput=+9 (leading plus) -&gt; USE_COLOR=0 (case guard) (USE_COLOR=0)
+  [OK]  tput=8 (threshold boundary) -&gt; USE_COLOR=1 (USE_COLOR=1)
+  [OK]  tput=8 emits CSI escapes -&gt; _c output matches
+  [OK]  tput=7 (just below threshold) -&gt; USE_COLOR=0 (USE_COLOR=0)
+  [OK]  tput=0x10 (hex notation) -&gt; USE_COLOR=0 (case guard) (USE_COLOR=0)
+  [OK]  tput=overflowing (huge number) -&gt; USE_COLOR=0 (bash parse error, safe) (USE_COLOR=0)
+  [OK]  tput='  256  ' (whitespace) -&gt; USE_COLOR=0 (case guard strict) (USE_COLOR=0)
+  [OK]  TERM=linux (no linux terminfo on this host; skipped)
+  [OK]  TERM=xterm-256color (tput colors=256) -&gt; USE_COLOR=1 (USE_COLOR=1)
+  [OK]  tput exit nonzero + empty -&gt; USE_COLOR=0 (USE_COLOR=0)
+  [OK]  tput-fail emits plain text -&gt; _c output matches
+  [OK]  tput empty output (rc=0) -&gt; USE_COLOR=0 (USE_COLOR=0)
+  [OK]  tput-empty emits plain text -&gt; _c output matches
+  [OK]  restore_ssh: NO_COLOR=1 -&gt; C_RED is empty
+  [OK]  restore_ssh: NEOHIRO_COLOR=1 -&gt; C_RED contains CSI
+
+All 56 color-gate test(s) passed.</system-out></testcase>
+    <testcase classname="curl_pipe_sim" name="curl_pipe_sim" time="4"><system-out>  [OK]  T1: no stray 'm' prefix on menu items (gate closed in curl|bash)
+  [OK]  T1: no ANSI CSI escapes leaked through
+  [OK]  T2: NEOHIRO_COLOR=1 emits CSI escapes
+  [OK]  T2: no bare 'm' bytes (correct CSI sequences)
+  [OK]  T3b: NO_COLOR=0 does NOT disable color (XDG fix)
+  [OK]  T3: NO_COLOR=1 suppresses CSI
+  [OK]  T3: NO_COLOR=1 produces clean plain text
+  [OK]  T4: NO_COLOR wins over FORCE_TTY+tput (gate precedence correct)
+  [OK]  T5: FORCE_TTY+tput=256 opens gate and emits CSI
+  [OK]  T5: no bare m bytes (fixed _c format emits complete CSI)
+
+All 10 curl|pipe regression test(s) passed.</system-out></testcase>
+    <testcase classname="color_fuzz" name="color_fuzz" time="59"><system-out>Running 200 fuzz iterations against /c/Users/Wout/Documents/Default Project/linux/lib/color-gate.sh
+
+All 200 fuzz iteration(s) passed (800 invariant checks).</system-out></testcase>
+    <testcase classname="linuxinstall" name="linuxinstall" time="5"><system-out>  [OK]  _valid_step accepts: system
+  [OK]  _valid_step accepts: system_update
+  [OK]  _valid_step accepts: dns
+  [OK]  _valid_step accepts: dnscrypt
+  [OK]  _valid_step accepts: firewall
+  [OK]  _valid_step accepts: tor
+  [OK]  _valid_step accepts: ssh
+  [OK]  _valid_step accepts: ssh_hardening
+  [OK]  _valid_step accepts: fail2ban
+  [OK]  _valid_step accepts: unattended
+  [OK]  _valid_step accepts: ipv6
+  [OK]  _valid_step accepts: sysctl
+  [OK]  _valid_step accepts: apparmor
+  [OK]  _valid_step accepts: pam
+  [OK]  _valid_step accepts: optimize
+  [OK]  _valid_step accepts: optimize_asr
+  [OK]  _valid_step accepts: deepclean
+  [OK]  _valid_step rejects: FOO
+  [OK]  _valid_step rejects: firewAll
+  [OK]  _valid_step rejects: sshd
+  [OK]  _valid_step rejects: optimizeall
+  [OK]  _valid_step rejects: ../etc
+  [OK]  _valid_step rejects: 
+  [OK]  _should_run_step: STEP_MODE=0 returns 0 regardless of key
+  [OK]  _should_run_step: STEP_MODE=1, matching key returns 0
+  [STEP] Skipping: tor (--step=firewall)
+  [OK]  _should_run_step: STEP_MODE=1, non-matching key returns 1
+  [STEP] Skipping: firewall (--step=)
+  [OK]  _should_run_step: STEP_MODE=1 with empty SELECTED_STEP returns 1
+  Skipping _tmpfile tests on non-POSIX platform (MINGW64_NT-10.0-26200)
+  Skipping _ssh_current_port default test (real /etc/ssh/sshd_config present)
+  [OK]  DRY_RUN=1: run prints DRY: prefix and returns 0
+=&gt; true
+  [OK]  DRY_RUN=0: run executes true and returns 0
+=&gt; false
+[WARN] Command failed (exit 1): false
+  [OK]  DRY_RUN=0: run(false) increments _FAIL_COUNT but returns 0
+=&gt; false
+[WARN] Command failed (exit 1): false
+  [OK]  STRICT_RUN=1: run(false) returns non-zero exit code
+  [OK]  _valid_step: regression on common keys
+  [OK]  _ssh_self_heal_check helper: _is_listening is declared
+  [OK]  _ssh_self_heal_check helper: _service_present is declared
+  [OK]  _ssh_self_heal_check helper: _fw_detect is declared
+  [OK]  _ssh_self_heal_install is declared
+  [OK]  _ssh_self_heal_uninstall is declared
+  [OK]  _maintenance_list_keys: declared
+  [OK]  _ssh_inspect_config is declared
+  [OK]  _maintenance_logs: declared
+  [OK]  _maintenance_sysinfo: declared
+  [OK]  _ssh_self_heal_check: no-op on system without sshd (rc=0)
+  [OK]  _run_all_updates sub: _update_apt declared
+  [OK]  _run_all_updates sub: _update_dnf declared
+  [OK]  _run_all_updates sub: _update_yum declared
+  [OK]  _run_all_updates sub: _update_zypper declared
+  [OK]  _run_all_updates sub: _update_pacman declared
+  [OK]  _run_all_updates sub: _update_snap declared
+  [OK]  _run_all_updates sub: _update_flatpak declared
+  [OK]  _run_all_updates sub: _update_docker declared
+  [OK]  _run_all_updates sub: _update_brew declared
+  [OK]  _run_all_updates sub: _update_firmware declared
+  [OK]  _run_all_updates: dispatcher declared
+  [OK]  _run_all_updates: completes cleanly (rc=0) on host with no package managers
+  [OK]  bash -n /c/Users/Wout/Documents/Default Project/linux/linuxinstall.sh: no syntax errors
+  [OK]  setup_dnscrypt: pkg_install is followed by 'then' (parse regression fixed)
+  [OK]  print_metrics_summary: three-branch disk-delta logic present in source
+  [OK]  show_progress: runs to completion (rc=0) and emits output
+  [OK]  print_welcome: runs to completion (rc=0), includes 'Run as:' line
+  [OK]  print_welcome: non-root EUID shows 'non-root' hint (pass-1 fix)
+  [OK]  print_metrics_summary: non-root branch shows 're-run as root' (EUID=197609)
+  [OK]  print_metrics_summary: second call returns 0 (idempotent)
+  [OK]  ask_profile: declared in extracted slice
+  [OK]  print_welcome: snapshot match (print_welcome_snapshot.txt)
+  [OK]  print_metrics_summary: snapshot match (print_metrics_summary_snapshot.txt)
+
+All 65 test(s) passed.</system-out></testcase>
+    <testcase classname="updater" name="updater" time="5"><system-out>  [OK]  _update_apt declared
+  [OK]  _update_dnf declared
+  [OK]  _update_yum declared
+  [OK]  _update_zypper declared
+  [OK]  _update_pacman declared
+  [OK]  _update_snap declared
+  [OK]  _update_flatpak declared
+  [OK]  _update_docker declared
+  [OK]  _update_brew declared
+  [OK]  _update_firmware declared
+  [OK]  _update_geoip declared
+  [OK]  _update_virsh declared
+  [OK]  _update_suse_snapper declared
+  [OK]  _update_btrfs_balance declared
+  [OK]  _update_pihole declared
+  [OK]  _track on rc=0: UPDATED=1, FAILED=0
+  [OK]  _track on rc=1: UPDATED=0, FAILED=1
+  [OK]  Bash 4+ detected (BASH_VERSINFO=5)
+  [OK]  _run_all_updates on bare host: rc=0 (no-op)
+  [OK]  _run_all_updates with FAILED=999: returns 1 (summary path works)
+  [OK]  _run_all_updates with failing sub-step: continues, FAILED&gt;=1, rc=1
+  [OK]  _run_all_updates with all sub-steps returning 0: rc=0, FAILED=0
+  [OK]  _run_all_updates with UPDATED=5: returns 0 (no failures)
+  [OK]  _update_geoip honors MAXMIND_LICENSE_KEY / GEOIP_URL env overrides
+  [OK]  lib/updater.sh has bash 4+ version guard
+  [OK]  _cmd helper: declared
+  [OK]  _cmd under DRY_RUN=1: prints DRY: and skips execution
+  [OK]  _cmd under VERBOSE=2: prints RUN: trace line
+  [OK]  VERBOSE=1 controls _log(): visible only when set
+  [OK]  _run_all_updates --summary=json: emits valid JSON
+=&gt; === Comprehensive system update ===
+
+  Everything is up to date.
+  [OK]  _run_all_updates --parallel=1: sequential execution returns 0
+  [OK]  _runner_cmd helper: declared
+  [OK]  run function: declared
+  [OK]  _run_updates_parallel subshell: exits with $_rc (not hardcoded 0)
+  [OK]  _run_updates_parallel aggregate: no FAILED double-count
+  [OK]  _run_all_updates --parallel=N: warns on invalid value
+  [OK]  _run_all_updates --parallel=abc: falls back to sequential, rc=0
+  [OK]  _run_updates_parallel: mktemp-fail fallback propagates FAILED state
+  [OK]  _run_all_updates --parallel=3 (5 failing stubs): FAILED=5, rc=1 (race-free aggregate)
+  [OK]  _run_updates_parallel: uses RETURN trap for $_result_dir (no temp leak)
+  [OK]  _run_all_updates: all 15 _update_* stubs called (exactly once each)
+  [OK]  _run_all_updates: all 15 stubs called exactly once (no duplicates)
+  [OK]  lib/updater.sh: bash 3.x guard: skipped (docker not available; verified by CI matrix)
+  [OK]  lib/updater.sh: bash 4+ version guard present in source
+  [OK]  linuxinstall.sh: bash 4+ version guard present in source
+
+All 45 test(s) passed.</system-out></testcase>
+    <testcase classname="verify_sync" name="verify_sync" time="5"><system-out>=== verify_sync.sh: color-gate canonical wiring checks ===
+
+1. Canonical files exist and are valid bash:
+  [OK]  lib/color-gate.sh exists
+  [OK]  lib/color-gate.sh syntax valid
+  [OK]  lib/color.sh exists
+  [OK]  lib/color.sh syntax valid
+  [OK]  lib/color.sh sources color-gate.sh
+  [OK]  lib/color.sh defines _c
+  [OK]  lib/color.sh guards double-source
+  [OK]  lib/color.sh defines print helpers (bold/warn/err/ok)
+
+2. linuxinstall.sh inline gate (curl|bash fallback):
+  [OK]  inline gate: has _apply_color_gate function
+  [OK]  inline gate: sets USE_COLOR from _apply_color_gate
+  [OK]  inline gate: unsets _apply_color_gate after use
+  [OK]  inline gate: has NEOHIRO_COLOR=1 fast path
+  [OK]  inline gate: checks XDG NO_COLOR correctly (not -n)
+
+3. lib/updater.sh inline gate (curl|bash fallback):
+  [OK]  updater.sh: has _updater_apply_gate function
+  [OK]  updater.sh: sets USE_COLOR from gate
+  [OK]  updater.sh: sources lib/color.sh when available
+  [OK]  updater.sh: checks XDG NO_COLOR correctly
+
+4. restore_ssh.sh inline gate:
+  [OK]  restore_ssh.sh: sources lib/color.sh
+  [OK]  restore_ssh.sh: has _color_safe gate function
+  [OK]  restore_ssh.sh: sets C_* from gate result
+  [OK]  restore_ssh.sh: checks XDG NO_COLOR correctly
+
+5. DeepClean.sh inline gate:
+  [OK]  DeepClean.sh: sources lib/color.sh
+  [OK]  DeepClean.sh: has USE_COLOR gate logic
+  [OK]  DeepClean.sh: checks XDG NO_COLOR correctly
+  [OK]  DeepClean.sh: uses GREEN/BLUE/YELLOW/CYAN/NC in output
+
+6. Behavioral: all scripts emit identical USE_COLOR for same env.
+  [OK]  canonical gate (no tty, no overrides) -&gt; USE_COLOR=0 (got 0)
+
+6a. Canonical gate parity across 6 critical env combinations:
+  [OK]  all 6 combos agree (driver == canonical)
+
+6b. Inline gate: canonical function present in each script:
+  [OK]  linuxinstall.sh: inline gate function defined
+  [OK]  lib/updater.sh: inline gate function defined
+  [OK]  restore_ssh.sh: inline gate function defined
+  [OK]  DeepClean.sh: inline gate logic present (no named function)
+
+7. Behavioral: all scripts honor NO_COLOR=1 (XDG spec).
+  [OK]  linuxinstall.sh: NO_COLOR XDG guard correct
+  [OK]  lib/updater.sh: NO_COLOR XDG guard correct
+  [OK]  restore_ssh.sh: NO_COLOR XDG guard correct
+  [OK]  DeepClean.sh: NO_COLOR XDG guard correct
+
+8. Drift prevention: tools/build-color-gate.sh must run successfully.
+  [OK]  tools/build-color-gate.sh runs successfully
+  [OK]  generator produced 6 lines (4 blocks)
+  [OK]  all 4 generated gate bodies are identical (no drift possible)
+
+All checks passed.</system-out></testcase>
+  </testsuite>
+</testsuites>

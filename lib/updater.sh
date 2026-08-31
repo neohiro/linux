@@ -22,9 +22,24 @@
 # Bash 4.0).  The macOS system bash is 3.2 and will fail with a
 # "bad substitution" error otherwise.  Surface this clearly rather
 # than failing in an opaque way.
+_updater_color_ok() {
+  # Canonical gate with -t 2 (stderr) because this fires before color.sh is
+  # sourced and is only used when writing the Bash4+ error message to stderr.
+  if [ "${NEOHIRO_COLOR:-}" = "1" ]; then return 0; fi
+  if [ "${NEOHIRO_COLOR:-}" = "0" ]; then return 1; fi
+  if [ "${FORCE_TTY:-}" != "1" ] && [ ! -t 2 ]; then return 1; fi
+  if [ -n "${NO_COLOR:-}" ] && [ "${NO_COLOR:-}" != "0" ]; then return 1; fi
+  if [ "${TERM:-}" = "dumb" ]; then return 1; fi
+  if ! command -v tput >/dev/null 2>&1; then return 1; fi
+  local _tcol; _tcol=$(tput colors 2>/dev/null) || return 1
+  case "${_tcol}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "${_tcol}" -ge 8 ] 2>/dev/null || return 1 ;;
+  esac
+  return 0
+}
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
-  local _err_tag
-  if [ -t 2 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != "dumb" ]; then
+  if _updater_color_ok; then
     _err_tag=$(printf '\033[1;31m%s\033[0m' '[ERROR]')
   else
     _err_tag='[ERROR]'
@@ -44,15 +59,37 @@ __NEOHIRO_UPDATER_SOURCED=1
 if [ -r "$(dirname "${BASH_SOURCE[0]:-$0}")/color.sh" ]; then
   source "$(dirname "${BASH_SOURCE[0]:-$0}")/color.sh"
 fi
-if [ -z "${USE_COLOR:-}" ]; then USE_COLOR=0; fi
+# If color.sh was not sourced or did not set USE_COLOR, run the canonical
+# gate inline so _c is safe to call in all execution paths.
+if [ -z "${USE_COLOR:-}" ]; then
+  _updater_apply_gate() {
+    if [ "${NEOHIRO_COLOR:-}" = "1" ]; then echo 1; return 0; fi
+    if [ "${NEOHIRO_COLOR:-}" = "0" ]; then echo 0; return 0; fi
+    if [ "${FORCE_TTY:-}" != "1" ] && [ ! -t 1 ]; then echo 0; return 0; fi
+    if [ -n "${NO_COLOR:-}" ] && [ "${NO_COLOR:-}" != "0" ]; then echo 0; return 0; fi
+    if [ "${TERM:-}" = "dumb" ]; then echo 0; return 0; fi
+    if ! command -v tput >/dev/null 2>&1; then echo 0; return 0; fi
+    local _tcol; _tcol=$(tput colors 2>/dev/null) || _tcol=""
+    case "${_tcol}" in
+      ''|*[!0-9]*) echo 0; return 0 ;;
+      *) [ "${_tcol}" -ge 8 ] 2>/dev/null && echo 1 || echo 0; return 0 ;;
+    esac
+  }
+  USE_COLOR=$(_updater_apply_gate)
+  unset -f _updater_apply_gate
+fi
 
 # Print helpers work whether sourced or run standalone.
-_c()  { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+_c()  { if [ "$USE_COLOR" = "1" ]; then printf '\033[%s%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 msg() { echo "=> $*"; }
 info(){ printf '  %s\n' "$*"; }
 ok()  { printf "%s %s\n" "$(_c '1;32m' '[OK]')" "$*"; }
-warn(){ local m="$(_c '1;33m' '[WARN]') $*" && printf '%s\n' "$m" >&2; }
-err() { local m="$(_c '1;31m' '[ERROR]') $*" && printf '%s\n' "$m" >&2; }
+# SC2155: declare and assign separately so a failing _c call doesn't get
+# masked by the local's exit code.  Without this, `local m=$(failing_cmd)`
+# would always return 0 even when the command inside the substitution
+# failed — silently dropping the warning/error.
+warn(){ local m; m="$(_c '1;33m' '[WARN]') $*"; printf '%s\n' "$m" >&2; }
+err() { local m; m="$(_c '1;31m' '[ERROR]') $*"; printf '%s\n' "$m" >&2; }
 
 VERBOSE="${VERBOSE:-0}"
 FAILED=0
@@ -563,11 +600,12 @@ _update_pihole() {
 
 _run_all_updates() {
   # Parse flags.
-  local _summary="text" _parallel="${PARALLEL:-1}" _p
+  local _summary="text" _parallel="${PARALLEL:-1}" _steps_overrides="" _p
   for _p in "$@"; do
     case "$_p" in
       --summary=json) _summary="json" ;;
-      --parallel=*)   _parallel="${_p#--parallel=}";;
+      --parallel=*)   _parallel="${_p#--parallel=}" ;;
+      --steps=*)      _steps_overrides="${_p#--steps=}" ;;
     esac
   done
 
@@ -575,11 +613,15 @@ _run_all_updates() {
   local start_sec=$SECONDS
 
   # Define the ordered list of sub-steps. Each entry is the function name.
-  local _steps="apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole"
+  # Override with --steps="..." for testing (avoids mocking every real package manager).
+  local _steps="${_steps_overrides:-apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole}"
 
-  if [ "$_parallel" -ge 2 ] 2>/dev/null; then
+  # Validate --parallel=N: must be a positive integer >= 2.
+  if [[ "$_parallel" =~ ^[1-9][0-9]*$ ]] && [ "$_parallel" -ge 2 ]; then
     _run_updates_parallel "$_steps" "$_parallel" "$_summary" "$start_sec"
     return $?
+  elif [ "$_parallel" != "1" ]; then
+    warn "parallel: invalid value '$_parallel' (must be an integer >= 2) — running sequentially."
   fi
 
   # --- Sequential dispatch ---
@@ -593,40 +635,49 @@ _run_all_updates() {
 
 # _run_updates_parallel <steps> <max_jobs> <summary_format> <start_sec>
 # Runs sub-steps concurrently, collects results, prints summary.
+#
+# Each sub-step writes its result to its own temp file (one file, one writer)
+# so there is no byte-level race on a shared results file.  The parent reads
+# all per-step files after all jobs have exited.
 _run_updates_parallel() {
   local _steps="$1" _max_jobs="$2" _summary="$3" _start_sec="$4"
-  local _fn _pid _pids="" _result_dir
+  local _fn _pids=""
 
   _result_dir=$(mktemp -d) || {
     warn "parallel: mktemp failed — falling back to sequential"
-    local _fn
     for _fn in $_steps; do "_update_$_fn" || true; done
     _print_summary "$_summary" "$((SECONDS - _start_sec))"
-    return 0
+    # Propagate the actual failure state from sub-steps; do not hardcode 0.
+    # _track() inside each step updated UPDATED/FAILED, which _print_summary
+    # uses to decide its own return value.  We pass that through.
+    [ "$FAILED" -gt 0 ] && return 1 || return 0
   }
+  # Install RETURN trap so $_result_dir is cleaned when this function returns,
+  # not when the shell exits.  This prevents temp-directory leaks when
+  # _run_updates_parallel is called multiple times in the same session.
   trap 'rm -rf "$_result_dir" 2>/dev/null || true' RETURN
 
   local _running=0
+  # _pids is a space-separated string of PIDs.  When a PID exits, we remove
+  # it with a regex pad-and-collapse to avoid double-space accumulation.
   for _fn in $_steps; do
     # Throttle: wait if we're at max concurrency.
     while [ "$_running" -ge "$_max_jobs" ]; do
       for _p in $_pids; do
         if ! kill -0 "$_p" 2>/dev/null; then
-          _pids="${_pids//$_p/}"
-          _pids="${_pids# }"; _pids="${_pids# }"
+          _pids=$(printf '%s' " $_pids " | sed -E "s/[[:space:]]+${_p}[[:space:]]+/ /")
           _running=$((_running - 1))
         fi
       done
       sleep 0.1
     done
 
-    # Launch sub-step in background, write result to a file.
+    # Write result to a dedicated file so this subshell is the sole writer.
+    # Step name is the filename; content is "rc:updated:failed".
     (
-      local _UPDATED=0 _FAILED=0 _rc=0
       "_update_$_fn"; _rc=$?
-      # Aggregate counters in the result file: step_name=rc:updated:failed
-      printf '%s=%d:%d:%d\n' "$_fn" "$_rc" "$UPDATED" "$FAILED" >> "$_result_dir/results"
-      exit 0
+      printf '%d:%d:%d\n' "$_rc" "$UPDATED" "$FAILED" > "$_result_dir/$_fn"
+      exit "$_rc"
     ) &
     _pids="$_pids $!"
     _running=$((_running + 1))
@@ -635,19 +686,20 @@ _run_updates_parallel() {
   # Wait for remaining background jobs.
   for _p in $_pids; do wait "$_p" 2>/dev/null; done
 
-  # Aggregate results from result files.
-  local _line _name _rc _step_upd _step_fail
-  while IFS='=' read -r _line; do
-    [ -z "$_line" ] && continue
-    _name="${_line%%=*}"
-    _rc="${_line#*=}"; _rc="${_rc%%:*}"
-    _step_upd="${_line#*:}"; _step_upd="${_step_upd%%:*}"
-    _step_fail="${_line##*:}"
+  # Aggregate from per-step files.  All subshells have exited by this point,
+  # so no file is being written while we read it.  Files in $_result_dir are
+  # owned by this user (mode 0700 from mktemp -d) so no permission races.
+  # File format is "rc:updated:failed"; IFS=: splits on the colon separator.
+  local _result_file _rc _step_upd _step_fail
+  UPDATED=0; FAILED=0
+  for _result_file in "$_result_dir"/*; do
+    [ -f "$_result_file" ] || continue
+    IFS=: read -r _rc _step_upd _step_fail < "$_result_file"
     UPDATED=$((UPDATED + _step_upd))
+    # _track() inside the subshell already incremented FAILED for each
+    # failed sub-step; do not add another +1 here (that would double-count).
     FAILED=$((FAILED + _step_fail))
-    # If any sub-step failed, mark the step as failed.
-    [ "$_rc" -ne 0 ] 2>/dev/null && FAILED=$((FAILED + 1))
-  done < "$_result_dir/results"
+  done
 
   _print_summary "$_summary" "$((SECONDS - _start_sec))"
 }
@@ -658,8 +710,7 @@ _print_summary() {
   local _fmt="$1" _elapsed="$2"
 
   if [ "$_fmt" = "json" ]; then
-    # Emit JSON with bash — no jq dependency. Quotes and backslashes escaped.
-    local _upd_esc="$UPDATED" _fail_esc="$FAILED"
+    # Emit JSON with bash — no jq dependency.
     printf '{"elapsed_s":%d,"updated":%d,"failed":%d}\n' \
       "$_elapsed" "$UPDATED" "$FAILED"
     if [ "$FAILED" -gt 0 ]; then return 1; fi

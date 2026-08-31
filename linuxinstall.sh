@@ -6,7 +6,13 @@
 # security tools, unattended upgrades, and kernel management accordingly.
 # Automates the README tutorial with safety prompts.
 # Run as root:   sudo bash linuxinstall.sh
+# Requires bash 4.0+ (uses [[ =~ ]], ${!var}, mapfile in helpers).
 #
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  printf '%s\n' "linuxinstall.sh requires Bash 4.0+; found ${BASH_VERSION:-unknown}." >&2
+  printf '%s\n' "  macOS users: brew install bash" >&2
+  exit 1
+fi
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
@@ -31,12 +37,32 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   fi
 else
   # Inline fallback for run-from-pipe (curl ... | bash) where the lib
-  # directory is not on disk. Same canonical definitions, kept in sync
-  # with lib/color.sh and lib/temp.sh.
-  USE_COLOR=1
-  if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then USE_COLOR=0; fi
+  # directory is not on disk. Sources the canonical color-gate function from
+  # a local copy so curl|bash works without any on-disk dependencies.
+  _NEOHIRO_LIB_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo /usr/local/bin)")/lib" 2>/dev/null && pwd || echo "")"
+  if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color-gate.sh" ]; then
+    # shellcheck source=lib/color-gate.sh
+    . "$_NEOHIRO_LIB_DIR/color-gate.sh"
+  else
+    # No on-disk lib; inline the gate function from the embedded heredoc below.
+    _apply_color_gate() {
+      if [ "${NEOHIRO_COLOR:-}" = "1" ]; then echo 1; return 0; fi
+      if [ "${NEOHIRO_COLOR:-}" = "0" ]; then echo 0; return 0; fi
+      if [ "${FORCE_TTY:-}" != "1" ] && [ ! -t 1 ]; then echo 0; return 0; fi
+      if [ -n "${NO_COLOR:-}" ] && [ "${NO_COLOR:-}" != "0" ]; then echo 0; return 0; fi
+      if [ "${TERM:-}" = "dumb" ]; then echo 0; return 0; fi
+      if ! command -v tput >/dev/null 2>&1; then echo 0; return 0; fi
+      local _tcol; _tcol=$(tput colors 2>/dev/null) || _tcol=""
+      case "${_tcol}" in
+        ''|*[!0-9]*) echo 0; return 0 ;;
+        *) [ "${_tcol}" -ge 8 ] 2>/dev/null && echo 1 || echo 0; return 0 ;;
+      esac
+    }
+  fi
+  USE_COLOR=$(_apply_color_gate)
+  unset -f _apply_color_gate
   # _c <ansi-code> <text>  -- wrap text in CSI escapes iff USE_COLOR=1.
-  _c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+  _c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%s%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
   # Print helpers. All accept a single message string. warn/err go to stderr.
   bold() { printf "%s\n" "$(_c '1m' "$*")"; }
   warn() { printf "%s %s\n" "$(_c '1;33m' '[WARNING]')" "$*" >&2; }
@@ -1077,14 +1103,14 @@ _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Rever
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
+_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary"
+
 show_progress() {
-  local done=0 total=0 i key
-  for key in tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary; do
+  local done=0 total=0 key status
+  for key in $_CHECKLIST_ORDER; do
     total=$((total + 1))
     case "${CHECKLIST[$key]:-pending}" in
-      done)   done=$((done + 1)) ;;
-      running) done=$((done + 1)) ;;
-      skip)   done=$((done + 1)) ;;
+      done|running|skip) done=$((done + 1)) ;;
     esac
   done
   local pct=$(( done * 100 / total ))
@@ -1099,19 +1125,19 @@ show_progress() {
   _c '1;32m' "$bar_filled"
   _c '1;30m' "$bar_empty"
   printf ' %d/%d (%d%%) ===\n' "$done" "$total" "$pct"
-  for key in tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary; do
-    local status="${CHECKLIST[$key]:-pending}"
-    local icon color
+  local icon color label_var label
+  for key in $_CHECKLIST_ORDER; do
+    status="${CHECKLIST[$key]:-pending}"
     case "$status" in
       done)    icon='[x]'; color='1;32m' ;;
       running) icon='[>]'; color='1;33m' ;;
-      skip)    icon='[ ]'; color='1;30m' ;;
       *)       icon='[ ]'; color='1;30m' ;;
     esac
-    local label_var="CHECKLIST_LABEL_${key}"
+    label_var="CHECKLIST_LABEL_${key}"
+    label="${!label_var:-}"
     printf '  '
     _c "$color" "$icon "
-    printf '%s\n' "${!label_var}"
+    printf '%s\n' "$label"
   done
   printf '\n'
 }
@@ -1133,10 +1159,14 @@ print_metrics_summary() {
   end_disk_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)"
   local disk_delta=$(( end_disk_kb - METRICS_START_DISK_KB ))
   local disk_freed_str
-  if [ "$disk_delta" -gt 0 ]; then
+  if [ "$EUID" -ne 0 ]; then
+    disk_freed_str="N/A (re-run as root to measure)"
+  elif [ "$disk_delta" -gt 0 ]; then
     disk_freed_str="$(numfmt --to=iec-i --suffix=B "$(( disk_delta * 1024 ))" 2>/dev/null || echo "${disk_delta} KB freed")"
+  elif [ "$disk_delta" -lt 0 ]; then
+    disk_freed_str="(used ${disk_delta#-} KB — net disk usage grew during run)"
   else
-    disk_freed_str="N/A (run as root to measure)"
+    disk_freed_str="0 B (no net change)"
   fi
 
   local max_val=1
@@ -1183,12 +1213,15 @@ print_metrics_summary() {
 }
 
 print_welcome() {
-  local _hr
-  _hr="$(printf '─%.0s' {1..58})"
-  local _os_label _kernel _hostname
+  local _os_label _kernel _hostname _user_label
   _os_label="$(awk -F= '/^NAME=/{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null || uname -s)"
   _kernel="$(uname -r)"
   _hostname="$(hostname 2>/dev/null || echo unknown)"
+  if [ "$EUID" -eq 0 ]; then
+    _user_label="root ($(whoami 2>/dev/null || echo root))"
+  else
+    _user_label="$USER (non-root — re-run with sudo)"
+  fi
   local _step_count _ssh_note
   case "$REPLY_PROFILE" in
     1) _step_count=6 _ssh_note="(no SSH changes)" ;;
@@ -1200,22 +1233,22 @@ print_welcome() {
   printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
   printf '%s\n' "$(_c '1;36m' "  ║          neohiro/linux  —  Setup & Hardening             ║")"
   printf '%s\n' "$(_c '1;36m' "  ╚══════════════════════════════════════════════════════════╝")"
-  printf '\n  %-14s %s\n' "$(_c '1;30m' 'Host:')" "$(_c '1;37m' "$_hostname")"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'OS:')" "$(_c '1;37m' "$_os_label")"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'Kernel:')" "$(_c '1;37m' "$_kernel")"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'Arch:')" "$(_c '1;37m' "$(uname -m)")"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'Run as:')" "$(_c '1;37m' "root ($(whoami))")"
-  printf '\n  %s\n' "$_hr"
+  printf '\n  %-14s %s\n' "$(_c '1;30m' 'Host:')"     "$(_c '1;37m' "$_hostname")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'OS:')"       "$(_c '1;37m' "$_os_label")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Kernel:')"   "$(_c '1;37m' "$_kernel")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Arch:')"     "$(_c '1;37m' "$(uname -m)")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Run as:')"   "$(_c '1;37m' "$_user_label")"
+  printf '\n  %s\n' "$(_c '1;30m' '──────────────────────────────────────────────────────────')"
   printf '  %-14s %s\n' "$(_c '1;30m' 'Environment:')" "$ENV_TYPE"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'Remote SSH:')" "$(_c '1;37m' "$USE_REMOTE_SSH")"
-  printf '  %-14s %s\n' "$(_c '1;30m' 'Profile:')" "$(_c '1;37m' "Profile $REPLY_PROFILE — $(_profile_label)")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Remote SSH:')"  "$(_c '1;37m' "$USE_REMOTE_SSH")"
+  printf '  %-14s %s\n' "$(_c '1;30m' 'Profile:')"     "$(_c '1;37m' "Profile $REPLY_PROFILE — $(_profile_label)")"
   if [ "$_step_count" -gt 0 ]; then
-    printf '  %-14s %s\n' "$(_c '1;30m' 'Steps:')" "$(_c '1;37m' "~$_step_count hardening steps $_ssh_note")"
+    printf '  %-14s %s\n' "$(_c '1;30m' 'Steps:')"       "$(_c '1;37m' "~$_step_count hardening steps $_ssh_note")"
   fi
   if [ "$QUICK_MODE" = "1" ]; then
     printf '  %-14s %s\n' "$(_c '1;32m' 'Quick mode:')" "$(_c '1;32m' 'ON — using defaults, no individual prompts')"
   fi
-  printf '  %s\n' "$_hr"
+  printf '  %s\n' "$(_c '1;30m' '──────────────────────────────────────────────────────────')"
   if [ -n "${TMUX:-}" ]; then
     info "Running inside tmux — your session is protected against SSH disconnection."
   fi
@@ -1275,10 +1308,10 @@ ask_profile() {
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Most aggressive.  Takes 5-10 min.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;33m' '4) Custom')"     "$(_c '1;37m' 'Choose each step individually.')"
-  printf '  %s        %s\n' "" "$(_c '1;30m' 'Run as: QUICK_MODE=1 bash linuxinstall.sh to skip individual prompts.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'QUICK_MODE=1 skips per-step prompts; use recommended defaults.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;31m' '5) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes. Safe recovery tool.')"
-  printf '  %s        %s\n' "" "$(_c '1;30m' 'Also reinstalls the SSH self-heal watchdog if you want.')"
+  printf '  %s  %s\n' "$(_c '1;31m' '5) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes; offers self-heal guard.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Safe recovery tool — re-run anytime without re-hardening.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;1;35m' '6) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
@@ -1289,17 +1322,17 @@ ask_profile() {
   printf '  %s  %s\n' "$(_c '1;32m' '8) Attack Surface Reduction')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Categories: hardware, networking, legacy protocols, etc.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '9) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (but do not enable)')"
+  printf '  %s  %s\n' "$(_c '1;32m' '9) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (do not enable)')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'tor / fail2ban / shadowsocks / dnscrypt. Auto-update opt-in.')"
   printf '\n'
-  printf '  %s\n' "$_hr"
+  printf '%s\n' "$_hr"
   prompt_choice "Apply which set of categories?" \
     "Recommended (safe, no SSH-lockout risk)" \
     "Standard (includes SSH hardening, Fail2ban, sysctl, AppArmor)" \
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
-    "Custom (I will be asked per category)" \
-    "Restore SSH (diagnose & fix common lockout causes; option-only menu)" \
-    "Maintenance suite (pick individual categories, return to this menu)" \
+    "Custom (individual per-category prompts)" \
+    "Restore SSH (diagnose & fix common lockout causes)" \
+    "Maintenance suite (20 individual tools, return to this menu)" \
     "DeepClean (cleanup + auto-prune; no hardening)" \
     "Attack Surface Reduction (OptimizeLinuxASR.sh; service-by-service)" \
     "Updates only (system update + kernel + optional packages + auto-update)"
@@ -1412,13 +1445,22 @@ _maintenance_logs() {
 
 _maintenance_sysinfo() {
   msg "System information"
-  printf '  %-20s %s\n' "Hostname:" "$(hostname 2>/dev/null)"
-  printf '  %-20s %s\n' "Uptime:" "$(uptime -p 2>/dev/null || uptime 2>/dev/null)"
-  printf '  %-20s %s\n' "Load (1/5/15 min):" "$(cat /proc/loadavg 2>/dev/null)"
-  printf '  %-20s %s\n' "Memory:" "$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2}')"
-  printf '  %-20s %s\n' "Disk /:" "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}')"
-  printf '  %-20s %s\n' "Kernel:" "$(uname -r 2>/dev/null)"
-  printf '  %-20s %s\n' "CPU:" "$(nproc 2>/dev/null) cores$(lscpu 2>/dev/null | awk '/Model name/ {printf ": %s", $0}' | sed 's/Model name.*: //')"
+  local cpu_model="" _nproc_str
+  if command -v lscpu >/dev/null 2>&1; then
+    cpu_model="$(lscpu 2>/dev/null | awk -F: '/^Model name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')"
+  fi
+  if command -v nproc >/dev/null 2>&1; then
+    _nproc_str="$(nproc 2>/dev/null) cores"
+  else
+    _nproc_str="? cores"
+  fi
+  printf '  %-20s %s\n' "Hostname:" "$(hostname 2>/dev/null || echo unknown)"
+  printf '  %-20s %s\n' "Uptime:" "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+  printf '  %-20s %s\n' "Load (1/5/15 min):" "$(cat /proc/loadavg 2>/dev/null || echo unknown)"
+  printf '  %-20s %s\n' "Memory:" "$(free -h 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2}' || echo unknown)"
+  printf '  %-20s %s\n' "Disk /:" "$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}' || echo unknown)"
+  printf '  %-20s %s\n' "Kernel:" "$(uname -r 2>/dev/null || echo unknown)"
+  printf '  %-20s %s%s\n' "CPU:" "$_nproc_str" "${cpu_model:+: $cpu_model}"
   if command -v ss >/dev/null 2>&1; then
     printf '  %-20s\n' "Listening TCP ports:"
     ss -tlnp 2>/dev/null | awk 'NR>1 {printf "    %s\n", $0}' | head -20
@@ -1777,9 +1819,9 @@ setup_dnscrypt() {
   else
     info "Installing dnscrypt-proxy (this can take a minute on first install)..."
     if ! pkg_install dnscrypt-proxy; then
-    err "dnscrypt-proxy not in official repos for $PKG_MGR; install from source."
-    return 1
-  fi
+      err "dnscrypt-proxy not in official repos for $PKG_MGR; install from source."
+      return 1
+    fi
   fi
   # Port 53 is the most common collision (systemd-resolved listens on
   # 127.0.0.53:53 by default; some users run a private unbound/pihole

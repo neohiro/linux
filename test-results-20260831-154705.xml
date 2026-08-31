@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="neohiro-linux" tests="6" failures="0" time="94s">
+  <testsuite name="run-all" tests="6" failures="0" time="94s">
+    <testcase classname="color_gate" name="color_gate" time="15s"><system-out>All 56 color-gate test(s) passed.</system-out></testcase>
+    <testcase classname="curl_pipe_sim" name="curl_pipe_sim" time="3s"><system-out>All 10 curl|pipe regression test(s) passed.</system-out></testcase>
+    <testcase classname="color_fuzz" name="color_fuzz" time="64s"><system-out>All 200 fuzz iteration(s) passed (800 invariant checks).</system-out></testcase>
+    <testcase classname="linuxinstall" name="linuxinstall" time="5s"><system-out>All 65 test(s) passed.</system-out></testcase>
+    <testcase classname="updater" name="updater" time="1s"><system-out>All 45 test(s) passed.</system-out></testcase>
+    <testcase classname="verify_sync" name="verify_sync" time="6s"><system-out>All checks passed.</system-out></testcase>
+  </testsuite>
+</testsuites>

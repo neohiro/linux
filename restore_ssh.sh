@@ -23,15 +23,32 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
 fi
 
 # --- print helpers (format preserved from original restore_ssh.sh) ---
-# If lib/color.sh was sourced, C_* constants are already set by _c's output;
-# re-emit them so that print helpers produce the original "[ OK ]" format.
-if [ -z "${C_RED:-}" ]; then
-  if [ "$USE_COLOR" = "1" ]; then
-    C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
-    C_CYA=$'\033[1;36m'; C_BLD=$'\033[1;37m'; C_RST=$'\033[0m'
-  else
-    C_RED=""; C_GRN=""; C_YEL=""; C_CYA=""; C_BLD=""; C_RST=""
-  fi
+# If lib/color.sh was sourced, USE_COLOR is set but C_* constants are not
+# (lib/color.sh defines _c, not C_RED/C_GRN/etc.). Run the gate once and
+# emit the legacy C_* constants from the same USE_COLOR decision so we
+# don't double-call tput colors.
+_color_safe() {
+  if [ "${NEOHIRO_COLOR:-}" = "1" ]; then return 0; fi
+  if [ "${NEOHIRO_COLOR:-}" = "0" ]; then return 1; fi
+  if [ -n "${NO_COLOR:-}" ] && [ "${NO_COLOR:-}" != "0" ]; then return 1; fi
+  if [ "${TERM:-}" = "dumb" ]; then return 1; fi
+  if [ "${FORCE_TTY:-}" != "1" ] && [ ! -t 1 ]; then return 1; fi
+  if ! command -v tput >/dev/null 2>&1; then return 1; fi
+  local _tcol; _tcol=$(tput colors 2>/dev/null) || return 1
+  case "${_tcol}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "${_tcol}" -ge 8 ] 2>/dev/null || return 1 ;;
+  esac
+  return 0
+}
+if [ -z "${USE_COLOR:-}" ]; then
+  if _color_safe; then USE_COLOR=1; else USE_COLOR=0; fi
+fi
+if [ "${USE_COLOR}" = "1" ]; then
+  C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_YEL=$'\033[1;33m'
+  C_CYA=$'\033[1;36m'; C_BLD=$'\033[1;37m'; C_RST=$'\033[0m'
+else
+  C_RED=""; C_GRN=""; C_YEL=""; C_CYA=""; C_BLD=""; C_RST=""
 fi
 ok()    { printf '%s[ OK ]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
 warn()  { printf '%s[WARN]%s %s\n' "$C_YEL" "$C_RST" "$*" 1>&2; }

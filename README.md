@@ -1,13 +1,69 @@
-﻿# neohiro/linux
+# neohiro/linux
 [![Platform](https://img.shields.io/badge/platform-Linux-lightgray.svg)](https://github.com/)
 [![Supported distros](https://img.shields.io/badge/distros-Ubuntu%20%7C%20Debian%20%7C%20RHEL%20%7C%20Fedora%20%7C%20SUSE%20%7C%20Arch%20%7C%20Amazon%20Linux-blue.svg)](#supported-distributions)
+[![CI](https://github.com/neohiro/linux/actions/workflows/tests.yml/badge.svg)](.github/workflows/tests.yml)
 
-Cross-distro general-purpose setup & hardening script. Auto-detects the
-distribution and the package manager, and adapts every step accordingly —
-package names, firewall tool, security tooling, kernel update path, and
-unattended-upgrades availability.
+> **One script. Every distro. Safe to run over SSH.**
+>
+> Auto-detects Ubuntu, Debian, RHEL, AlmaLinux, Rocky, CentOS, Fedora,
+> Amazon Linux, openSUSE, SLES, Arch, and Manjaro from `/etc/os-release` —
+> then picks the right package manager, firewall, MAC system, and service
+> unit for that family. Same prompt, same outcome, on any box you own.
 
-Offers a more secure starting point for any new super user.
+## Why it exists
+
+A fresh server or VPS comes with a long list of defaults that are **wrong
+for anything exposed to the internet** — password SSH, no firewall,
+unattended-upgrades off, no MAC, the running kernel from the install ISO,
+no log rotation. Fixing that by hand means reading 7 manpages and getting
+the package name right per distro. This script:
+
+- **One-liner, zero install.** `curl | bash` with no prerequisites; the
+  script fetches its own helpers on demand.
+- **Resumable over SSH.** Auto-wraps itself in a detached `tmux` session
+  on the first prompt, so a dropped connection never aborts a long
+  `dnf upgrade`. Reattach with `tmux attach -t linux-setup`.
+- **Refuses to lock you out.** SSH hardening will not touch
+  `PasswordAuthentication` until a fresh ed25519 key has been validated,
+  and it never changes the port. A self-heal watchdog (systemd timer or
+  cron) re-opens the port and re-enables password auth if sshd ever dies.
+- **Rollback log per file.** Every config it edits is backed up to a
+  timestamped copy; the index lives at `/var/log/linux-install-rollback.log`
+  and is one `cp` away from a full undo.
+- **Three security profiles + a 20-tool maintenance suite.** From
+  "Recommended" (firewall + updates, 6 steps, no SSH risk) to "Full"
+  (Tor + IPv6 disable + ASR + deep clean, 12 steps). Maintenance menu
+  re-runs any step on a live box without re-hardening.
+
+## At a glance
+
+| What you get | How |
+|---|---|
+| Firewall (UFW on apt, firewalld everywhere else) | Default-deny incoming; opens SSH only if you say so |
+| Kernel + full system update | `apt full-upgrade` / `dnf upgrade` / `zypper update` / `pacman -Syu` — auto-detected |
+| Old-kernel prune | Keeps running kernel + one spare; prints names before removing |
+| SSH hardening | `PasswordAuthentication no` gated on validated pubkey; port never changed |
+| Fail2ban, sysctl profile, AppArmor/SELinux check | per-distro package names |
+| Tor, dnscrypt-proxy, unattended-upgrades, DeepClean | optional per profile |
+| **Rollback log** | `/var/log/linux-install-rollback.log` — `original\tbackup` per file |
+| **SSH self-heal** | `--install-self-heal` — systemd timer or cron, every 60s |
+| **20-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
+
+## Quick start
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)"
+```
+
+> Read it first:
+> `curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | less`
+
+The script prompts you per category. **Full profile on a server runs in
+auto mode** — SSH hardening is applied without the interactive lockout-
+prone prompts (it never disables `PasswordAuthentication` unless it
+detects a working pubkey, and it never changes the port), so the only
+way to get locked out is the OpenSSH config breaking — in which case
+the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 
 ## Supported distributions
 
@@ -25,36 +81,6 @@ Offers a more secure starting point for any new super user.
 > The package manager is then selected from the order `pacman → zypper → dnf
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
-
-## One-step automated setup
-
-Run the general interactive script directly from the repo — it prompts you
-per category (environment type, SSH lockout-prone steps, ambiguous DNS/Tor/
-IPv6 choices, and the new helper scripts are fetched on-demand):
-
-```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)"
-```
-
-> Review it first:
-> `curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | less`
-
-**Profiles:** the script asks which profile to apply — Recommended (safe),
-Standard (full hardening + SSH), Full (everything including Tor/IPv6/ASR/
-DeepClean), or Custom (you confirm every step). Risky actions (SSH
-hardening, IPv6, DNS method, Tor, attack-surface reduction) always prompt
-individually before touching anything.
-
-**Full profile on a server runs in "auto" mode:** SSH hardening is applied
-without the interactive lockout-prone prompts (it never disables
-`PasswordAuthentication` unless it detects a working pubkey, and it never
-changes the port), so the only way to get locked out is the OpenSSH config
-breaking — in which case the in-script `restore_ssh` routine or Tailscale
-SSH can get you back in.
-
-**Progress checklist:** the script prints a colored bar chart (e.g.
-`━━━ PROGRESS ████████████░░░░ 12/17 (70%) ━━━`) before every step, so you
-always see what's already done and what's coming.
 
 ### Cross-distro kernel update
 
@@ -479,6 +505,21 @@ dumps — add to `/etc/security/limits.conf`:
 * hard core 0
 ```
 
+### Testing
+
+```bash
+bash tests/test_linuxinstall.sh    # 65 tests: parse, logic, UX coverage, snapshot
+bash tests/test_updater.sh         # 43 tests: dispatcher, race safety, version floor
+shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
+```
+
+To regenerate snapshot fixtures after a deliberate UX change:
+```bash
+bash tests/gen_snapshots.sh   # re-captures print_welcome + print_metrics_summary
+```
+
+The snapshot test normalises host-specific lines (hostname, OS, kernel, arch) before comparison so fixtures are portable.  On macOS (bash 3.2 default) the `lib/updater.sh` version guard fires cleanly — this is verified by the CI matrix entry `bash:3.2-alpine3.18`.
+
 ### Verify & maintain
 
 ```bash
@@ -514,5 +555,5 @@ ss -tulnp                                               # re-check listeners
 
 - 💖 [Sponsor neohiro on GitHub](https://github.com/sponsors/neohiro) — covers API + hosting costs
 - 🌐 [neohiro.github.io](https://neohiro.github.io/) — main site
-- 🎬 [FrenzyPenguin Media](https://neohiro.github.io/frenzypenguin-media/) — video deep-dives
+- 🎬 [FrenzyPenguin Media](https://frenzypenguin-media.github.io/) — video deep-dives
 - 🧬 [transhumanists](https://transhumanists.github.io/) — companion dashboard for human progress

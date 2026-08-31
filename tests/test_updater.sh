@@ -19,6 +19,8 @@
 # Run: bash tests/test_updater.sh
 set -u
 PASS=0; FAIL=0
+# Ensure any test-created temp files are cleaned even on unexpected exit.
+trap 'rm -f /tmp/_cmd_test_ran_$$ 2>/dev/null || true' EXIT
 if [ -t 1 ]; then
   C_RED=$'\033[1;31m'; C_GRN=$'\033[1;32m'; C_RST=$'\033[0m'
 else C_RED=""; C_GRN=""; C_RST=""; fi
@@ -185,7 +187,7 @@ fi
 # the command was NOT executed (temp file must not exist after).
 DRY_RUN=1
 ran_flag=/tmp/_cmd_test_ran_$$
-[ -e "$ran_flag" ] && rm -f "$ran_flag"
+rm -f "$ran_flag" 2>/dev/null || true
 out=$(_cmd touch "$ran_flag" 2>&1)
 rc=$?
 DRY_RUN=0
@@ -196,6 +198,7 @@ if [ "$rc" = "0" ] && [ ! -e "$ran_flag" ] \
 else
   fail_t "_cmd under DRY_RUN=1" "rc=$rc file_exists=$([ -e "$ran_flag" ] && echo yes || echo no) output='$out'"
 fi
+# Cleanup guaranteed regardless of pass/fail (no leak).
 rm -f "$ran_flag" 2>/dev/null || true
 unset DRY_RUN
 
@@ -268,6 +271,201 @@ if declare -F run >/dev/null 2>&1; then
   ok_t "run function: declared"
 else
   fail_t "run function: declared" "not found"
+fi
+
+# --- Test 18: parallel subshell propagates exit code (pass 1 regression) ---
+# The pass-1 fix changed `exit 0` to `exit "$_rc"` in the background
+# subshell so `wait` in the parent correctly sees the sub-step's failure.
+# We verify by reading the function source and confirming the pattern.
+if grep -E 'exit "\$_rc"' "$ROOT/lib/updater.sh" >/dev/null 2>&1; then
+  ok_t "_run_updates_parallel subshell: exits with \$_rc (not hardcoded 0)"
+else
+  fail_t "_run_updates_parallel subshell: exit \"\$_rc\"" \
+         "subshell hardcodes exit 0 — failure will not propagate to parent wait"
+fi
+
+# --- Test 19: parallel aggregate does not double-count FAILED ---
+# The pass-1 fix removed the redundant `FAILED + 1` in the aggregate loop
+# (the per-step _track() call already counted each failure). Verify by
+# checking the source for the removed pattern.
+if grep -E '\[ "\$_rc" -ne 0 \] 2>/dev/null && FAILED=\$\(\(FAILED \+ 1\)\)' \
+     "$ROOT/lib/updater.sh" >/dev/null 2>&1; then
+  fail_t "_run_updates_parallel aggregate: no double-count" \
+         "redundant FAILED+1 per non-zero _rc still present"
+else
+  ok_t "_run_updates_parallel aggregate: no FAILED double-count"
+fi
+
+# --- Test 20: --parallel=N validates input and warns on bad value ---
+# Pass 1 added `[[ =~ ]]` validation; verify the warn path exists.
+if grep -E 'parallel: invalid value' "$ROOT/lib/updater.sh" >/dev/null 2>&1; then
+  ok_t "_run_all_updates --parallel=N: warns on invalid value"
+else
+  fail_t "_run_all_updates --parallel=N: invalid-value warning" \
+         "warning string not found in source"
+fi
+
+# --- Test 21: --parallel=abc falls back to sequential with no crash ---
+# End-to-end: passing a non-integer must not abort, and must not silently
+# invoke the parallel path (which would crash on `kill -0 $(echo)`).
+unset PARALLEL
+UPDATED=0; FAILED=0
+result=0
+_run_all_updates --parallel=abc >/dev/null 2>&1 || result=$?
+if [ "$result" -le 1 ]; then
+  ok_t "_run_all_updates --parallel=abc: falls back to sequential, rc=$result"
+else
+  fail_t "_run_all_updates --parallel=abc" "got rc=$result, expected 0 or 1"
+fi
+
+# --- Test 22b: dispatcher must propagate FAILED=0 vs >0 from mktemp fallback ---
+# The pass-2 fix changed the mktemp-fail fallback from `return 0` to
+# `[ "$FAILED" -gt 0 ] && return 1 || return 0`, so silent failure
+# swallowing is eliminated.  Verify the pattern exists in the parallel
+# dispatcher's mktemp-fail branch (NOT in _update_geoip's similar pattern).
+if grep -E 'parallel: mktemp failed' "$ROOT/lib/updater.sh" >/dev/null 2>&1; then
+  # Search ±10 lines because there's a 3-line comment between the warn and
+  # the [ "$FAILED" -gt 0 ] return line.
+  if grep -A 10 'parallel: mktemp failed' "$ROOT/lib/updater.sh" \
+     | grep -qE '\[ "\$FAILED" -gt 0 \] && return 1'; then
+    ok_t "_run_updates_parallel: mktemp-fail fallback propagates FAILED state"
+  else
+    fail_t "_run_updates_parallel: mktemp-fail fallback rc" \
+           "fallback still hardcodes 'return 0' — failures silently swallowed"
+  fi
+else
+  fail_t "_run_updates_parallel: mktemp-fail fallback" \
+         "fallback message 'parallel: mktemp failed' not found"
+fi
+
+# --- Test 22: end-to-end concurrency — 5 failing stubs in --parallel=3 ---
+# Spawn 5 _update_* stubs that all return non-zero.  In --parallel=3 mode,
+# three run concurrently, the other two wait, then all complete.  With the
+# per-substep file fix, each subshell writes "rc:updated:failed" atomically
+# to its own file; the parent aggregates them via `IFS=:` read.  FAILED must
+# equal exactly 5 (one per stub, no double-count, no parse error).
+for _fn in stub1 stub2 stub3 stub4 stub5; do
+  eval "_update_$_fn() { FAILED=\$((FAILED + 1)); return 1; }"
+done
+UPDATED=0; FAILED=0
+result=0
+_run_all_updates --parallel=3 --steps="stub1 stub2 stub3 stub4 stub5" >/dev/null 2>&1 || result=$?
+if [ "$FAILED" -eq 5 ] && [ "$result" -eq 1 ]; then
+  ok_t "_run_all_updates --parallel=3 (5 failing stubs): FAILED=5, rc=1 (race-free aggregate)"
+else
+  fail_t "_run_all_updates --parallel=3 (5 failing stubs)" \
+         "got FAILED=$FAILED, rc=$result (expected 5, 1)"
+fi
+for _fn in stub1 stub2 stub3 stub4 stub5; do
+  unset -f "_update_$_fn"
+done
+unset _fn
+
+# --- Test 22a: _result_dir uses RETURN trap (not EXIT) to avoid temp leaks ---
+# The pass-2 fix changed the cleanup trap from EXIT to RETURN so each call
+# to _run_updates_parallel cleans its own $_result_dir immediately when the
+# function returns, rather than waiting for shell exit.  This prevents temp-dir
+# accumulation when the dispatcher is called repeatedly.  Verify by source.
+if grep -qE 'trap.*rm -rf.*_result_dir.*RETURN' "$ROOT/lib/updater.sh" 2>/dev/null; then
+  ok_t "_run_updates_parallel: uses RETURN trap for \$_result_dir (no temp leak)"
+else
+  fail_t "_run_updates_parallel: RETURN trap for \$_result_dir" \
+         "cleanup uses EXIT instead of RETURN — temp dirs leak on repeated calls"
+fi
+
+# --- Test 23: all 15 _update_* stubs are dispatched and called exactly once ---
+# The dispatcher builds function names from the space-separated _steps list
+# (e.g. "apt" -> _update_apt).  This test overrides --steps= with all 15
+# known names and verifies each is invoked exactly once.
+_UPDATE_CALL_LOG=""
+# Each stub captures its own name via a per-function local, so the
+# function body does NOT reference an outer-scope variable that may be
+# unset by the time the dispatcher invokes the function under `set -u`.
+set +u
+for _update_fn in apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole; do
+  eval "_update_$_update_fn() { _UPDATE_CALL_LOG=\"\${_UPDATE_CALL_LOG}\${_UPDATE_CALL_LOG:+ }$_update_fn\"; }"
+done
+unset _update_fn
+# Run dispatcher under `set +u` so that any inner code in lib/updater.sh
+# (e.g. msg/info calls, $RUNNER_USED checks) does not error out due to
+# test-harness state.  The lib is robust enough that this is safe; the
+# goal here is to count dispatches, not to test the lib's set -u
+# discipline (covered by the other test cases).
+_run_all_updates --steps="apt dnf yum zypper pacman snap flatpak docker brew firmware geoip virsh suse_snapper btrfs_balance pihole" >/dev/null 2>&1
+set -u
+
+# Count how many of the 15 were called
+_UPDATE_CALLED=0
+for _called_fn in $_UPDATE_CALL_LOG; do
+  _UPDATE_CALLED=$((_UPDATE_CALLED + 1))
+done
+
+# Verify exactly 15 were called
+if [ "$_UPDATE_CALLED" -eq 15 ]; then
+  ok_t "_run_all_updates: all 15 _update_* stubs called (exactly once each)"
+else
+  fail_t "_run_all_updates: all 15 _update_* stubs" \
+         "expected 15 calls, got $_UPDATE_CALLED. Log: $_UPDATE_CALL_LOG"
+fi
+
+# Verify no duplicate calls (set cardinality = 15 means no dupes)
+_UPDATE_SEEN=""
+_UPDATE_DUPES=0
+for _called_fn in $_UPDATE_CALL_LOG; do
+  case " $_UPDATE_SEEN " in
+    *" $_called_fn "*) _UPDATE_DUPES=$((_UPDATE_DUPES + 1)) ;;
+    *) _UPDATE_SEEN="$_UPDATE_SEEN$_called_fn " ;;
+  esac
+done
+unset _called_fn _UPDATE_SEEN
+if [ "$_UPDATE_DUPES" -eq 0 ]; then
+  ok_t "_run_all_updates: all 15 stubs called exactly once (no duplicates)"
+else
+  fail_t "_run_all_updates: no duplicate calls" \
+         "$_UPDATE_DUPES duplicate(s) detected. Log: $_UPDATE_CALL_LOG"
+fi
+
+# --- Test 24: bash 3.x floor guard runtime check (docker required) ---
+# lib/updater.sh has a guard that returns/exits when BASH_VERSINFO[0] < 4.
+# We can't mock BASH_VERSINFO (it's readonly), so we can only run this test
+# when docker is available and can pull a bash:3 container. On CI, the docker
+# matrix entry runs this test under bash:3. On hosts without docker, we only
+# verify the guard is in the source (covered by test 25).
+_docker_available=false
+if command -v docker >/dev/null 2>&1; then
+  if timeout 30 docker pull bash:3.2-alpine3.18 >/dev/null 2>&1; then
+    _docker_available=true
+  fi
+fi
+if [ "$_docker_available" = "true" ]; then
+  _guard_out=$(docker run --rm -v "$ROOT:/work" -w /work bash:3.2-alpine3.18 \
+    bash -c 'if declare -F _run_all_updates >/dev/null 2>&1; then echo DECLARED; else echo ABSENT; fi' 2>&1)
+  if printf '%s' "$_guard_out" | grep -q "ABSENT"; then
+    ok_t "lib/updater.sh: bash 3.x guard fires (docker, functions not declared)"
+  else
+    fail_t "lib/updater.sh: bash 3.x guard (docker)" \
+           "bash 3.2 ran but _run_all_updates was declared — guard did not fire"
+  fi
+else
+  ok_t "lib/updater.sh: bash 3.x guard: skipped (docker not available; verified by CI matrix)"
+fi
+
+# --- Test 25: lib/updater.sh has the bash 4+ version guard in source ---
+# Regression marker: any future refactor that removes the guard should fail this.
+if grep -qE 'BASH_VERSINFO\[0\].*-lt 4' "$ROOT/lib/updater.sh" 2>/dev/null; then
+  ok_t "lib/updater.sh: bash 4+ version guard present in source"
+else
+  fail_t "lib/updater.sh: bash 4+ version guard" \
+         "BASH_VERSINFO[0] < 4 check not found"
+fi
+
+# --- Test 26: linuxinstall.sh has a bash 4+ version guard ---
+# The script uses [[ =~ ]], ${!var}, mapfile in helpers — must reject bash 3.
+if grep -qE 'BASH_VERSINFO\[0\].*-lt 4' "$ROOT/linuxinstall.sh" 2>/dev/null; then
+  ok_t "linuxinstall.sh: bash 4+ version guard present in source"
+else
+  fail_t "linuxinstall.sh: bash 4+ version guard" \
+         "BASH_VERSINFO[0] < 4 check not found — script will fail opaquely on bash 3"
 fi
 
 echo

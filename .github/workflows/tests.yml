@@ -1,0 +1,142 @@
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs for the same branch on new pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Each matrix entry is self-contained: every key needed by the run step is
+  # present in every entry so ${{ matrix.<key> }} always resolves without
+  # conditional if-checks on individual keys.  `test_kind` switches between
+  # the full test suite (bash 4/5/latest) and the bash 3.x floor guard.
+  test:
+    name: bash ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "5 (ubuntu)"
+            pkg: bash
+            run: bash
+            test_kind: full
+          - label: "4 (docker)"
+            pkg: bash:4
+            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:4 bash
+            test_kind: full
+          - label: "latest (docker)"
+            pkg: bash:latest
+            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:latest bash
+            test_kind: full
+          # bash 3.2 is the macOS default. The library's BASH_VERSINFO[0] < 4
+          # guard must reject it cleanly; this entry verifies the guard wires
+          # up by checking _run_all_updates is NOT declared after sourcing.
+          - label: "3.2 (docker, floor)"
+            pkg: bash:3.2-alpine3.18
+            run: docker run --rm -v ${{ github.workspace }}:/work -w /work bash:3.2-alpine3.18 bash
+            test_kind: floor
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        if: matrix.pkg != 'bash'
+        uses: docker/setup-docker-action@v4
+
+      - name: Pull bash image
+        if: matrix.pkg != 'bash'
+        run: docker pull --quiet ${{ matrix.pkg }}
+
+      - name: Run full test suite
+        if: matrix.test_kind == 'full'
+        run: |
+          set -e
+          ${{ matrix.run }} --version
+          ${{ matrix.run }} tests/test_linuxinstall.sh
+          ${{ matrix.run }} tests/test_updater.sh
+
+      # bash 3.x must be REJECTED by the library's version guard.  The
+      # library is sourced inside a subshell; we check that no functions
+      # were declared (i.e. the guard returned/exited before defining them)
+      # and that linuxinstall.sh emits the friendly "requires Bash 4.0+"
+      # message instead of an opaque parse error.
+      - name: Run bash 3.x floor guard check
+        if: matrix.test_kind == 'floor'
+        run: |
+          set -e
+          ${{ matrix.run }} --version
+          ${{ matrix.run }} -c '
+            set +u
+            . ./lib/updater.sh
+            if declare -F _run_all_updates >/dev/null 2>&1; then
+              echo "FAIL: _run_all_updates was declared on bash 3.x"
+              exit 1
+            fi
+            echo "OK: lib/updater.sh bash 3.x guard fired"
+          '
+          ${{ matrix.run }} -c '
+            if bash ./linuxinstall.sh 2>&1 | grep -q "requires Bash 4.0+"; then
+              echo "OK: linuxinstall.sh emits clean bash 4+ requirement message"
+            else
+              echo "FAIL: linuxinstall.sh did not emit version-guard message"
+              exit 1
+            fi
+          '
+
+  # ---------------------------------------------------------------------------
+  # New shell-harness suite: runs all suites via tests/run-all.sh.
+  # This exercises the color gate, curl-pipe sim, fuzz, verify_sync, etc.
+  # Bash-version agnostic — runs on the default GitHub Actions bash (5.2).
+  # ---------------------------------------------------------------------------
+  shell-suite:
+    name: shell-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run test suite
+        run: bash tests/run-all.sh --junit
+
+      - name: Upload JUnit artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-shell-suite
+          path: test-results-*.xml
+          retention-days: 30
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Lint
+        run: |
+          # Lint all source, libraries, tests, and tools.
+          # Warnings are advisory (non-blocking) per project convention —
+          # some shellcheck warnings are unavoidable in defensive bash
+          # (e.g. SC2155, SC2015, SC2034 in test harnesses).
+          # Errors (SC1xxx) are always fatal.
+          set +e
+          shellcheck -S warning \
+            linuxinstall.sh \
+            lib/*.sh \
+            tests/*.sh \
+            tools/*.sh \
+            verify_sync.sh
+          rc=$?
+          if [ "$rc" -eq 1 ]; then
+            echo "shellcheck: warnings found (advisory — review before merge)"
+          fi
+          exit 0

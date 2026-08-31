@@ -1,0 +1,17 @@
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║          neohiro/linux  —  Setup & Hardening             ║
+  ╚══════════════════════════════════════════════════════════╝
+
+  Host:          DESKTOP-28U4HF6
+  OS:            MINGW64_NT-10.0-26200
+  Kernel:        3.6.9-b4195d69.x86_64
+  Arch:          x86_64
+  Run as:        testuser (non-root — re-run with sudo)
+
+  ──────────────────────────────────────────────────────────
+  Environment:   server
+  Remote SSH:    no
+  Profile:       Profile 2 — Standard
+  Steps:         ~10 hardening steps (includes SSH hardening)
+  ──────────────────────────────────────────────────────────

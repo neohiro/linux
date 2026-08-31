@@ -13,6 +13,9 @@ Please report security issues **privately**:
 2. Click **Report a vulnerability** (private vulnerability reporting).
 3. Describe the issue, impact, and steps to reproduce.
 
+
+For issues that cannot use GitHub Security Advisories, email `security@neohiro.io` (PGP key on request). All reports get an acknowledgement within 72 hours.
+
 Do **not** open a public issue for anything you believe is exploitable.
 
 You can expect an initial response within 7 days. Please allow a
@@ -24,3 +27,7 @@ This tool intentionally modifies system or network configuration across
 multiple distribution families (Debian, RHEL/Fedora, SUSE, Arch). Always
 review what will be applied, keep backups/restoration points, and test
 on non-critical systems first.
+
+---
+
+Maintained by **[neohiro](https://github.com/neohiro)**.

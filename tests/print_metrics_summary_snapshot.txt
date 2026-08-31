@@ -1,0 +1,32 @@
+
+=====================================================================
+  RUN SUMMARY [SERVER MODE]
+=====================================================================
+
+  PACKAGES
+      Packages upgraded        [████████░░░░]
+      Packages installed       [████████░░░░]
+
+  SECURITY
+      Services hardened        [████████░░░░]
+      Services stopped         [████████░░░░]
+      sysctls applied          [████████░░░░]
+      Firewall rules added     [████████░░░░]
+
+  SSH & AUTHENTICATION
+      Auth keys added          [████████░░░░]
+
+  TOR
+      Tor services enabled     [████████░░░░]
+
+  BACKUPS & ROLLBACK
+      Config files backed up   [████████░░░░]
+      Rollback entries logged  [████████░░░░]
+
+  STORAGE
+    Disk freed (approximate)   N/A (re-run as root to measure)
+
+  [!] Rollback log: /tmp/rollback-test.log
+    Format: original_path<TAB>backup_path
+    To restore: sudo cp backup_path original_path
+=====================================================================
