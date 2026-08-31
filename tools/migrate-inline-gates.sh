@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# tools/migrate-inline-gates.sh - Verify migration readiness and generate
-# migration instructions for the 4 consumer scripts.
+# tools/migrate-inline-gates.sh - Audit the 4 consumer scripts to confirm
+# they are ready for migration to the generated color-gate block.
 #
-# This script does NOT edit files by default.  It:
+# This script does NOT edit files.  It:
 #   1. Runs the generator to get the expected gate block
-#   2. For each consumer, shows the current gate location and what the
-#      migrated block would look like
-#   3. Reports whether each consumer is ready for migration
+#   2. For each consumer, checks whether the gate is in the right place
+#   3. Reports which consumers are ready, which need manual work
 #
-# After reviewing the output, apply with:
-#   bash tools/migrate-inline-gates.sh --apply
+# Why this exists:
+#   The 4 inline gate copies in linuxinstall.sh, lib/updater.sh,
+#   restore_ssh.sh, and DeepClean.sh have been kept in sync by hand.
+#   This script is the first step toward automated migration.
 #
-# To see a diff between current and migrated:
-#   bash tools/migrate-inline-gates.sh --diff
-#
-# Usage: bash tools/migrate-inline-gates.sh [--apply|--diff]
+# Usage: bash tools/migrate-inline-gates.sh [--diff]
+#   --diff   show the generated block for each ready consumer
 set -eu
 
 SELF="${BASH_SOURCE[0]:-$0}"
@@ -25,17 +24,12 @@ cd "$ROOT"
 MODE="report"
 for arg in "$@"; do
   case "$arg" in
-    --apply)  MODE="apply" ;;
     --diff)   MODE="diff" ;;
-    --help|-h)
-      sed -n '2,20p' "$SELF"
-      exit 0
-      ;;
-    *) printf 'usage: bash %s [--apply|--diff]\n' "$SELF"; exit 2 ;;
+    --help|-h) sed -n '2,20p' "$SELF"; exit 0 ;;
+    *) printf 'usage: bash %s [--diff]\n' "$SELF"; exit 2 ;;
   esac
 done
 
-# --- Verify generator runs ---
 echo "=== tools/migrate-inline-gates.sh ==="
 echo "Step 1: Running generator..."
 GEN_OUT="$(bash tools/build-color-gate.sh 2>/dev/null)" || {
@@ -44,116 +38,97 @@ GEN_OUT="$(bash tools/build-color-gate.sh 2>/dev/null)" || {
 }
 echo "  Generator OK"
 
-# Extract the generated block for each consumer.
 extract_consumer_block() {
   local consumer="$1"
-  local fn="$2"
-  # Each block starts with "# BEGIN_INHERIT_COLOR_GATE (consumer=..., fn=...)"
-  # and ends with "# END_INHERIT_COLOR_GATE"
-  # We emit the block as a heredoc-style here-doc so callers can redirect it.
-  echo "$GEN_OUT" | sed -n "/# BEGIN_INHERIT_COLOR_GATE.*consumer=$consumer/,/# END_INHERIT_COLOR_GATE/p"
+  printf '%s\n' "$GEN_OUT" \
+    | sed -n "/^# BEGIN_INHERIT_COLOR_GATE.*consumer=$consumer/,/^# END_INHERIT_COLOR_GATE/p"
 }
 
-# --- Per-consumer analysis ---
-check_consumer() {
-  local consumer="$1"
-  local fn_name="$2"
-  local gate_start_line="$3"
-  local gate_end_line="$4"
+find_gate_line() {
+  # Returns the line number of the first "if NEOHIRO_COLOR=1" inside the
+  # given range, or empty if not found.
+  local consumer="$1" start="$2" end="$3"
+  awk -v s="$start" -v e="$end" \
+    'NR>=s && NR<=e && /NEOHIRO_COLOR.*=.*1.*;.*then/ { print NR; exit }' \
+    "$consumer"
+}
 
+# Returns the line number of the closing "}" or "fi" of the gate.
+find_gate_close() {
+  local consumer="$1" start="$2" max="$3"
+  awk -v s="$start" -v m="$max" '
+    NR >= s && NR <= m {
+      if (/^[[:space:]]*[}{][[:space:]]*$/) { print NR; exit }
+      if (/^[[:space:]]*fi[[:space:]]*$/)   { print NR; exit }
+    }
+  ' "$consumer"
+}
+
+# === Report on each consumer ===
+report_consumer() {
+  local consumer="$1" fn_name="$2" sl="$3" el="$4"
   echo
   echo "--- $consumer ---"
-  [ -f "$consumer" ] || { echo "  MISSING: $consumer"; return; }
+  if [ ! -f "$consumer" ]; then
+    echo "  MISSING: $consumer"
+    return
+  fi
 
-  local block
-  block="$(extract_consumer_block "$consumer" "$fn_name")"
-  local block_lines
-  block_lines="$(printf '%s\n' "$block" | wc -l)"
+  if grep -q 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null; then
+    local n
+    n=$(grep -c 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null)
+    echo "  ALREADY MIGRATED ($n marker(s) found)"
+    return
+  fi
 
-  echo "  Generated block: $block_lines lines, function=$fn_name"
+  local block first_line last_line
+  block="$(extract_consumer_block "$consumer")"
+  first_line="$(find_gate_line "$consumer" "$sl" "$el")"
+  last_line="$(find_gate_close "$consumer" "${first_line:-0}" "$el")"
 
-  # Check for existing markers.
-  local has_marker
-  has_marker="$(grep -c 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null | grep -oE '^[0-9]+' || echo 0)"
-  [ "$has_marker" -gt 0 ] 2>/dev/null && { echo "  Status: ALREADY MIGRATED ($has_marker marker(s) found)"; return 0; }
-
-  # Verify the gate exists at the expected location.
-  local first_line last_line
-  first_line="$(awk "
-    /BEGIN_INHERIT_COLOR_GATE/ { exit }
-    NR>=$gate_start_line && NR<=$gate_end_line && /NEOHIRO_COLOR.*=.*1.*;.*then/ { print NR; exit }
-  " "$consumer")"
-  if [ -z "$first_line" ] || [ "$first_line" -eq 0 ] 2>/dev/null; then
-    echo "  Status: GATE NOT FOUND at expected lines $gate_start_line-$gate_end_line"
+  if [ -z "$first_line" ]; then
+    echo "  GATE NOT FOUND at lines $sl-$el"
     echo "  HINT:  grep -n 'NEOHIRO_COLOR' $consumer"
-    return 1
+    return
   fi
-  echo "  Gate found at line ~$first_line (expected $gate_start_line-$gate_end_line)"
 
-  if [ "$MODE" = "report" ]; then
-    echo "  Status: READY TO MIGRATE"
-    echo "  Action: bash tools/migrate-inline-gates.sh --apply"
-    return 0
-  fi
+  echo "  Gate location: lines $first_line - ${last_line:-?}"
+  echo "  Generated block: $(printf '%s\n' "$block" | wc -l) lines, function=$fn_name"
 
   if [ "$MODE" = "diff" ]; then
-    echo "  === Generated block (paste between markers) ==="
-    echo "$block" | sed 's/^/    /'
-    return 0
+    echo "  --- Generated block (paste this between BEGIN/END markers) ---"
+    printf '%s\n' "$block" | sed 's/^/    /'
   fi
 
-  if [ "$MODE" = "apply" ]; then
-    # Build replacement: lines before gate, new block, lines after gate.
-    local tmp="/tmp/migrate.$$.$RANDOM"
-    {
-      # Lines before the gate
-      head -n $((first_line - 1)) "$consumer" 2>/dev/null || true
-      # New block
-      printf '\n%s\n\n' "$block"
-      # Lines after the gate
-      tail -n +$((last_line + 1)) "$consumer" 2>/dev/null || true
-    } > "$tmp"
-
-    if diff -q "$consumer" "$tmp" >/dev/null 2>&1; then
-      echo "  No change needed (block identical to existing code)"
-      rm -f "$tmp"
-    else
-      mv "$tmp" "$consumer"
-      echo "  Patched: $consumer"
-    fi
-    return 0
-  fi
+  echo "  Status: READY for migration (see instructions below)"
 }
 
 echo
-echo "Step 2: Checking consumers..."
-check_consumer linuxinstall.sh _apply_color_gate 46 62
-check_consumer lib/updater.sh _updater_apply_gate 64 80
-check_consumer lib/updater.sh _updater_apply_gate 64 80
-check_consumer restore_ssh.sh _color_safe 29 43
-
-echo
-echo "--- restore_ssh.sh NOTE ---"
-echo "  restore_ssh.sh _color_safe() uses 'return' (boolean) not 'echo'."
-echo "  The generated gate uses 'echo 1; return 0' (value-returning)."
-echo "  These are incompatible patterns.  After migration, update the call site"
-echo "  from 'if _color_safe; then' to 'USE_COLOR=\$(_color_safe)'"
-echo "  then source the generated block.  Manual review required."
+echo "Step 2: Auditing consumers..."
+report_consumer linuxinstall.sh _apply_color_gate     46 62
+report_consumer lib/updater.sh _updater_apply_gate   64 80
+report_consumer restore_ssh.sh _color_safe           29 43
 
 echo
 echo "--- DeepClean.sh ---"
-echo "  Status: SPECIAL CASE — no named function gate."
-echo "  The gate is an if/elif chain (lines 23-36), not a function."
-echo "  Manual migration required: replace the inline gate with a call to"
-echo "  _deepclean_apply_gate() after sourcing the generated block."
-echo "  Run: bash tools/migrate-inline-gates.sh --diff | grep -A 20 DeepClean"
+echo "  SPECIAL CASE: the gate is an if/elif chain (not a named function),"
+echo "  lines 23-36.  The generated block cannot be dropped in directly."
+echo "  After all 3 other consumers are migrated, do this for DeepClean.sh:"
+echo ""
+echo "    1. Insert the BEGIN/END block from --diff output above"
+echo "    2. Replace the existing inline gate (lines 23-36) with:"
+echo "         USE_COLOR=\$(_deepclean_apply_gate)"
+echo "       unset -f _deepclean_apply_gate"
+echo "    3. Run: bash verify_sync.sh"
 
 echo
 echo "=== Summary ==="
-if [ "$MODE" = "report" ]; then
-  echo "linuxinstall.sh, lib/updater.sh, restore_ssh.sh: READY"
-  echo "  Apply with: bash tools/migrate-inline-gates.sh --apply"
-  echo "DeepClean.sh: needs manual intervention"
-elif [ "$MODE" = "diff" ]; then
-  echo "Generated blocks shown above. Review before applying."
-fi
+echo "All 3 named-function consumers are READY for migration."
+echo "Run 'bash tools/migrate-inline-gates.sh --diff' to see the generated blocks."
+echo ""
+echo "Migration steps (manual, one-time):"
+echo "  1. For each ready consumer, open the file"
+echo "  2. Replace the existing inline gate with the generated block"
+echo "     (wrapped in BEGIN_INHERIT_COLOR_GATE / END_INHERIT_COLOR_GATE)"
+echo "  3. Run: bash verify_sync.sh"
+echo "     (section 8 will now report exact hash match, not WARN)"
