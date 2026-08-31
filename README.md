@@ -82,7 +82,6 @@ the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
 
-<<<<<<< HEAD
 =======
 ## One-step automated setup
 
