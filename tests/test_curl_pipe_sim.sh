@@ -106,6 +106,7 @@ echo "256"
 EOF
   chmod +x "$WD/tput"
 }
+# shellcheck disable=SC2218  # make_tput defined immediately above; SC2218 false-positive inside conditional context
 make_tput
 out="$(/usr/bin/bash -c 'export FORCE_TTY=1 NO_COLOR=0; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
