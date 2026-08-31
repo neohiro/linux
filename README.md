@@ -52,7 +52,7 @@ the package name right per distro. This script:
 ## Quick start
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)"
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash -s --
 ```
 
 > Read it first:
@@ -221,12 +221,12 @@ out-of-band):**
 
 ```bash
 # 1. Diagnose and auto-fix most lockout causes
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/restore_ssh.sh)"
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/restore_ssh.sh | sudo bash -s --
 # or, equivalently, via the main script's first-class menu entry
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)" --restore-ssh
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash -s -- --restore-ssh
 
 # 2. Or undo every config change the script made (dry-run):
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh)" --rollback
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash -s -- --rollback
 
 # 3. Or do it manually — re-enable password auth, restart sshd
 sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
