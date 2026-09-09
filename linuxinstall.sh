@@ -15,6 +15,7 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
+ORIG_CWD="$(pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 # Validate SCRIPT_PATH: if it looks wrong (e.g. /root/bash), try to find the real script
 if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
@@ -30,7 +31,44 @@ if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
     fi
   done
 fi
-ORIG_CWD="$(pwd)"
+
+# Persistent state file — remembers user decisions across runs so re-runs
+# don't re-prompt for environment type / SSH usage.
+NEOHIRO_STATE_FILE="${NEOHIRO_STATE_FILE:-/etc/neohiro/linux-state.conf}"
+
+# Load a single key=value from the state file. Returns 1 if missing.
+_state_get() {
+  local _k="$1" _v
+  if [ -r "$NEOHIRO_STATE_FILE" ]; then
+    _v=$(awk -F= -v k="$_k" '$1==k {sub(/^[ \t]+/,"",$2); print $2; exit}' "$NEOHIRO_STATE_FILE" 2>/dev/null)
+    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
+  fi
+  return 1
+}
+
+# Save a single key=value to the state file (atomic: write to temp, then mv).
+_state_set() {
+  local _k="$1" _v="$2" _tmp _dir
+  _dir="${NEOHIRO_STATE_FILE%/*}"
+  # Ensure the parent directory exists (mode 0755, root-owned)
+  if [ ! -d "$_dir" ]; then
+    mkdir -p "$_dir" 2>/dev/null || return 1
+    chmod 0755 "$_dir" 2>/dev/null || true
+  fi
+  _tmp="${NEOHIRO_STATE_FILE}.tmp.$$"
+  if [ -f "$NEOHIRO_STATE_FILE" ]; then
+    grep -vE "^[[:space:]]*${_k}[[:space:]]*=" "$NEOHIRO_STATE_FILE" 2>/dev/null > "$_tmp" || true
+  fi
+  printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
+  mv -f "$_tmp" "$NEOHIRO_STATE_FILE" 2>/dev/null || return 1
+  chmod 0600 "$NEOHIRO_STATE_FILE" 2>/dev/null || true
+  return 0
+}
+
+# Clear the state file (used by --reset-state).
+_state_clear() {
+  rm -f "$NEOHIRO_STATE_FILE" 2>/dev/null
+}
 
 # Canonical helpers. Resolved relative to the script's own location so the
 # library works whether the script is run from a clone, a symlink, or
@@ -1265,6 +1303,9 @@ print_welcome() {
   if [ -n "${TMUX:-}" ]; then
     info "Running inside tmux — your session is protected against SSH disconnection."
   fi
+  if [ -r "$NEOHIRO_STATE_FILE" ]; then
+    info "State file: $NEOHIRO_STATE_FILE  (run --reset-state to clear)"
+  fi
 }
 
 _profile_label() {
@@ -1283,9 +1324,17 @@ _profile_label() {
 }
 
 detect_or_ask_env() {
-  if pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
-     pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
-     2>/dev/null; then
+  local _saved_env _saved_ssh
+  _saved_env=$(_state_get ENV_TYPE 2>/dev/null || true)
+  _saved_ssh=$(_state_get USE_REMOTE_SSH 2>/dev/null || true)
+
+  # 1) Environment type
+  if [ -n "$_saved_env" ]; then
+    ENV_TYPE="$_saved_env"
+    info "Environment (from state): $ENV_TYPE"
+  elif pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
+       pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
+       2>/dev/null; then
     ENV_TYPE="desktop"
   elif systemctl list-unit-files 2>/dev/null | grep -qE '^(ssh|sshd)\.service'; then
     ENV_TYPE="server"
@@ -1294,16 +1343,25 @@ detect_or_ask_env() {
   fi
 
   if [ -n "$ENV_TYPE" ]; then
-    info "Detected environment: $ENV_TYPE"
-    if ! prompt_yn "Use this environment type?" "y"; then ENV_TYPE=""; fi
+    if ! prompt_yn "Use this environment type ($ENV_TYPE)?" "y"; then
+      ENV_TYPE=""
+    fi
   fi
   if [ -z "$ENV_TYPE" ]; then
     prompt_choice "Which environment is this machine?" "Desktop" "Server (headless / VPS)"
     ENV_TYPE="desktop"; [ "$REPLY_CHOICE" -eq 1 ] && ENV_TYPE="server"
   fi
+  _state_set ENV_TYPE "$ENV_TYPE" 2>/dev/null || true
 
-  prompt_choice "Do you use remote SSH to log in to this machine?" "No" "Yes"
-  USE_REMOTE_SSH="no"; [ "$REPLY_CHOICE" -eq 1 ] && USE_REMOTE_SSH="yes"
+  # 2) Remote SSH usage
+  if [ -n "$_saved_ssh" ]; then
+    USE_REMOTE_SSH="$_saved_ssh"
+    info "SSH usage (from state): $_saved_ssh"
+  else
+    prompt_choice "Do you use remote SSH to log in to this machine?" "No" "Yes"
+    USE_REMOTE_SSH="no"; [ "$REPLY_CHOICE" -eq 1 ] && USE_REMOTE_SSH="yes"
+    _state_set USE_REMOTE_SSH "$USE_REMOTE_SSH" 2>/dev/null || true
+  fi
 }
 
 ask_profile() {
@@ -3459,6 +3517,13 @@ restore_ssh_mode() {
 main() {
   # Handle flags before anything else
   case "${1:-}" in
+    --reset-state)
+      bold "neohiro/linux - Clear persistent state"
+      _state_clear
+      echo "State file removed: ${NEOHIRO_STATE_FILE:-/etc/neohiro/linux-state.conf}"
+      echo "Next run will re-prompt for environment type and SSH usage."
+      exit 0
+      ;;
     --restore-ssh)
       bold "neohiro/linux - Restore SSH (standalone)"
       restore_ssh_mode
@@ -3527,7 +3592,7 @@ main() {
       ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
+Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [--reset-state] [-h]
 
   (no flag)         Run the full interactive setup & hardening.
   --dry-run         Preview what would run without executing any commands.
@@ -3549,6 +3614,9 @@ Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--re
   --rollback        Dry-prints the inverse cp commands needed to undo
                     every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those cp commands (latest backup wins).
+  --reset-state     Clear the persistent state file
+                    (/etc/neohiro/linux-state.conf) so the next run re-prompts
+                    for environment type and SSH usage.
   -h, --help        Show this help.
 USAGE
       exit 0
