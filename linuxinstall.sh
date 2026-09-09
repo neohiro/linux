@@ -82,6 +82,7 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   # shellcheck disable=SC1091
   if [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
     source "$_NEOHIRO_LIB_DIR/runner.sh"
+    run() { _runner_cmd "$@"; }
   fi
   # shellcheck disable=SC1091
   if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
@@ -1098,19 +1099,16 @@ _step_begin() {
 }
 
 # Print elapsed time after a step completes.
-# Usage: _step_end <key> <label> <elapsed_sec>
+# Usage: _step_end <key> <label> <elapsed_sec> [rc]
 _step_end() {
-  local key="$1" label="$2" elapsed="${3:-$SECONDS}"
-  mark_step "$key" done
-  local min=$(( elapsed / 60 ))
-  local sec=$(( elapsed % 60 ))
-  local time_str
-  if [ "$min" -gt 0 ]; then
-    time_str="${min}m ${sec}s"
+  local key="$1" label="$2" elapsed="${3:-$SECONDS}" rc="${4:-0}"
+  if [ "$rc" -eq 0 ]; then
+    mark_step "$key" done
+    printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $elapsed s"
   else
-    time_str="${sec}s"
+    mark_step "$key" skip
+    printf '  %s %s\n' "$(_c '1;31m' '[FAIL]')" "$label failed (rc=$rc) — skipped"
   fi
-  printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $time_str"
 }
 
 # When --step STEP is set, run() is a no-op and ask_category_enabled returns 1
@@ -3719,7 +3717,7 @@ USAGE
       local rc=0
       "$fn" || rc=$?
       local step_elapsed=$((SECONDS - step_start_sec))
-      _step_end "$key" "$label" "$step_elapsed"
+      _step_end "$key" "$label" "$step_elapsed" "$rc"
       if [ "$rc" -eq 0 ]; then return 0; fi
       # Failure recovery: offer retry / skip / abort.
       if _prompt_failure_recovery "$label" "$rc"; then
