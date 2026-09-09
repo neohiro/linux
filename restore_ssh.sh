@@ -125,14 +125,21 @@ pkg_install_ssh() {
 # Replace directive in-place or append it (used for both main config and drop-ins).
 _set_or_append() {
   local file="$1" key="$2" value="$3"
+  # Escape key for extended regex: escape []\^$.|?*+(){}
+  local key_re
+  key_re=$(printf '%s' "$key" | sed 's/[][\^$.|?*+(){}]/\\&/g')
+  # Escape value for sed replacement: escape &, \, and delimiter (|)
+  local value_repl
+  value_repl=$(printf '%s' "$value" | sed 's/[&\]/\\&/g; s/|/\\|/g')
+
   if [ ! -f "$file" ]; then
-    echo "${key} ${value}" | sudo tee -a "$file" >/dev/null
+    printf '%s %s\n' "$key" "$value" | sudo tee -a "$file" >/dev/null
     return
   fi
-  if sudo grep -qE "^[[:space:]]*${key}[[:space:]]" "$file"; then
-    sudo sed -i -E "s|^[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$file"
+  if sudo grep -qE "^[[:space:]]*${key_re}[[:space:]]" "$file"; then
+    sudo sed -i -E "s|^[[:space:]]*${key_re}[[:space:]].*|${key} ${value_repl}|" "$file"
   else
-    echo "${key} ${value}" | sudo tee -a "$file" >/dev/null
+    printf '%s %s\n' "$key" "$value" | sudo tee -a "$file" >/dev/null
   fi
 }
 

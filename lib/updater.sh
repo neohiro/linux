@@ -625,10 +625,13 @@ _run_all_updates() {
   fi
 
   # --- Sequential dispatch ---
-  local _fn
+  local _fn _update_failed=0
   for _fn in $_steps; do
-    "_update_$_fn" || true
+    "_update_$_fn" || _update_failed=1
   done
+  if [ "$_update_failed" -eq 1 ]; then
+    warn "One or more update components failed (see above). Continuing."
+  fi
 
   _print_summary "$_summary" "$((SECONDS - start_sec))"
 }
@@ -645,7 +648,11 @@ _run_updates_parallel() {
 
   _result_dir=$(mktemp -d) || {
     warn "parallel: mktemp failed — falling back to sequential"
-    for _fn in $_steps; do "_update_$_fn" || true; done
+    local _fn _update_failed=0
+    for _fn in $_steps; do "_update_$_fn" || _update_failed=1; done
+    if [ "$_update_failed" -eq 1 ]; then
+      warn "One or more update components failed (see above). Continuing."
+    fi
     _print_summary "$_summary" "$((SECONDS - _start_sec))"
     # Propagate the actual failure state from sub-steps; do not hardcode 0.
     # _track() inside each step updated UPDATED/FAILED, which _print_summary
