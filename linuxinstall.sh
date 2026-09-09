@@ -16,6 +16,20 @@ fi
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+# Validate SCRIPT_PATH: if it looks wrong (e.g. /root/bash), try to find the real script
+if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
+  # Try common locations
+  for _candidate in \
+    "$ORIG_CWD/linuxinstall.sh" \
+    "/usr/local/bin/linuxinstall.sh" \
+    "/opt/neohiro/linux/linuxinstall.sh" \
+    "$HOME/linuxinstall.sh"; do
+    if [ -f "$_candidate" ] && grep -q "neohiro/linux" "$_candidate" 2>/dev/null; then
+      SCRIPT_PATH="$_candidate"
+      break
+    fi
+  done
+fi
 ORIG_CWD="$(pwd)"
 
 # Canonical helpers. Resolved relative to the script's own location so the
@@ -507,6 +521,7 @@ _take_etc_snapshot() {
     done < <(find "$snap_dir" -maxdepth 1 -type f -name 'etc-*.tar.gz' ! -name "$(basename "$snap_path")" 2>/dev/null)
     info "Created /etc snapshot: $snap_path"
     info "  Full /etc restore:  sudo bash $SCRIPT_PATH --restore-etc-snapshot"
+    info "  (or re-fetch: curl -fsSL $REPO_RAW_BASE/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)"
     info "  (May need sudo systemd-resolve --reload if /etc/resolv.conf was reverted)"
   else
     sudo rm -f "$snap_path" 2>/dev/null
@@ -1045,11 +1060,10 @@ _step_begin() {
 }
 
 # Print elapsed time after a step completes.
-# Usage: _step_end <key> <label>
+# Usage: _step_end <key> <label> <elapsed_sec>
 _step_end() {
-  local key="$1" label="$2"
+  local key="$1" label="$2" elapsed="${3:-$SECONDS}"
   mark_step "$key" done
-  local elapsed=$SECONDS
   local min=$(( elapsed / 60 ))
   local sec=$(( elapsed % 60 ))
   local time_str
@@ -2877,10 +2891,10 @@ updates_only_mode() {
   # and is also runnable standalone:  sudo bash lib/updater.sh
   if ask_category_enabled "system" "Comprehensive system update" "y"; then
     _step_begin "system_update" "Comprehensive system update" "${_STEP_PREVIEWS[system]}"
-    SECONDS=0
+    local _step_start=$SECONDS
     local _rc=0
     _run_all_updates || _rc=$?
-    _step_end "system_update" "Comprehensive system update"
+    _step_end "system_update" "Comprehensive system update" $((SECONDS - _step_start))
     if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
   fi
 
@@ -2891,10 +2905,10 @@ updates_only_mode() {
   # one.
   if ask_category_enabled "system" "Kernel update + prune" "y"; then
     _step_begin "system_update" "Kernel update + prune" ""
-    SECONDS=0
+    local _step_start=$SECONDS
     local _rc=0
     update_kernel || _rc=$?
-    _step_end "system_update" "Kernel update + prune"
+    _step_end "system_update" "Kernel update + prune" $((SECONDS - _step_start))
     if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
   fi
 
@@ -2934,10 +2948,10 @@ updates_only_mode() {
       apt)
         if ask_category_enabled "unattended" "Unattended security upgrades" "y"; then
           _step_begin "unattended" "Unattended security upgrades" "${_STEP_PREVIEWS[unattended]}"
-          SECONDS=0
+          local _step_start=$SECONDS
           local _rc=0
           configure_unattended_upgrades || _rc=$?
-          _step_end "unattended" "Unattended security upgrades"
+          _step_end "unattended" "Unattended security upgrades" $((SECONDS - _step_start))
           if [ "$_rc" -ne 0 ]; then mark_step "unattended" skip; fi
         fi
         ;;
@@ -3626,14 +3640,18 @@ USAGE
   # so a single failure does not abort subsequent steps.
   _run_step() {
     local key="$1" label="$2" preview="$3" fn="$4"
-    if ! ask_category_enabled "$key" "$label" "${5:-n}"; then return 0; fi
+    if ! ask_category_enabled "$key" "$label" "${5:-n}"; then
+      mark_step "$key" skip
+      return 0
+    fi
     local p="${_STEP_PREVIEWS[$key]:-$preview}"
     while true; do
       _step_begin "$key" "$label" "$p"
-      SECONDS=0
+      local step_start_sec=$SECONDS
       local rc=0
       "$fn" || rc=$?
-      _step_end "$key" "$label"
+      local step_elapsed=$((SECONDS - step_start_sec))
+      _step_end "$key" "$label" "$step_elapsed"
       if [ "$rc" -eq 0 ]; then return 0; fi
       # Failure recovery: offer retry / skip / abort.
       if _prompt_failure_recovery "$label" "$rc"; then
@@ -3662,12 +3680,12 @@ USAGE
   if ask_category_enabled "system" "System update + base packages" "y"; then
     while true; do
       _step_begin "system_update" "System update + base packages" "${_STEP_PREVIEWS[system]}"
-      SECONDS=0
+      local _step_start=$SECONDS
       local _rc=0
       _run_all_updates || _rc=$?
       update_system || _rc=$?
       update_kernel || _rc=$?
-      _step_end "system_update" "System update + base packages"
+      _step_end "system_update" "System update + base packages" $((SECONDS - _step_start))
       if [ "$_rc" -eq 0 ]; then break; fi
       if _prompt_failure_recovery "System update" "$_rc"; then continue; fi
       mark_step "system_update" skip; break
@@ -3721,6 +3739,7 @@ _print_run_summary() {
     printf '\n  %s\n' "$(_c '1;36m' '== /etc SNAPSHOT')"
     printf '  Full /etc snapshot: %s\n' "$(_c '1;37m' "$_ETC_SNAPSHOT_PATH")"
     printf '  Restore whole /etc:  sudo bash %q --restore-etc-snapshot\n' "$SCRIPT_PATH"
+    printf '  (or re-fetch: curl -fsSL %s/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)\n' "$REPO_RAW_BASE"
   fi
   # If update_kernel staged a new image, offer a reboot once we are
   # back at the prompt. Never auto-reboot — connection loss during the
