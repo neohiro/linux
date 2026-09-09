@@ -3209,7 +3209,7 @@ _ssh_self_heal_install() {
 #!/bin/bash
 # neohiro-ssh-watchdog.sh -- invoked by systemd timer / cron every minute.
 # Calls the canonical self-heal logic in the parent linuxinstall.sh.
-exec /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+exec /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
 SCRIPT
     chmod 0755 "$_script" 2>/dev/null || true
     cat > "$_svc" <<UNIT
@@ -3248,8 +3248,8 @@ TIMER
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 # Run self-heal at boot (+30s grace) and every minute
-@reboot sleep 30 && /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
-* * * * * root /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+@reboot sleep 30 && /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
+* * * * * root /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
 CRON
     chmod 0644 "$_cron_dir/neohiro-ssh-watchdog"
     ok "SSH self-heal guard installed (cron: @reboot + every minute)."
