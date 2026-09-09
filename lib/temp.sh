@@ -37,7 +37,11 @@ if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
   fi
 fi
 # Create the log with owner-only permissions before any breadcrumb is written.
-install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
+# Use explicit grouping to avoid ||/&& precedence confusion:
+# try install; if it fails, try touch+chmod.
+(install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
+  || (touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
+  || true
 
 # Public: create a tracked temp file. Returns the new path.
 # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)

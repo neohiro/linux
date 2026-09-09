@@ -239,3 +239,4 @@ printf 'Current Disk (%s):\n' "${CYAN}${ROOT_FS}${NC}"
 printf '  Total : %s\n' "${BLUE}${ROOT_TOTAL}${NC}"
 printf '  Used  : %s (%s)\n' "${BLUE}${ROOT_USED}${NC}" "$ROOT_PERCENT"
 printf '  Free  : %s\n\n' "${GREEN}${ROOT_FREE}${NC}"
+exit 0

@@ -3,6 +3,8 @@
 # Works on: Ubuntu / Debian / RHEL / AlmaLinux / Rocky / Fedora / SUSE / Arch
 # Run as root:  sudo ./OptimizeLinuxASR.sh
 
+set -euo pipefail
+
 # Color helpers from lib/color.sh (no-op if running via curl|bash).
 # shellcheck disable=SC1091
 if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
@@ -10,7 +12,7 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
 fi
 
 if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root. Please use sudo."
+   echo "This script must be run as root. Please use sudo." >&2
    exit 1
 fi
 
@@ -183,3 +185,4 @@ echo "You may want to reboot your system for all changes to take full effect."
 echo "To re-enable a service:"
 echo "  sudo systemctl unmask <service> && sudo systemctl enable --now <service>"
 echo "============================================================================="
+exit 0

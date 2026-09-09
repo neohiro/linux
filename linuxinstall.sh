@@ -84,7 +84,11 @@ else
     fi
   fi
   # Create the log with owner-only permissions before any breadcrumb is written.
-  install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
+  # Use explicit grouping to avoid ||/&& precedence confusion:
+  # try install; if it fails, try touch+chmod.
+  (install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
+    || (touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
+    || true
   trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
 
   # Public: create a tracked temp file. Returns the new path.
@@ -147,16 +151,20 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
   _run_all_updates() {
     msg "=== Comprehensive system update ==="
-    _update_apt || true
-    _update_dnf || true
-    _update_yum || true
-    _update_zypper || true
-    _update_pacman || true
-    _update_snap || true
-    _update_flatpak || true
-    _update_docker || true
-    _update_brew || true
-    _update_firmware || true
+    local _update_failed=0
+    _update_apt    || _update_failed=1
+    _update_dnf    || _update_failed=1
+    _update_yum    || _update_failed=1
+    _update_zypper || _update_failed=1
+    _update_pacman || _update_failed=1
+    _update_snap   || _update_failed=1
+    _update_flatpak|| _update_failed=1
+    _update_docker || _update_failed=1
+    _update_brew   || _update_failed=1
+    _update_firmware|| _update_failed=1
+    if [ "$_update_failed" -eq 1 ]; then
+      warn "One or more update components failed (see above). Continuing."
+    fi
     printf '\n'; ok "Update engine complete."; }
 fi
 
@@ -176,7 +184,7 @@ _record_backup_init() {
   else
     sudo mkdir -p "$logdir" 2>/dev/null || true
     sudo install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null \
-      || sudo sh -c "touch '$ROLLBACK_LOG' && chmod 0600 '$ROLLBACK_LOG'" 2>/dev/null || true
+      || sudo sh -c 'touch "$1" && chmod 0600 "$1"' _ "$ROLLBACK_LOG" 2>/dev/null || true
   fi
 }
 _record_backup_init
@@ -210,7 +218,8 @@ print_recovery_cmd() {
   printf '\n'
   _c '1;33m' "----------------------------------------------------------------------"
   printf '\n'
-  printf "  After reconnecting over SSH, run the command above to resume the run.\n\n"
+  printf "  After reconnecting over SSH, run the command above to resume the run.\n"
+  printf "  (The tmux session persists after script completion — use 'tmux kill-session -t linux-setup' to exit.)\n\n"
 }
 
 _warn_if_not_tmux() {
@@ -364,19 +373,8 @@ ensure_tmux_if_ssh() {
   bold "SSH session detected. Wrapping this run in a tmux session so disconnects do not abort it."
   # Quote everything via env+args (no string interpolation) so paths with spaces
   # or shell metacharacters survive. The inner bash re-execs the same script
-  # by absolute path; on clean exit it tears the tmux session down.
-  local inner
-  inner=$(cat <<'INNER_EOF'
-trap 'tmux kill-session -t linux-setup 2>/dev/null' EXIT
-cd "$1" && shift
-bash "$1" "$@"
-rc=$?
-if [ "$rc" -eq 0 ]; then
-  tmux kill-session -t linux-setup 2>/dev/null
-fi
-exit "$rc"
-INNER_EOF
-)
+  # by absolute path. On clean exit we keep the tmux session alive so the user
+  # can continue working (run more steps, open maintenance menu, etc.).
   exec tmux new-session -A -s linux-setup -n setup \
     "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
 }
@@ -508,7 +506,7 @@ _take_etc_snapshot() {
       [ -n "$prev" ] && sudo rm -f "$prev" 2>/dev/null
     done < <(find "$snap_dir" -maxdepth 1 -type f -name 'etc-*.tar.gz' ! -name "$(basename "$snap_path")" 2>/dev/null)
     info "Created /etc snapshot: $snap_path"
-    info "  Full /etc restore:  sudo bash $0 --restore-etc-snapshot"
+    info "  Full /etc restore:  sudo bash $SCRIPT_PATH --restore-etc-snapshot"
     info "  (May need sudo systemd-resolve --reload if /etc/resolv.conf was reverted)"
   else
     sudo rm -f "$snap_path" 2>/dev/null
@@ -596,6 +594,7 @@ run_remote_script() {
   fi
 
   bash "$dst"
+  return $?
 }
 
 # Verify a detached cleartext GPG signature (.asc) against the script.
@@ -2338,6 +2337,13 @@ EOF
 # /etc/ssh/sshd_config.d/*.conf is correctly rewritten.
 _set_or_append_sshd_config() {
   local param="$1" value="$2" cfg="$3"
+  # Escape param for extended regex (grep -E / sed -E): escape []\^$.|?*+(){}
+  local param_re
+  param_re=$(printf '%s' "$param" | sed 's/[][\^$.|?*+(){}]/\\&/g')
+  # Escape value for sed replacement: escape &, \, and delimiter (/)
+  local value_repl
+  value_repl=$(printf '%s' "$value" | sed 's/[&\]/\\&/g; s|/|\\/|g')
+
   # If the parameter lives in a drop-in (Include /etc/ssh/sshd_config.d/*.conf
   # is processed before the main file's directives, so first-set wins),
   # edit the drop-in there. Otherwise update the main config.
@@ -2345,13 +2351,13 @@ _set_or_append_sshd_config() {
   local dropin
   for dropin in /etc/ssh/sshd_config.d/*.conf; do
     [ -f "$dropin" ] || continue
-    if grep -qE "^[[:space:]]*#?[[:space:]]*${param}[[:space:]]" "$dropin"; then
+    if grep -qE "^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]]" "$dropin"; then
       target="$dropin"
       break
     fi
   done
-  if grep -qE "^[[:space:]]*#?[[:space:]]*${param}[[:space:]]" "$target"; then
-    run sudo sed -i -E "s/^[[:space:]]*#?[[:space:]]*${param}[[:space:]].*/${param} ${value}/" "$target"
+  if grep -qE "^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]]" "$target"; then
+    run sudo sed -i -E "s/^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]].*/${param} ${value_repl}/" "$target"
   else
     printf '%s %s\n' "$param" "$value" | run sudo tee -a "$target" >/dev/null
   fi
@@ -3049,7 +3055,7 @@ rollback_mode() {
     info "Done. Review with:  sudo sshd -t   (and reload any service you changed)"
   else
     echo
-    info "Dry-run only. To actually apply:  sudo bash $0 --rollback --apply"
+    info "Dry-run only. To actually apply:  sudo bash $SCRIPT_PATH --rollback --apply"
   fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -3683,7 +3689,7 @@ USAGE
     info "Because SSH was changed, verify a SECOND session can log in BEFORE closing this one."
     if [ "$SSH_AUTO_MODE" = "1" ]; then
       info "Full+server auto mode: SSH was hardened automatically. If anything went wrong,"
-      info "reconnect via console (or out-of-band) and run:  sudo bash $0  --restore-ssh"
+      info "reconnect via console (or out-of-band) and run:  sudo bash $SCRIPT_PATH  --restore-ssh"
     fi
   fi
   _print_run_summary
@@ -3704,7 +3710,7 @@ _print_run_summary() {
     total_time_str="${total_sec}s"
   fi
   local _hr="════════════════════════════════════════════════════════════"
-  printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
+  printf '\n%s\n' "$(_c '1;36m' "  ╔═════════════════════════════════════════════════════════╗")"
   printf '%s\n' "$(_c '1;36m' "  ║               ✓  Run complete  —  $total_time_str                 ║")"
   printf '%s\n' "$(_c '1;36m' "  ╚══════════════════════════════════════════════════════════╝")"
   printf '\n'
@@ -3757,6 +3763,14 @@ _print_run_summary() {
       return 1
     else
       warn "$_FAIL_COUNT command(s) failed during the run. Re-run with STRICT_RUN=1 to exit non-zero."
+    fi
+  fi
+
+  # Offer to enter maintenance menu for further actions (unless already in maintenance profile)
+  if [ "${REPLY_PROFILE:-}" != "6" ] && [ -t 0 ]; then
+    printf '\n'
+    if prompt_yn "Open maintenance menu for additional tools (service management, SSH diagnostics, logs, etc.)?" "n"; then
+      maintenance_menu
     fi
   fi
   return 0
