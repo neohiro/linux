@@ -164,7 +164,7 @@ count_pubkeys() {
   local f c total=0
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    c=$(sudo grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null) || c=0
+    c=$(sudo grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null) || c=0
     total=$((total + c))
   done
   echo "$total"

@@ -2475,7 +2475,7 @@ backup_and_report_authorized_keys() {
   local f count
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    count=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0)
+    count=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0)
     [ "$count" -eq 0 ] && continue
     run sudo cp -a "$f" "$bakdir/$(echo "$f" | tr '/' '_').bak.$(date +%s%N)"
     info "Preserved $f ($count keys) -> $bakdir/$(basename "$f").bak.*"
@@ -2487,10 +2487,10 @@ audit_authorized_keys() {
   local f count total=0
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || { info "  (none)  $f"; continue; }
-    count=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0)
+    count=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0)
     info "  $count key(s) in $f"
     total=$((total + count))
-    grep -E '^(ssh-|ecdsa-)' "$f" 2>/dev/null | while IFS= read -r k; do
+    grep -E '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null | while IFS= read -r k; do
       printf "    %s ...  %s\n" "$(echo "$k" | awk '{printf "%.50s", $1" "$2}')" "$(echo "$k" | awk '{print $NF}')"
     done
   done
@@ -2689,7 +2689,7 @@ harden_ssh() {
     local _pubkey_count=0
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
       [ -f "$f" ] || continue
-      _pubkey_count=$(( _pubkey_count + $(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0) ))
+      _pubkey_count=$(( _pubkey_count + $(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0) ))
     done
     if [ "$_pubkey_count" -eq 0 ] && [ -z "${LINUXINSTALL_SKIP_PUBKEY_CHECK:-}" ]; then
       err "Refusing to restart sshd: no authorized pubkeys found and PasswordAuthentication may be off."
@@ -2742,7 +2742,7 @@ harden_ssh() {
 _ssh_has_valid_pubkey() {
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    if grep -qE '^(ssh-|ecdsa-)' "$f" 2>/dev/null; then
+    if grep -qE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null; then
       return 0
     fi
   done
@@ -2753,7 +2753,7 @@ _ssh_disable_password_auth() {
   local cfg="$1" ak_count=0 f c
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    c=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null) || c=0
+    c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null) || c=0
     ak_count=$((ak_count + c))
   done
   if [ "$ak_count" -eq 0 ]; then
@@ -3258,7 +3258,7 @@ _ssh_self_heal_check() {
   local _ak_count=0 _f _c
   for _f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$_f" ] || continue
-    _c=$(grep -cE '^(ssh-|ecdsa-' "$_f" 2>/dev/null) || _c=0
+    _c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$_f" 2>/dev/null) || _c=0
     _ak_count=$((_ak_count + _c))
   done
 
@@ -3449,7 +3449,7 @@ restore_ssh_mode() {
     local ak_count=0 f c
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
       [ -f "$f" ] || continue
-      c=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null) || c=0
+      c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null) || c=0
       ak_count=$((ak_count + c))
     done
     if [ "$ak_count" -eq 0 ]; then
