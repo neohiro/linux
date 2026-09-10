@@ -82,8 +82,6 @@ the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
 
-<<<<<<< HEAD
-=======
 ## One-step automated setup
 
 Run the general interactive script directly from the repo — it prompts you
@@ -114,7 +112,40 @@ SSH can get you back in.
 `━━━ PROGRESS ████████████░░░░ 12/17 (70%) ━━━`) before every step, so you
 always see what's already done and what's coming.
 
->>>>>>> origin/main
+### Command-line options
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Preview what would run without executing any commands |
+| `--step STEP` | Run only the named step (e.g. `--step firewall`). Supports aliases: `system`/`system_update`, `ssh`/`ssh_hardening`, `dns`/`dnscrypt`, `optimize`/`optimize_asr` |
+| `--restore-ssh` | Diagnose & fix the most common SSH lockout causes |
+| `--self-heal` | Run the self-heal check now (used by cron/systemd timer) |
+| `--install-self-heal` | Install the per-minute + boot-time self-heal guard |
+| `--no-self-heal` | Remove the self-heal guard |
+| `--restore-etc-snapshot` | Restore /etc from the latest snapshot taken before hardening |
+| `--rollback` | Dry-print inverse commands to undo every change |
+| `--rollback --apply` | Run those inverse commands (latest backup wins) |
+| `--reset-state` | Clear persistent state file so next run re-prompts for env/SSH |
+
+### GPG signature verification (optional)
+
+To enable GPG verification of downloaded helper scripts (`OptimizeLinuxASR.sh`, `DeepClean.sh`):
+
+```bash
+export NEOSIGN_GPG_LEVEL=advisory   # warn on failure but continue
+export NEOSIGN_GPG_LEVEL=required   # abort on failure
+export NEOSIGN_GPG_FPR=<40-hex-fingerprint>  # optional: pin signer
+```
+
+The signature is expected as a detached cleartext `.asc` file alongside the script at the same URL. The signer's key must be in the user's GPG pubring.
+
+### SSH hardening order (lockout prevention)
+
+SSH hardening now runs **last** in the Full/Standard profiles, after all other hardening steps (firewall, fail2ban, sysctl, AppArmor, PAM, etc.). This ensures:
+- You have a working firewall and fail2ban before SSH is locked down
+- The self-heal guard is installed before any SSH changes
+- Auto-mode on servers only disables `PasswordAuthentication` if a valid pubkey (ed25519, RSA, DSA, ECDSA) is detected
+
 ### Cross-distro kernel update
 
 `linuxinstall.sh` auto-detects the package manager and updates the kernel
