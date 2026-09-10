@@ -17,7 +17,7 @@ fi
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
 ORIG_CWD="$(pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-# Validate SCRIPT_PATH: if it looks wrong (e.g. /root/bash), try to find the real script
+# Validate SCRIPT_PATH: if it looks wrong (e.g. /root/bash from curl|bash), try to find the real script.
 if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
   # Try common locations
   for _candidate in \
@@ -31,6 +31,16 @@ if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
     fi
   done
 fi
+
+# _get_restore_cmd: returns the correct command to use for --restore-etc-snapshot
+# If SCRIPT_PATH is a real linuxinstall.sh file, use it; otherwise use re-fetch URL
+_get_restore_cmd() {
+  if [ -f "$SCRIPT_PATH" ] && grep -q "neohiro/linux" "$SCRIPT_PATH" 2>/dev/null; then
+    printf 'sudo bash %q --restore-etc-snapshot' "$SCRIPT_PATH"
+  else
+    printf 'curl -fsSL %s/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot' "$REPO_RAW_BASE"
+  fi
+}
 
 # Persistent state file — remembers user decisions across runs so re-runs
 # don't re-prompt for environment type / SSH usage.
@@ -156,8 +166,62 @@ else
     _TMP_FILES+=("$f")
     printf '%s' "$f"
   }
+
+  # Inline fallback for lib/runner.sh (curl|bash path).  Provides
+  # _runner_cmd so the main script and all call sites can use run()
+  # without requiring the lib directory to be on disk.
+  _runner_init() {
+    : "${STRICT_RUN:=0}"
+    : "${DRY_RUN:=0}"
+    : "${VERBOSE:=0}"
+    if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+      : "${_FAIL_COUNT:=0}"
+    else
+      : "${FAIL_COUNT:=0}"
+    fi
+  }
+  _runner_init
+
+  _runner_cmd() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      printf '  %s\n' "DRY: $*"
+      return 0
+    fi
+
+    if [ "${VERBOSE:-0}" -ge 2 ]; then
+      printf '  %s\n' "RUN: $*"
+    fi
+
+    if [ "${RUNNER_ECHO:-1}" = "1" ] && declare -F msg >/dev/null 2>&1; then
+      msg "$*"
+    fi
+
+    "$@"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+      if declare -F warn >/dev/null 2>&1; then
+        warn "Command failed (exit $rc): $*"
+      else
+        printf '%s\n' "[ERROR] Command failed (exit $rc): $*" >&2
+      fi
+      if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+        _FAIL_COUNT=$((_FAIL_COUNT + 1))
+      else
+        FAIL_COUNT=${FAIL_COUNT:-0}
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+      if declare -F _log_error >/dev/null 2>&1; then
+        _log_error "$rc" "$*"
+      fi
+      if [ "${STRICT_RUN:-0}" = "1" ]; then
+        return $rc
+      fi
+      return 0
+    fi
+    return 0
+  }
+  run() { _runner_cmd "$@"; }
 fi
-unset _NEOHIRO_LIB_DIR
 
 # Inline fallback for lib/updater.sh (curl|bash path).  Provides
 # _run_all_updates so the Updates-only profile and the main script's update
@@ -441,14 +505,6 @@ STRICT_RUN="${STRICT_RUN:-0}"
 QUICK_MODE="${QUICK_MODE:-0}"
 _FAIL_COUNT=0
 
-# Source the shared runner helpers. _runner_cmd is the canonical implementation;
-# alias it to `run` so all existing call sites are satisfied.
-  # shellcheck disable=SC1091
-  if [ -n "${_NEOHIRO_LIB_DIR:-}" ] && [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
-    source "$_NEOHIRO_LIB_DIR/runner.sh"
-    run() { _runner_cmd "$@"; }
-  fi
-
 # Offer a Retry / Skip / Abort choice after a step failure.
 # Only prompts when running interactively (tty + not QUIET_PROMPTS).
 # Returns: 0 = retry, 1 = skip, 2 = abort.
@@ -559,7 +615,8 @@ _take_etc_snapshot() {
       [ -n "$prev" ] && sudo rm -f "$prev" 2>/dev/null
     done < <(find "$snap_dir" -maxdepth 1 -type f -name 'etc-*.tar.gz' ! -name "$(basename "$snap_path")" 2>/dev/null)
     info "Created /etc snapshot: $snap_path"
-    info "  Full /etc restore:  sudo bash $SCRIPT_PATH --restore-etc-snapshot"
+    _restore_cmd=$(_get_restore_cmd)
+    info "  Full /etc restore:  $_restore_cmd"
     info "  (or re-fetch: curl -fsSL $REPO_RAW_BASE/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)"
     info "  (May need sudo systemd-resolve --reload if /etc/resolv.conf was reverted)"
   else
@@ -612,7 +669,7 @@ prompt_choice() {
   if ! [[ "$a" =~ ^[0-9]+$ ]] || [ "$a" -lt 1 ] || [ "$a" -gt ${#opts[@]} ]; then
     a=1
   fi
-  REPLY_CHOICE=$((a-1))
+  REPLY_CHOICE=$a
 }
 
 run_remote_script() {
@@ -3847,7 +3904,8 @@ _print_run_summary() {
   if [ -n "$_ETC_SNAPSHOT_PATH" ]; then
     printf '\n  %s\n' "$(_c '1;36m' '== /etc SNAPSHOT')"
     printf '  Full /etc snapshot: %s\n' "$(_c '1;37m' "$_ETC_SNAPSHOT_PATH")"
-    printf '  Restore whole /etc:  sudo bash %q --restore-etc-snapshot\n' "$SCRIPT_PATH"
+    _restore_cmd=$(_get_restore_cmd)
+    printf '  Restore whole /etc:  %s\n' "$_restore_cmd"
     printf '  (or re-fetch: curl -fsSL %s/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)\n' "$REPO_RAW_BASE"
   fi
   # If update_kernel staged a new image, offer a reboot once we are
