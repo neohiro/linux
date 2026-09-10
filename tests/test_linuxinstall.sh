@@ -30,16 +30,21 @@ SRC="$ROOT/linuxinstall.sh"
 WD="$(mktemp -d)"
 trap 'rm -rf "$WD"' EXIT
 
-# Extract helper block. Four regions:
+# Extract helper blocks. Five regions:
+#   0. Early helpers: _get_restore_cmd to just before STRICT_RUN
+#      Captures _get_restore_cmd, _state_get, _state_set, _state_clear, NEOHIRO_STATE_FILE
 #   1. run() body: STRICT_RUN to just before _ssh_inspect_config
 #      This captures run(), _fw_detect, _is_listening, _service_present,
-#      _ensure_firewall_open, and all other cross-cutting helpers.
+#      _ensure_firewall_open, run_remote_script, and all other cross-cutting helpers.
 #   2. Step functions: _should_run_step to _valid_step
 #   3. Maintenance helpers: _ssh_inspect_config to before maintenance_menu
 #   4. Self-heal functions: _ssh_self_heal_check to before restore_ssh_mode
+#   5. SSH hardening helpers: _ssh_has_valid_pubkey to before _ssh_self_heal_check
+_EARLY_START=$(grep -n '^_get_restore_cmd() {' "$SRC" | head -1 | cut -d: -f1)
 _STRICT_LINE=$(grep -n '^STRICT_RUN=' "$SRC" | head -1 | cut -d: -f1)
-# Include ALL helpers between _restore_etc_snapshot and _ssh_inspect_config:
-#   _fw_detect (line ~663), _is_listening (~750), _service_present (~835), etc.
+_EARLY_END=$((_STRICT_LINE - 1))
+# Include ALL helpers between STRICT_RUN and _ssh_inspect_config:
+#   _fw_detect, _is_listening, _service_present, _ensure_firewall_open, run_remote_script, etc.
 _RUN_END_LINE=$(grep -n '^_ssh_inspect_config() {' "$SRC" | head -1 | cut -d: -f1)
 _RUN_END_LINE=$((_RUN_END_LINE - 1))
 _STEP_START=$(grep -n '^_should_run_step() {' "$SRC" | tail -1 | cut -d: -f1)
@@ -53,9 +58,12 @@ _MAINT_END=$((_MAINT_END - 1))
 _HEAL_START=$(grep -n '^_ssh_self_heal_check() {' "$SRC" | head -1 | cut -d: -f1)
 _HEAL_END=$(grep -n '^restore_ssh_mode() {' "$SRC" | head -1 | cut -d: -f1)
 _HEAL_END=$((_HEAL_END - 1))
-[ -n "$_STRICT_LINE" ] && [ -n "$_RUN_END_LINE" ] && [ -n "$_STEP_START" ] && [ -n "$_STEP_END" ] \
+_SSH_HELPERS_START=$(grep -n '^_ssh_has_valid_pubkey() {' "$SRC" | head -1 | cut -d: -f1)
+_SSH_HELPERS_END=$((_HEAL_START - 1))
+[ -n "$_EARLY_START" ] && [ -n "$_STRICT_LINE" ] && [ -n "$_RUN_END_LINE" ] && [ -n "$_STEP_START" ] && [ -n "$_STEP_END" ] \
   && [ -n "$_MAINT_START" ] && [ -n "$_MAINT_END" ] \
   && [ -n "$_HEAL_START" ] && [ -n "$_HEAL_END" ] \
+  && [ -n "$_SSH_HELPERS_START" ] && [ -n "$_SSH_HELPERS_END" ] \
   || { echo "Could not locate helper block in $SRC"; exit 2; }
 
 # Source lib/color.sh first so the run() body can call msg/err/ok.
@@ -66,14 +74,16 @@ fi
 
 # Source the extracted regions.
 {
+  sed -n "${_EARLY_START},${_EARLY_END}p" "$SRC"
   sed -n "${_STRICT_LINE},${_RUN_END_LINE}p" "$SRC"
   sed -n "${_STEP_START},${_STEP_END}p" "$SRC"
   sed -n "${_MAINT_START},${_MAINT_END}p" "$SRC"
   sed -n "${_HEAL_START},${_HEAL_END}p" "$SRC"
+  sed -n "${_SSH_HELPERS_START},${_SSH_HELPERS_END}p" "$SRC"
 } > "$WD/helpers.sh"
 # shellcheck disable=SC1090
 . "$WD/helpers.sh"
-unset _STRICT_LINE _RUN_END_LINE _STEP_START _STEP_END _MAINT_START _MAINT_END _HEAL_START _HEAL_END
+unset _EARLY_START _EARLY_END _STRICT_LINE _RUN_END_LINE _STEP_START _STEP_END _MAINT_START _MAINT_END _HEAL_START _HEAL_END _SSH_HELPERS_START _SSH_HELPERS_END
 
 # --- lib/temp.sh: source the real library, not the script's fallback ---
 if [ -r "$ROOT/lib/temp.sh" ]; then
@@ -191,6 +201,128 @@ if _should_run_step "firewall"; then
   fail_t "_should_run_step: non-alias step should be skipped" "got rc=0 for firewall when SELECTED_STEP=system_update"
 else
   ok_t "_should_run_step: non-alias step correctly skipped (firewall when SELECTED_STEP=system_update)"
+fi
+
+# --- run_remote_script: DRY_RUN mode ---
+# DRY_RUN=1 should print what would be done without executing
+if declare -F run_remote_script >/dev/null 2>&1; then
+  # Save original vars
+  _orig_DRY_RUN="${DRY_RUN:-0}"
+  _orig_REPO_RAW_BASE="${REPO_RAW_BASE:-}"
+  
+  DRY_RUN=1
+  REPO_RAW_BASE="https://example.com/repo"
+  out=$(run_remote_script "testscript.sh" 2>&1)
+  rc=$?
+  
+  # Restore
+  DRY_RUN="${_orig_DRY_RUN}"
+  REPO_RAW_BASE="${_orig_REPO_RAW_BASE}"
+  unset _orig_DRY_RUN _orig_REPO_RAW_BASE
+  
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "DRY-RUN.*Would download and execute testscript.sh"; then
+    ok_t "run_remote_script: DRY_RUN=1 prints preview and returns 0"
+  else
+    fail_t "run_remote_script: DRY_RUN=1" "rc=$rc out='$out'"
+  fi
+fi
+
+# --- _get_restore_cmd: returns correct restore command ---
+if declare -F _get_restore_cmd >/dev/null 2>&1; then
+  # Test with non-existent SCRIPT_PATH (curl|bash scenario)
+  SCRIPT_PATH="/nonexistent/path"
+  REPO_RAW_BASE="https://raw.githubusercontent.com/neohiro/linux/main"
+  out=$(_get_restore_cmd)
+  if [ "$out" = "curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot" ]; then
+    ok_t "_get_restore_cmd: returns curl|bash command when SCRIPT_PATH invalid"
+  else
+    fail_t "_get_restore_cmd: invalid SCRIPT_PATH" "got: $out"
+  fi
+  
+  # Test with valid SCRIPT_PATH
+  SCRIPT_PATH="/tmp/test_linuxinstall.sh"
+  cat > "$SCRIPT_PATH" <<'EOF'
+#!/usr/bin/env bash
+# neohiro/linux test script
+EOF
+  chmod +x "$SCRIPT_PATH"
+  REPO_RAW_BASE="https://raw.githubusercontent.com/neohiro/linux/main"
+  out=$(_get_restore_cmd)
+  if [ "$out" = "sudo bash /tmp/test_linuxinstall.sh --restore-etc-snapshot" ]; then
+    ok_t "_get_restore_cmd: returns sudo bash command when SCRIPT_PATH valid"
+  else
+    fail_t "_get_restore_cmd: valid SCRIPT_PATH" "got: $out"
+  fi
+  rm -f "$SCRIPT_PATH"
+fi
+
+# --- _ssh_has_valid_pubkey: detects valid SSH public keys ---
+if declare -F _ssh_has_valid_pubkey >/dev/null 2>&1; then
+  # Test with no authorized_keys files (should return 1)
+  # We test by temporarily moving any existing authorized_keys
+  _bak_root_keys=""
+  _bak_user_keys=""
+  if [ -f /root/.ssh/authorized_keys ]; then
+    _bak_root_keys=$(mktemp)
+    mv /root/.ssh/authorized_keys "$_bak_root_keys"
+  fi
+  for f in /home/*/.ssh/authorized_keys; do
+    if [ -f "$f" ]; then
+      _bak_user_keys=$(mktemp)
+      mv "$f" "$_bak_user_keys"
+      break
+    fi
+  done
+  
+  if ! _ssh_has_valid_pubkey; then
+    ok_t "_ssh_has_valid_pubkey: returns 1 when no authorized_keys exist"
+  else
+    fail_t "_ssh_has_valid_pubkey: no keys" "returned 0"
+  fi
+  
+  # Restore
+  if [ -n "$_bak_root_keys" ] && [ -f "$_bak_root_keys" ]; then
+    mv "$_bak_root_keys" /root/.ssh/authorized_keys
+  fi
+  if [ -n "$_bak_user_keys" ] && [ -f "$_bak_user_keys" ]; then
+    mv "$_bak_user_keys" /home/*/.ssh/authorized_keys 2>/dev/null || true
+  fi
+  
+  # Test with a valid ed25519 key
+  mkdir -p /root/.ssh
+  printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGTestKey user@host\n' > /root/.ssh/authorized_keys
+  if _ssh_has_valid_pubkey; then
+    ok_t "_ssh_has_valid_pubkey: returns 0 for valid ed25519 key"
+  else
+    fail_t "_ssh_has_valid_pubkey: ed25519 key" "returned 1"
+  fi
+  
+  # Test with valid RSA key
+  printf 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQTestKey user@host\n' > /root/.ssh/authorized_keys
+  if _ssh_has_valid_pubkey; then
+    ok_t "_ssh_has_valid_pubkey: returns 0 for valid RSA key"
+  else
+    fail_t "_ssh_has_valid_pubkey: RSA key" "returned 1"
+  fi
+  
+  # Test with valid ECDSA key
+  printf 'ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBTestKey user@host\n' > /root/.ssh/authorized_keys
+  if _ssh_has_valid_pubkey; then
+    ok_t "_ssh_has_valid_pubkey: returns 0 for valid ECDSA key"
+  else
+    fail_t "_ssh_has_valid_pubkey: ECDSA key" "returned 1"
+  fi
+  
+  # Test with invalid key format (should return 1)
+  printf 'invalid-key-format\n' > /root/.ssh/authorized_keys
+  if ! _ssh_has_valid_pubkey; then
+    ok_t "_ssh_has_valid_pubkey: returns 1 for invalid key format"
+  else
+    fail_t "_ssh_has_valid_pubkey: invalid format" "returned 0"
+  fi
+  
+  # Cleanup
+  rm -f /root/.ssh/authorized_keys
 fi
 
 # --- _tmpfile: returns unique writable file with 0600 perms ---
