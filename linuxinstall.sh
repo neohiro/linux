@@ -1138,22 +1138,23 @@ _step_end() {
 # for every step except the named one. _valid_step validates the user input
 # against a known list so typos fail loudly instead of silently skipping
 # everything.
-VALID_STEPS_ALIASES="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
+# Alias pairs: when --step selects one, its alias also runs (and vice versa).
+# Format: "key:alias key:alias ..."
+STEP_ALIAS_PAIRS="system:system_update dns:dnscrypt ssh:ssh_hardening optimize:optimize_asr"
 _should_run_step() {
   if [ "${STEP_MODE:-0}" = "0" ]; then return 0; fi
   if [ "$1" = "${SELECTED_STEP:-}" ]; then return 0; fi
-  # Also accept aliases: if the selected step is, say, "system_update",
-  # then "system" should also be allowed, and vice versa.
-  # Check if $1 is an alias of SELECTED_STEP or SELECTED_STEP is an alias of $1
-  case " $VALID_STEPS_ALIASES " in
-    *" $1 "*)
-      case " $VALID_STEPS_ALIASES " in
-        *" ${SELECTED_STEP:-}"*)
-          return 0
-          ;;
-      esac
-      ;;
-  esac
+  # Check if $1 and SELECTED_STEP form an alias pair
+  for pair in $STEP_ALIAS_PAIRS; do
+    key="${pair%%:*}"
+    alias="${pair#*:}"
+    if [ "$1" = "$key" ] && [ "${SELECTED_STEP:-}" = "$alias" ]; then
+      return 0
+    fi
+    if [ "$1" = "$alias" ] && [ "${SELECTED_STEP:-}" = "$key" ]; then
+      return 0
+    fi
+  done
   info "[STEP] Skipping: $1 (--step=${SELECTED_STEP})"
   return 1
 }
