@@ -1102,9 +1102,17 @@ _step_begin() {
 # Usage: _step_end <key> <label> <elapsed_sec> [rc]
 _step_end() {
   local key="$1" label="$2" elapsed="${3:-$SECONDS}" rc="${4:-0}"
+  local min=$(( elapsed / 60 ))
+  local sec=$(( elapsed % 60 ))
+  local time_str
+  if [ "$min" -gt 0 ]; then
+    time_str="${min}m ${sec}s"
+  else
+    time_str="${sec}s"
+  fi
   if [ "$rc" -eq 0 ]; then
     mark_step "$key" done
-    printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $elapsed s"
+    printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $time_str"
   else
     mark_step "$key" skip
     printf '  %s %s\n' "$(_c '1;31m' '[FAIL]')" "$label failed (rc=$rc) — skipped"
