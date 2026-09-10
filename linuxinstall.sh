@@ -619,6 +619,15 @@ run_remote_script() {
   local name="$1"
   local url="${REPO_RAW_BASE}/${name}"
   local dst="${TMP_DIR}/${name}"
+  
+  # Respect DRY_RUN flag - don't execute when DRY_RUN=1
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    warn "[DRY-RUN] Would download and execute $name from $url"
+    echo "Downloading: $url"
+    echo "Executing: $dst"
+    return 0
+  fi
+  
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fsSL "$url" -o "$dst"; then err "Failed to fetch $url"; return 1; fi
   elif command -v wget >/dev/null 2>&1; then
@@ -626,8 +635,9 @@ run_remote_script() {
   else
     err "Neither curl nor wget available; cannot fetch $name"; return 1
   fi
+  
   chmod +x "$dst"
-
+  
   # Optional GPG verification. Disabled by default; enable by setting
   #   NEOSIGN_GPG_LEVEL=required  NEOSIGN_GPG_FPR=<40-hex fingerprint>
   # in the environment. `advisory` warns but does not abort. The
@@ -635,8 +645,11 @@ run_remote_script() {
   # `.asc` suffix (detached cleartext signature).
   local gpg_level="${NEOSIGN_GPG_LEVEL:-off}"
   if [ "$gpg_level" != "off" ]; then
-    if _verify_remote_gpg_signature "$name" "$dst"; then
+    _verify_remote_gpg_signature "$name" "$dst"; rc=$?
+    if [ "$rc" -eq 0 ]; then
       ok "GPG signature OK for $name"
+    elif [ "$rc" -eq 2 ]; then
+      warn "Continuing despite advisory-only GPG verification issue (NEOSIGN_GPG_LEVEL=advisory)."
     else
       err "GPG signature verification FAILED for $name"
       if [ "$gpg_level" = "required" ]; then
@@ -646,7 +659,8 @@ run_remote_script() {
       warn "Continuing despite bad signature (NEOSIGN_GPG_LEVEL=advisory)."
     fi
   fi
-
+  
+  # Execute the downloaded script
   bash "$dst"
   return $?
 }
@@ -655,17 +669,15 @@ run_remote_script() {
 # Uses the system default pubring (no custom keyring).
 # The signer's key must already be in the user's keyring.
 # Optionally verify the signer fingerprint matches $NEOSIGN_GPG_FPR if set.
+# Returns 0 on success, 1 on failure, 2 on advisory-only failure.
 _verify_remote_gpg_signature() {
-  local name="$1" script="$2" sig url_dst gpg_out rc
+  local name="$1" script="$2" sig url_dst gpg_out rc rc_final=0 fpr="${NEOSIGN_GPG_FPR:-}"
   if ! command -v gpg >/dev/null 2>&1; then
-    err "gpg is not installed; cannot verify $name"
-    return 1
+    err "gpg is not installed; cannot verify $name"; return 1
   fi
-  local fpr="${NEOSIGN_GPG_FPR:-}"
   url_dst="${TMP_DIR}/${name}.asc"
   if ! curl -fsSL "${REPO_RAW_BASE}/${name}.asc" -o "$url_dst" 2>/dev/null; then
-    err "Could not fetch ${name}.asc from $REPO_RAW_BASE"
-    return 1
+    err "Could not fetch ${name}.asc from $REPO_RAW_BASE"; return 1
   fi
   # Verify with the system pubring. If the signer's key is not in the
   # pubring, gpg still validates the cryptographic signature but warns
@@ -673,15 +685,16 @@ _verify_remote_gpg_signature() {
   gpg_out=$(mktemp)
   rc=0
   gpg --batch --verify "$url_dst" "$script" >"$gpg_out" 2>&1 || rc=$?
-  if [ $rc -ne 0 ] && ! grep -qi 'gpg: no signer information' "$gpg_out" 2>/dev/null; then
-    # Also check for "Good signature" despite unknown key
-    if ! grep -qi 'Good signature' "$gpg_out" 2>/dev/null; then
-      err "gpg --verify failed:"
-      cat "$gpg_out" >&2
-      rm -f "$gpg_out"
-      return 1
+  if [ $rc -ne 0 ]; then
+    if ! grep -qi 'gpg: no signer information' "$gpg_out" 2>/dev/null; then
+      # Also check for "Good signature" despite unknown key
+      if ! grep -qi 'Good signature' "$gpg_out" 2>/dev/null; then
+        err "gpg --verify failed:"; cat "$gpg_out" >&2; rm -f "$gpg_out"; return 1
+      fi
+      warn "Signature is cryptographically valid but key is not in pubring."
     fi
-    warn "Signature is cryptographically valid but key is not in pubring."
+    # Not a complete failure; continue to fingerprint check (if any)
+    rc_final=2
   fi
   # Optional fingerprint pin: if FPR is set, confirm the signing key matches.
   if [ -n "$fpr" ]; then
@@ -691,17 +704,19 @@ _verify_remote_gpg_signature() {
     # gpg --verify output format varies; also try gpg --list-keys with the signer key id
     if [ -z "$signer" ]; then
       signer=$(gpg --batch --list-keys --keyid-format long "$url_dst" 2>/dev/null \
-                | awk '/^pub.*\// {sub(/.*\//,""); print toupper($0); exit}')
+                | awk '/^pub.*\\/ {sub(/.*\\/,""); print toupper($0); exit}')
     fi
     if [ -n "$signer" ] && [ "$signer" != "$(printf '%s' "$fpr" | tr -d ' ' | tr 'a-f' 'A-F')" ]; then
-      err "Signer key ($signer) does not match trusted fingerprint ($fpr)."
-      rm -f "$gpg_out"
-      return 1
+      err "Signer key ($signer) does not match trusted fingerprint ($fpr)."; rm -f "$gpg_out"
+      if [ "${NEOSIGN_GPG_LEVEL:-off}" = "required" ]; then
+        return 1
+      fi
+      return 2
     fi
     ok "Signer fingerprint verified: ${signer:-$(printf '%s' "$fpr" | tr -d ' ')}"
   fi
   rm -f "$gpg_out"
-  return 0
+  return $rc_final
 }
 
 ENV_TYPE=""
@@ -1069,7 +1084,7 @@ CHECKLIST_LABEL_dnscrypt="DNSCrypt + DNS routing"
 CHECKLIST_LABEL_firewall="Firewall (UFW / firewalld)"
 CHECKLIST_LABEL_tor="Tor daemon"
 CHECKLIST_LABEL_ssh="SSH hardening (lockout-prone)"
-CHECKLIST_LABEL_ssh_hardening="SSH hardening (lockout-prone)"
+CHECKLIST_LABEL_ssh_hardening="SSH hardening (lockout-prone — run LAST)"
 CHECKLIST_LABEL_fail2ban="Fail2ban"
 CHECKLIST_LABEL_unattended="Unattended security upgrades"
 CHECKLIST_LABEL_ipv6="Disable IPv6"
@@ -1123,9 +1138,22 @@ _step_end() {
 # for every step except the named one. _valid_step validates the user input
 # against a known list so typos fail loudly instead of silently skipping
 # everything.
+VALID_STEPS_ALIASES="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
 _should_run_step() {
   if [ "${STEP_MODE:-0}" = "0" ]; then return 0; fi
   if [ "$1" = "${SELECTED_STEP:-}" ]; then return 0; fi
+  # Also accept aliases: if the selected step is, say, "system_update",
+  # then "system" should also be allowed, and vice versa.
+  # Check if $1 is an alias of SELECTED_STEP or SELECTED_STEP is an alias of $1
+  case " $VALID_STEPS_ALIASES " in
+    *" $1 "*)
+      case " $VALID_STEPS_ALIASES " in
+        *" ${SELECTED_STEP:-}"*)
+          return 0
+          ;;
+      esac
+      ;;
+  esac
   info "[STEP] Skipping: $1 (--step=${SELECTED_STEP})"
   return 1
 }
@@ -1160,7 +1188,7 @@ _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Rever
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
-_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary"
+_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary ssh_hardening"
 
 show_progress() {
   local done=0 total=0 key status
@@ -1429,7 +1457,7 @@ ask_category_enabled() {
   fi
   case "$REPLY_PROFILE" in
     1) [ "$default" = "y" ]; return $?;;
-    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;
+    2) [ "$default" = "y" ] || [ "$key" = "ssh_hardening" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;
     3) return 0;;
     4) prompt_yn "Run: $desc?" "$default"; return $?;;
     5) return 1;;
@@ -2645,8 +2673,13 @@ harden_ssh() {
       warn "Pubkey not validated; PasswordAuthentication left unchanged."
     fi
   else
-    ok "[AUTO] PasswordAuthentication handling in auto mode."
-    _ssh_disable_password_auth "$SSHCFG" || true
+    # Auto mode: only disable password auth if at least one valid pubkey exists
+    if _ssh_has_valid_pubkey; then
+      _ssh_disable_password_auth "$SSHCFG"
+      ok "[AUTO] PasswordAuthentication disabled (valid pubkey found)."
+    else
+      warn "[AUTO] No valid pubkey found — keeping PasswordAuthentication enabled to prevent lockout."
+    fi
   fi
 
   # Final anti-lockout check: confirm a pubkey actually works before we
@@ -2706,6 +2739,16 @@ harden_ssh() {
   fi
 }
 
+_ssh_has_valid_pubkey() {
+  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+    [ -f "$f" ] || continue
+    if grep -qE '^(ssh-|ecdsa-)' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 _ssh_disable_password_auth() {
   local cfg="$1" ak_count=0 f c
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
@@ -2714,15 +2757,6 @@ _ssh_disable_password_auth() {
     ak_count=$((ak_count + c))
   done
   if [ "$ak_count" -eq 0 ]; then
-    if [ "$SSH_AUTO_MODE" = "1" ]; then
-      warn "[AUTO] No pubkeys found. Leaving PasswordAuthentication=yes (no lockout)."
-      return 1
-    fi
-    warn "No public keys found in any authorized_keys."
-    if ! setup_authorized_keys_with_validation; then
-      err "No working pubkey validated. Leaving PasswordAuthentication unchanged."
-      return 1
-    fi
     _set_or_append_sshd_config "PasswordAuthentication" "no" "$cfg"
     metrics_add services_hardened 1
     metrics_add auth_keys_added 1
@@ -3768,7 +3802,6 @@ USAGE
   _run_step dnscrypt     "DNSCrypt (DNS method is ambiguous)"         "" setup_dnscrypt            n
   _run_step firewall     "Firewall (UFW)"                             "" setup_firewall            y
   _run_step tor          "Tor daemon"                                 "" setup_tor                 n
-  _run_step ssh          "SSH hardening (lockout-prone)"              "" harden_ssh                n
   _run_step fail2ban    "Fail2ban"                                   "" setup_fail2ban            n
   _run_step unattended  "Unattended security upgrades"               "" configure_unattended_upgrades y
   _run_step ipv6        "Disable IPv6 (risky)"                       "" disable_ipv6              n
@@ -3776,6 +3809,7 @@ USAGE
   _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
   _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
   _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
+  _run_step ssh_hardening "SSH hardening (lockout-prone — run LAST)"   "" harden_ssh                n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then
     info "Because SSH was changed, verify a SECOND session can log in BEFORE closing this one."
