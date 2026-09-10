@@ -141,6 +141,58 @@ else
   ok_t "_should_run_step: STEP_MODE=1 with empty SELECTED_STEP returns 1"
 fi
 
+# --- _should_run_step: alias pairs (system<->system_update, ssh<->ssh_hardening, etc.) ---
+# When --step selects one alias, its pair should also run
+STEP_MODE=1; SELECTED_STEP="system_update"
+if _should_run_step "system"; then
+  ok_t "_should_run_step: alias pair system<->system_update (select system_update, run system)"
+else
+  fail_t "_should_run_step: alias pair system<->system_update" "got rc=1 for system when SELECTED_STEP=system_update"
+fi
+
+STEP_MODE=1; SELECTED_STEP="system"
+if _should_run_step "system_update"; then
+  ok_t "_should_run_step: alias pair system<->system_update (select system, run system_update)"
+else
+  fail_t "_should_run_step: alias pair system<->system_update" "got rc=1 for system_update when SELECTED_STEP=system"
+fi
+
+STEP_MODE=1; SELECTED_STEP="ssh_hardening"
+if _should_run_step "ssh"; then
+  ok_t "_should_run_step: alias pair ssh<->ssh_hardening (select ssh_hardening, run ssh)"
+else
+  fail_t "_should_run_step: alias pair ssh<->ssh_hardening" "got rc=1 for ssh when SELECTED_STEP=ssh_hardening"
+fi
+
+STEP_MODE=1; SELECTED_STEP="ssh"
+if _should_run_step "ssh_hardening"; then
+  ok_t "_should_run_step: alias pair ssh<->ssh_hardening (select ssh, run ssh_hardening)"
+else
+  fail_t "_should_run_step: alias pair ssh<->ssh_hardening" "got rc=1 for ssh_hardening when SELECTED_STEP=ssh"
+fi
+
+STEP_MODE=1; SELECTED_STEP="dnscrypt"
+if _should_run_step "dns"; then
+  ok_t "_should_run_step: alias pair dns<->dnscrypt (select dnscrypt, run dns)"
+else
+  fail_t "_should_run_step: alias pair dns<->dnscrypt" "got rc=1 for dns when SELECTED_STEP=dnscrypt"
+fi
+
+STEP_MODE=1; SELECTED_STEP="optimize_asr"
+if _should_run_step "optimize"; then
+  ok_t "_should_run_step: alias pair optimize<->optimize_asr (select optimize_asr, run optimize)"
+else
+  fail_t "_should_run_step: alias pair optimize<->optimize_asr" "got rc=1 for optimize when SELECTED_STEP=optimize_asr"
+fi
+
+# Non-alias steps should still be skipped when a different step is selected
+STEP_MODE=1; SELECTED_STEP="system_update"
+if _should_run_step "firewall"; then
+  fail_t "_should_run_step: non-alias step should be skipped" "got rc=0 for firewall when SELECTED_STEP=system_update"
+else
+  ok_t "_should_run_step: non-alias step correctly skipped (firewall when SELECTED_STEP=system_update)"
+fi
+
 # --- _tmpfile: returns unique writable file with 0600 perms ---
 # The 0600 behaviour relies on Linux mktemp semantics and `install(1) -m`.
 # Skip on non-POSIX hosts where /tmp and /dev/null are not Linux-compatible.
