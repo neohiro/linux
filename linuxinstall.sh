@@ -1464,7 +1464,14 @@ ask_profile() {
       REPLY_PROFILE=2  # Standard on desktops (no SSH lockout risk)
     fi
     printf '\n  %s\n' "$(_c '1;32m' '[AUTO] Selected: auto (intelligent defaults) — server='"$ENV_TYPE"' SSH='"$USE_REMOTE_SSH"')"
-    printf '  %s\n' "$(_c '1;32m' '  Final profile: '"$(_profile_label)"' — '"$(case "$REPLY_PROFILE" in 2) echo "Standard (desktop, no SSH hardening)" ;; 3) echo "Full (server, SSH hardened)" ;; esac)"
+    local _profile_desc
+    case "$REPLY_PROFILE" in
+      2) _profile_desc='Standard (desktop, no SSH hardening)' ;;
+      3) _profile_desc='Full (server, SSH hardened)' ;;
+      *) _profile_desc='Unknown' ;;
+    esac
+    local _label="$(_profile_label)"
+    printf '  %s\n' "$(_c '1;32m' '  Final profile: '"$_label"' — '"$_profile_desc)"
     printf '\n'
     return 0
   fi
