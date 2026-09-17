@@ -75,8 +75,8 @@ echo "5. DeepClean.sh inline gate:"
 check "DeepClean.sh: sources lib/color.sh" 'grep -qF "color.sh" DeepClean.sh'
 check "DeepClean.sh: has USE_COLOR gate logic" 'grep -qF "USE_COLOR=" DeepClean.sh'
 check "DeepClean.sh: checks XDG NO_COLOR correctly" 'grep -qF "!= \"0\"" DeepClean.sh'
-check "DeepClean.sh: uses GREEN/BLUE/YELLOW/CYAN/NC in output" \
-  'grep -q "$" DeepClean.sh && grep -q "GREEN" DeepClean.sh && grep -q "CYAN" DeepClean.sh'
+check "DeepClean.sh: uses _c() for colored output" \
+  'grep -q "_c" DeepClean.sh && grep -q "printf" DeepClean.sh'
 echo
 
 echo "6. Behavioral: all scripts emit identical USE_COLOR for same env."

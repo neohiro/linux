@@ -220,17 +220,17 @@ ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
 ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
 ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 
-printf '\n%s\n' "${BLUE}=================================================================${NC}"
-printf '%s\n' "${GREEN}             DEEPCLEAN AND AUTO-PRUNE COMPLETE!${NC}"
-printf '%s\n\n' "${BLUE}=================================================================${NC}"
-
-if [ "$FREED_KB" -gt 1024000 ]; then
-    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_GB} GB${NC} (${FREED_MB} MB)"
-else
-    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_MB} MB${NC}"
-fi
-
-printf 'Current Disk (%s):\n' "${CYAN}${ROOT_FS}${NC}"
-printf '  Total : %s\n' "${BLUE}${ROOT_TOTAL}${NC}"
-printf '  Used  : %s (%s)\n' "${BLUE}${ROOT_USED}${NC}" "$ROOT_PERCENT"
-printf '  Free  : %s\n\n' "${GREEN}${ROOT_FREE}${NC}"
+printf '\n%s\n' "$(_c '1;34m' '=================================================================')"
+    printf '%s\n' "$(_c '1;32m' '             DEEPCLEAN AND AUTO-PRUNE COMPLETE!')"
+    printf '%s\n\n' "$(_c '1;34m' '=================================================================')"
+ 
+    if [ "$FREED_KB" -gt 1024000 ]; then
+        printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_GB} GB (${FREED_MB} MB)")"
+    else
+        printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_MB} MB")"
+    fi
+ 
+    printf 'Current Disk (%s):\n' "$(_c '1;36m' "${ROOT_FS}")"
+    printf '  Total : %s\n' "$(_c '1;34m' "${ROOT_TOTAL}")"
+    printf '  Used  : %s (%s)\n' "$(_c '1;34m' "${ROOT_USED}")" "${ROOT_PERCENT}"
+    printf '  Free  : %s\n\n' "$(_c '1;32m' "${ROOT_FREE}")"
