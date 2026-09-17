@@ -16,9 +16,15 @@ fi
 
 # Read one line interactively. Falls back to /dev/tty when stdin is not a
 # TTY (cron, sudo -i from a pipeline, etc.) so the script cannot hang.
+# In non-interactive mode (AUTO_MODE=1 or QUIET_PROMPTS=1), returns empty
+# REPLY immediately so callers can default to safe behavior.
 # Usage: _read_tty <prompt> <var>
 _read_tty() {
   local prompt="$1"
+  if [ "${AUTO_MODE:-0}" = "1" ] || [ "${QUIET_PROMPTS:-0}" = "1" ]; then
+    REPLY=""
+    return 0
+  fi
   if [ -t 0 ]; then
     read -r -p "$prompt"
   elif [ -e /dev/tty ] && [ -r /dev/tty ]; then
@@ -52,6 +58,9 @@ ask_category() {
     while true; do
         REPLY="" ; _read_tty "Action for this category? [i=Interactive / a=Disable All / s=Skip All] (Default i): "
         cat_choice="${REPLY,,}"
+        # In non-interactive mode (AUTO_MODE/QUIET_PROMPTS), _read_tty returns
+        # empty REPLY; default to Skip All (s) for safety.
+        [ -z "$cat_choice" ] && cat_choice="s"
         case "$cat_choice" in
             a|all )
                 CATEGORY_ACTION="a"
@@ -61,7 +70,7 @@ ask_category() {
                 CATEGORY_ACTION="s"
                 echo " -> Action: SKIPPING ALL services in ${category_name}."
                 break ;;
-            i|interactive|"")
+            i|interactive )
                 CATEGORY_ACTION="i"
                 echo " -> Action: Interactive mode."
                 break ;;
@@ -96,6 +105,7 @@ ask_disable() {
             else
                 REPLY="" ; _read_tty "Disable ${service} (${description})? [y/N]: "
                 choice="$REPLY"
+                # In non-interactive mode, _read_tty returns empty REPLY; default to N (skip)
                 [ -z "$choice" ] && choice="$default_choice"
             fi
 

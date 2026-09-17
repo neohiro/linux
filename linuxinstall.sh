@@ -92,10 +92,13 @@ else
   _tmpfile() {
     local prefix="${1:-neohiro}"
     local f
-    # install(1) is atomic (mode set at create time) so there is no
-    # window where the file is world-readable between mktemp and chmod.
-    f=$(install -m 0600 /dev/null "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null \
-        || mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+    # Try mktemp with -m for atomic mode setting (GNU extension).
+    # Fall back to mktemp + chmod (small race window, acceptable).
+    if f=$(mktemp -m 0600 "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null); then
+      :
+    else
+      f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX") && chmod 0600 "$f"
+    fi
     _TMP_FILES+=("$f")
     printf '%s' "$f"
   }
