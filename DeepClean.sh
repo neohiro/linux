@@ -38,9 +38,9 @@ fi
 # Emit color constants from the validated gate. Single-quoted strings
 # so the backslashes survive verbatim into the terminal.
 if [ "${USE_COLOR}" = "1" ]; then
-  GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+  RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 else
-  GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
+  RED=""; GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
 fi
 
 USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
