@@ -11,15 +11,14 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Color constants and helpers sourced from lib/color.sh (falls back inline).
+# Color helpers from lib/color.sh (falls back inline).
 # shellcheck disable=SC1091
 if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
 fi
 
-# If lib/color.sh was sourced, USE_COLOR is already set. If not
-# (run standalone from /tmp), apply the same gate inline so we never
-# emit stray "m" bytes to terminals that strip CSI sequences.
+# If lib/color.sh was not sourced or did not set USE_COLOR, run the canonical
+# gate inline so _c is safe to call in all execution paths.
 if [ -z "${USE_COLOR:-}" ]; then
   if [ "${NEOHIRO_COLOR:-}" = "1" ]; then
     USE_COLOR=1
@@ -35,20 +34,15 @@ if [ -z "${USE_COLOR:-}" ]; then
     esac
   fi
 fi
-# Emit color constants from the validated gate. Single-quoted strings
-# so the backslashes survive verbatim into the terminal.
-if [ "${USE_COLOR}" = "1" ]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-else
-  RED=""; GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
-fi
 
-USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
+# _c <ansi-code> <text> -- wrap text in CSI escapes iff USE_COLOR=1.
+_c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%s%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 
-msg()  { echo "${CYAN}[*]${NC} $*"; }
-ok()   { echo "${GREEN}[+]${NC} $*"; }
-warn() { echo "${YELLOW}[!]${NC} $*"; }
-err()  { echo "${RED}[!]${NC} $*" >&2; }
+# Print helpers. All accept a single message string. warn/err go to stderr.
+msg()  { printf '%s\n' "$(_c '1;36m' '[*]' "$*")"; }
+ok()   { printf '%s\n' "$(_c '1;32m' '[+]' "$*")"; }
+warn() { printf '%s\n' "$(_c '1;33m' '[!]' "$*")"; }
+err()  { printf '%s\n' "$(_c '1;31m' '[!]' "$*")" >&2; }
 
 pkg_mgr() {
   if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then
