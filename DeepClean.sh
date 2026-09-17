@@ -31,7 +31,7 @@ if [ -z "${USE_COLOR:-}" ]; then
     _tcol=$(tput colors 2>/dev/null) || _tcol=""
     case "${_tcol}" in
       ''|*[!0-9]*) USE_COLOR=0 ;;
-      *) [ "${_tcol}" -ge 8 ] || USE_COLOR=0 ;;
+      *) [ "${_tcol}" -ge 8 ] && USE_COLOR=1 || USE_COLOR=0 ;;
     esac
   fi
 fi
@@ -48,6 +48,7 @@ USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
 msg()  { echo "${CYAN}[*]${NC} $*"; }
 ok()   { echo "${GREEN}[+]${NC} $*"; }
 warn() { echo "${YELLOW}[!]${NC} $*"; }
+err()  { echo "${RED}[!]${NC} $*" >&2; }
 
 pkg_mgr() {
   if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then

@@ -43,7 +43,7 @@ else
   _nc=$(tput colors 2>/dev/null) || _nc=""
   case "$_nc" in
     ''|*[!0-9]*) USE_COLOR=0 ;;
-    *) [ "$_nc" -ge 8 ] || USE_COLOR=0 ;;
+    *) [ "$_nc" -ge 8 ] && USE_COLOR=1 || USE_COLOR=0 ;;
   esac
   unset _nc
 fi
