@@ -37,15 +37,23 @@ if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
   fi
 fi
 # Create the log with owner-only permissions before any breadcrumb is written.
-install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
+# Use mktemp for atomic creation with mode, then write initial content.
+_log_file=$(mktemp -m 0600 "$(dirname "$NEOHIRO_DEBUG_LOG")/neohiro-debug.XXXXXX" 2>/dev/null) \
+  && mv "$_log_file" "$NEOHIRO_DEBUG_LOG" 2>/dev/null \
+  || { touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG"; } 2>/dev/null || true
 
 # Public: create a tracked temp file. Returns the new path.
 # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)
 _tmpfile() {
   local prefix="${1:-neohiro}"
   local f
-  f=$(install -m 0600 /dev/null "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null \
-      || mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
+  # Try mktemp with -m for atomic mode setting (GNU extension).
+  # Fall back to mktemp + chmod (small race window, acceptable).
+  if f=$(mktemp -m 0600 "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null); then
+    :
+  else
+    f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX") && chmod 0600 "$f"
+  fi
   _TMP_FILES+=("$f")
   printf '%s' "$f"
 }

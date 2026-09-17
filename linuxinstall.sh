@@ -83,8 +83,11 @@ else
       NEOHIRO_DEBUG_LOG="${TMP_DIR}/neohiro-debug.log"
     fi
   fi
-  # Create the log with owner-only permissions before any breadcrumb is written.
-  install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null || touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null || true
+# Create the log with owner-only permissions before any breadcrumb is written.
+# Use mktemp for atomic creation with mode, then move into place.
+_log_file=$(mktemp -m 0600 "$(dirname "$NEOHIRO_DEBUG_LOG")/neohiro-debug.XXXXXX" 2>/dev/null) \
+  && mv "$_log_file" "$NEOHIRO_DEBUG_LOG" 2>/dev/null \
+  || { touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG"; } 2>/dev/null || true
   trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
 
   # Public: create a tracked temp file. Returns the new path.
@@ -170,15 +173,18 @@ ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
 # Creates it with 0600 mode (owner-only) to avoid leaking paths to other users.
 _record_backup_init() {
   local logdir="${ROLLBACK_LOG%/*}"
-  # install(1) sets the mode atomically at create-time, avoiding a brief
-  # window where the file is world-readable between touch and chmod.
+  # Use mktemp for atomic creation with mode, then move into place.
+  # This avoids the race window where touch+chmod leaves the file world-readable.
   if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
     # Running as root without sudo available: create log directly.
     mkdir -p "$logdir" 2>/dev/null || true
-    install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null || true
+    _log_file=$(mktemp -m 0600 "${logdir}/linux-install-rollback.XXXXXX" 2>/dev/null) \
+      && mv "$_log_file" "$ROLLBACK_LOG" 2>/dev/null \
+      || { touch "$ROLLBACK_LOG" && chmod 0600 "$ROLLBACK_LOG"; } 2>/dev/null || true
   else
     sudo mkdir -p "$logdir" 2>/dev/null || true
-    sudo install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null \
+    _log_file=$(sudo mktemp -m 0600 "${logdir}/linux-install-rollback.XXXXXX" 2>/dev/null) \
+      && sudo mv "$_log_file" "$ROLLBACK_LOG" 2>/dev/null \
       || sudo sh -c "touch '$ROLLBACK_LOG' && chmod 0600 '$ROLLBACK_LOG'" 2>/dev/null || true
   fi
 }
