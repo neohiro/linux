@@ -115,10 +115,10 @@ esac
 # 5. Snap Revisions (not Ubuntu-only; snap exists on other distros too)
 if command -v snap >/dev/null 2>&1; then
     msg "Removing disabled snap revisions..."
-    LANG=C snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' |
+    { LANG=C snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' |
         while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
-        done
+        done; } || true
     rm -rf /var/lib/snapd/cache/* 2>/dev/null || true
 fi
 
@@ -147,11 +147,12 @@ find /home/*/.local/share/Trash/* -delete 2>/dev/null || true
 msg "Configuring journald for automatic log retention..."
 JOURNALD_CONF="/etc/systemd/journald.conf"
 [ -f "$JOURNALD_CONF" ] || touch "$JOURNALD_CONF"
-grep -qE "^#?SystemMaxUse=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*SystemMaxUse=.*/SystemMaxUse=200M/' "$JOURNALD_CONF" || \
+# Use subshell with || true to handle grep/sed failures gracefully
+( grep -qE "^#?SystemMaxUse=" "$JOURNALD_CONF" && \
+    sed -i 's/^#*SystemMaxUse=.*/SystemMaxUse=200M/' "$JOURNALD_CONF" ) || \
     echo "SystemMaxUse=200M" >> "$JOURNALD_CONF"
-grep -qE "^#?MaxRetentionSec=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*MaxRetentionSec=.*/MaxRetentionSec=7d/' "$JOURNALD_CONF" || \
+( grep -qE "^#?MaxRetentionSec=" "$JOURNALD_CONF" && \
+    sed -i 's/^#*MaxRetentionSec=.*/MaxRetentionSec=7d/' "$JOURNALD_CONF" ) || \
     echo "MaxRetentionSec=7d" >> "$JOURNALD_CONF"
 systemctl restart systemd-journald 2>/dev/null || true
 
@@ -193,8 +194,8 @@ esac
 msg "Configuring systemd-coredump limits..."
 COREDUMP_CONF="/etc/systemd/coredump.conf"
 [ -f "$COREDUMP_CONF" ] || { echo "[Coredump]" > "$COREDUMP_CONF"; }
-grep -qE "^#?MaxUse=" "$COREDUMP_CONF" && \
-    sed -i 's/^#*MaxUse=.*/MaxUse=100M/' "$COREDUMP_CONF" || \
+( grep -qE "^#?MaxUse=" "$COREDUMP_CONF" && \
+    sed -i 's/^#*MaxUse=.*/MaxUse=100M/' "$COREDUMP_CONF" ) || \
     echo "MaxUse=100M" >> "$COREDUMP_CONF"
 systemctl restart systemd-coredump.socket 2>/dev/null || true
 
@@ -202,7 +203,7 @@ systemctl restart systemd-coredump.socket 2>/dev/null || true
 msg "Configuring global logrotate for shorter retention and compression..."
 if [ -f /etc/logrotate.conf ]; then
     sed -i 's/^#compress/compress/' /etc/logrotate.conf
-    grep -q "^compress" /etc/logrotate.conf || echo "compress" >> /etc/logrotate.conf
+    ( grep -q "^compress" /etc/logrotate.conf ) || echo "compress" >> /etc/logrotate.conf
     sed -i 's/^rotate 4/rotate 2/' /etc/logrotate.conf
 fi
 
