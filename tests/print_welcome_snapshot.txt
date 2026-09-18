@@ -13,5 +13,5 @@
   Environment:   server
   Remote SSH:    no
   Profile:       Profile 2 — Standard
-  Steps:         ~10 hardening steps (includes SSH hardening)
+  Steps:         ~6 hardening steps (no SSH changes)
   ──────────────────────────────────────────────────────────
