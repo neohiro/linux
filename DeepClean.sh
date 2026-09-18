@@ -62,6 +62,9 @@ pkg_mgr() {
 
 PM=$(pkg_mgr)
 
+# Capture disk usage before cleaning
+USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
+
 msg "Detected package manager: ${PM:-none}"
 msg "Starting DeepClean..."
 
