@@ -15,6 +15,11 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
+# Validate REPO_RAW_BASE is a trusted domain (prevents malicious overrides)
+if [[ "$REPO_RAW_BASE" != https://raw.githubusercontent.com/neohiro/linux/* ]]; then
+  err "REPO_RAW_BASE must be a raw.githubusercontent.com URL under neohiro/linux; got: $REPO_RAW_BASE"
+  exit 1
+fi
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
 ORIG_CWD="$(pwd)"
 

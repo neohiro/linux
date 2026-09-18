@@ -114,12 +114,35 @@ if ! declare -F run >/dev/null 2>&1; then
         printf '  DRY: %s\n' "$*"
         return 0
       fi
+      if [ "${VERBOSE:-0}" -ge 2 ]; then
+        printf '  %s\n' "RUN: $*"
+      fi
+      if [ "${RUNNER_ECHO:-1}" = "1" ] && declare -F msg >/dev/null 2>&1; then
+        msg "$*"
+      fi
       "$@"
       local rc=$?
       if [ $rc -ne 0 ]; then
-        warn "Command failed (exit $rc): $*"
+        if declare -F warn >/dev/null 2>&1; then
+          warn "Command failed (exit $rc): $*"
+        else
+          printf '%s\n' "[ERROR] Command failed (exit $rc): $*" >&2
+        fi
+        if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+          _FAIL_COUNT=$((_FAIL_COUNT + 1))
+        else
+          FAIL_COUNT=${FAIL_COUNT:-0}
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+        if declare -F _log_error >/dev/null 2>&1; then
+          _log_error "$rc" "$*"
+        fi
+        if [ "${STRICT_RUN:-0}" = "1" ]; then
+          return $rc
+        fi
+        return 0
       fi
-      return $rc
+      return 0
     }
   fi
 fi
