@@ -70,6 +70,43 @@ else
   ok()   { printf "%s %s\n" "$(_c '1;32m' '[OK]')"      "$*"; }
   info() { printf "  %s\n" "$*"; }
   msg()  { echo "=> $*"; }
+  # Inline fallback for run() when lib/runner.sh is not available.
+  # Provides basic command execution with DRY_RUN/VERBOSE support.
+  run() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+      printf '  %s\n' "DRY: $*"
+      return 0
+    fi
+    if [ "${VERBOSE:-0}" -ge 2 ]; then
+      printf '  %s\n' "RUN: $*"
+    fi
+    if [ "${RUNNER_ECHO:-1}" = "1" ]; then
+      msg "$*"
+    fi
+    "$@"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+      if declare -F warn >/dev/null 2>&1; then
+        warn "Command failed (exit $rc): $*"
+      else
+        printf '%s\n' "[ERROR] Command failed (exit $rc): $*" >&2
+      fi
+      if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+        _FAIL_COUNT=$((_FAIL_COUNT + 1))
+      else
+        FAIL_COUNT=${FAIL_COUNT:-0}
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+      fi
+      if declare -F _log_error >/dev/null 2>&1; then
+        _log_error "$rc" "$*"
+      fi
+      if [ "${STRICT_RUN:-0}" = "1" ]; then
+        return $rc
+      fi
+      return 0
+    fi
+    return 0
+  }
   TMP_DIR="$(mktemp -d)"
   _TMP_FILES=()
   # Debug log location. Override with NEOHIRO_DEBUG_LOG=path. /var/log may
@@ -415,11 +452,50 @@ if [ "${QUIET_PROMPTS:-0}" = "1" ]; then AUTO_MODE=1; fi
 _FAIL_COUNT=0
 
 # Source the shared runner helpers. _runner_cmd is the canonical implementation;
-# alias it to `run` so all existing call sites are satisfied.
-  # shellcheck disable=SC1091
-  if [ -n "${_NEOHIRO_LIB_DIR:-}" ] && [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
-    source "$_NEOHIRO_LIB_DIR/runner.sh"
-    run() { _runner_cmd "$@"; }
+  # alias it to `run` so all existing call sites are satisfied.
+    # shellcheck disable=SC1091
+    if [ -n "${_NEOHIRO_LIB_DIR:-}" ] && [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
+      source "$_NEOHIRO_LIB_DIR/runner.sh"
+      run() { _runner_cmd "$@"; }
+    fi
+  # Fallback: if run() is still not defined (lib dir missing or runner.sh unreadable),
+  # provide an inline implementation matching lib/runner.sh behavior.
+  if ! declare -F run >/dev/null 2>&1; then
+    run() {
+      if [ "${DRY_RUN:-0}" = "1" ]; then
+        printf '  %s\n' "DRY: $*"
+        return 0
+      fi
+      if [ "${VERBOSE:-0}" -ge 2 ]; then
+        printf '  %s\n' "RUN: $*"
+      fi
+      if [ "${RUNNER_ECHO:-1}" = "1" ] && declare -F msg >/dev/null 2>&1; then
+        msg "$*"
+      fi
+      "$@"
+      local rc=$?
+      if [ $rc -ne 0 ]; then
+        if declare -F warn >/dev/null 2>&1; then
+          warn "Command failed (exit $rc): $*"
+        else
+          printf '%s\n' "[ERROR] Command failed (exit $rc): $*" >&2
+        fi
+        if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+          _FAIL_COUNT=$((_FAIL_COUNT + 1))
+        else
+          FAIL_COUNT=${FAIL_COUNT:-0}
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+        if declare -F _log_error >/dev/null 2>&1; then
+          _log_error "$rc" "$*"
+        fi
+        if [ "${STRICT_RUN:-0}" = "1" ]; then
+          return $rc
+        fi
+        return 0
+      fi
+      return 0
+    }
   fi
 
 # Offer a Retry / Skip / Abort choice after a step failure.
