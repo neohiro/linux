@@ -115,6 +115,21 @@ assert_out() {
 # Expected bytes when _c emits green (fixed-format via printf)
 ANSI_GREEN_SAMPLE=$'\033[1;32msample\033[0m'
 
+# --- TEMP DIAGNOSTIC (remove) ---
+if [ "${NEOHIRO_DIAG:-}" = "1" ]; then
+  make_tput 256
+  export PATH="$WD:/usr/bin:/bin"
+  export FORCE_TTY=1
+  echo "DIAG PATH=$PATH"
+  echo "DIAG tput-resolves-to=$(command -v tput)"
+  echo "DIAG tput-colors=$(tput colors 2>&1)"
+  echo "DIAG gate-direct=$(_apply_color_gate 2>&1)"
+  . "$LIB"
+  echo "DIAG USE_COLOR=$USE_COLOR"
+  echo "DIAG TERM=[${TERM:-<unset>}] NO_COLOR=[${NO_COLOR:-<unset>}] FORCE_TTY=[${FORCE_TTY:-<unset>}]"
+  exit 0
+fi
+
 # --- Closed-gate tests (USE_COLOR=0) ---
 # All of these should hold regardless of TTY state.
 
