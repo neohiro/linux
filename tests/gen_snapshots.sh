@@ -26,11 +26,27 @@ sed -n "${_STRICT_LINE},${_RUN_END}p" "$SRC" > "$WD/helpers.sh"
 sed -n "${_MAINT_START},${_MAINT_END}p" "$SRC" >> "$WD/helpers.sh"
 . "$WD/helpers.sh"
 
+# Normalize host-specific fields before committing. print_welcome embeds the
+# real hostname, OS, kernel and user; committing those leaks machine identity
+# and makes the snapshot non-portable. Mirrors _normalize_output() in
+# tests/test_linuxinstall.sh.
+normalize_snapshot() {
+  awk '
+    /^  Host:[[:space:]]/     { sub(/Host:[[:space:]]+.*/,       "Host:          <HOST>");     print; next }
+    /^  OS:[[:space:]]/       { sub(/OS:[[:space:]]+.*/,         "OS:            <OS>");       print; next }
+    /^  Kernel:[[:space:]]/   { sub(/Kernel:[[:space:]]+.*/,     "Kernel:        <KERNEL>");   print; next }
+    /^  Arch:[[:space:]]/     { sub(/Arch:[[:space:]]+.*/,       "Arch:          <ARCH>");     print; next }
+    /^  Run as:[[:space:]]/   { sub(/Run as:[[:space:]]+.*/,       "Run as:        <USER>");     print; next }
+    /^[[:space:]]*Disk freed \(approximate\)/ { sub(/\(approximate\)[[:space:]]+.*/, "(approximate) <DISK>"); print; next }
+    { print }
+  '
+}
+
 # Snapshot: print_welcome (non-root, REPLY_PROFILE=2)
 REPLY_PROFILE=2; QUICK_MODE=0; USE_REMOTE_SSH="no"; ENV_TYPE="server"
 _USER_SAVED="${USER:-}"; USER="${USER:-testuser}"
 _profile_label() { echo "Standard"; }
-print_welcome > "$WD/print_welcome_snapshot.txt"
+print_welcome | normalize_snapshot > "$WD/print_welcome_snapshot.txt"
 if [ -n "$_USER_SAVED" ]; then USER="$_USER_SAVED"; else unset USER; fi
 
 # Snapshot: print_metrics_summary (non-root, METRICS_START_DISK_KB=0)
@@ -45,7 +61,7 @@ if [ -n "$_USER_SAVED" ]; then USER="$_USER_SAVED"; else unset USER; fi
   USE_REMOTE_SSH="no"; ENV_TYPE="server"
   ROLLBACK_LOG="/tmp/rollback-test.log"
   _metrics_bar() { printf '  %-28s %s\n' "  $1" "[████████░░░░]"; }
-  print_metrics_summary > "$WD/print_metrics_summary_snapshot.txt"
+  print_metrics_summary | normalize_snapshot > "$WD/print_metrics_summary_snapshot.txt"
 
 # Print where the files are and diff them against current
 echo "Snapshot fixtures generated in $WD"

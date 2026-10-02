@@ -1561,7 +1561,8 @@ ask_profile() {
       3) _profile_desc='Full (server, SSH hardened)' ;;
       *) _profile_desc='Unknown' ;;
     esac
-    local _label="$(_profile_label)"
+    local _label
+    _label="$(_profile_label)"
     local _final="  Final profile: ${_label} — ${_profile_desc}"
     printf '  %s\n' "$(_c '1;32m' "${_final}")"
     printf '\n'
