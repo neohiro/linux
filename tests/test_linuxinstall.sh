@@ -395,9 +395,9 @@ fi
 
 # show_progress: must run and emit at least one bar char.
 if declare -F show_progress >/dev/null 2>&1; then
-  CHECKLIST[tmux_wrap]="done"
-  CHECKLIST[env_detect]="running"
-  CHECKLIST[system_update]="skip"
+  CHECKLIST["tmux_wrap"]="done"
+  CHECKLIST["env_detect"]="running"
+  CHECKLIST["system_update"]="skip"
   _out=$(show_progress 2>&1)
   rc=$?
   if [ "$rc" -eq 0 ] && [ -n "$_out" ]; then
