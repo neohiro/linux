@@ -109,7 +109,9 @@ EOF
 # shellcheck disable=SC2218  # make_tput defined immediately above; SC2218 false-positive inside conditional context
 make_tput
 # $WD must be on PATH or the driver uses the host tput instead of the stub.
-out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=0 PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
+# TERM is pinned because GitHub runners export TERM=dumb for non-interactive
+# steps, and the gate closes on that before it ever consults tput.
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=0 TERM=xterm-256color PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   ok_t "T3b: NO_COLOR=0 does NOT disable color (XDG fix)"
 else
@@ -147,7 +149,7 @@ EOF
   chmod +x "$WD/tput"
 }
 make_tput
-out="$("$BASH_BIN" -c 'export FORCE_TTY=1 PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 TERM=xterm-256color PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   ok_t "T5: FORCE_TTY+tput=256 opens gate and emits CSI"
 else
