@@ -32,7 +32,7 @@ trap 'rm -rf "$WD"' EXIT
 make_tput() {
   local mode="$1"
   cat > "$WD/tput" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 case "\$1" in
   colors) echo "$mode"; exit 0 ;;
   *) echo "" 1>&2; exit 1 ;;
@@ -60,12 +60,15 @@ run_gate() {
         *)            eval "export $kv" ;;  # SC2163: must use eval to set the named var
       esac
     done
+    # Must be exported: _apply_color_gate runs inside $( ), a subshell, and a
+    # subshell only inherits exported variables. A bare assignment here left the
+    # stub invisible to the gate, so it fell through to the host tput.
     if [ -x "$WD/tput" ]; then
-      PATH="$WD:/usr/bin:/bin"
+      export PATH="$WD:/usr/bin:/bin"
     else
       # Use only the test scratch dir; exclude all system tput paths.
       # On Git-Bash/Cygwin, /bin and /usr/bin both contain tput.
-      PATH="$WD"
+      export PATH="$WD"
     fi
     if [ "$mode" = "force-tty" ]; then
       export FORCE_TTY=1
@@ -220,7 +223,7 @@ fi
 
 res="$(
   make_tput 256
-  PATH="$WD:/usr/bin:/bin"
+  export PATH="$WD:/usr/bin:/bin"
   export FORCE_TTY=1
   # shellcheck disable=SC1090
   . "$LIB"; first=$USE_COLOR
@@ -257,7 +260,7 @@ fi
 
 # --- Defensive: tput emits garbage (non-numeric) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "garbage-output-not-a-number"
 exit 0
 EOF
@@ -268,7 +271,7 @@ assert_out     "tput-garbage emits plain text" "sample" "$out"
 
 # --- Defensive: tput emits negative number (broken terminfo) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "-1"
 exit 0
 EOF
@@ -279,7 +282,7 @@ assert_out     "tput=-1 emits plain text" "sample" "$out"
 
 # --- Defensive: tput reports +9 (leading-plus; some terminfo has this) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "+9"
 exit 0
 EOF
@@ -292,7 +295,7 @@ assert_use_color "tput=+9 (leading plus) -> USE_COLOR=0 (case guard)" 0 "$out"
 
 # --- Defensive: tput reports exactly 8 (threshold boundary) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "8"
 exit 0
 EOF
@@ -303,7 +306,7 @@ assert_out     "tput=8 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
 # --- Defensive: tput reports exactly 7 (just below threshold) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "7"
 exit 0
 EOF
@@ -313,7 +316,7 @@ assert_use_color "tput=7 (just below threshold) -> USE_COLOR=0" 0 "$out"
 
 # --- Defensive: tput reports 0x10 (hex, bash arithmetic would 0 it) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "0x10"
 exit 0
 EOF
@@ -323,7 +326,7 @@ assert_use_color "tput=0x10 (hex notation) -> USE_COLOR=0 (case guard)" 0 "$out"
 
 # --- Defensive: tput reports very large number (bash arithmetic overflow) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "99999999999999999999"
 exit 0
 EOF
@@ -337,7 +340,7 @@ assert_use_color "tput=overflowing (huge number) -> USE_COLOR=0 (bash parse erro
 
 # --- Defensive: tput reports trailing whitespace (some terminfo does this) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "  256  "
 exit 0
 EOF
@@ -391,7 +394,7 @@ fi
 
 # --- Defensive: tput exits nonzero with empty output ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo ""
 exit 1
 EOF
@@ -402,7 +405,7 @@ assert_out     "tput-fail emits plain text" "sample" "$out"
 
 # --- Defensive: tput prints just a newline (whitespace only) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo ""
 exit 0
 EOF

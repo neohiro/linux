@@ -27,7 +27,7 @@ trap 'rm -rf "$WD"' EXIT
 # logic from linuxinstall.sh (lines 42-67). The gate runs at top-level
 # inside a subshell that pretends stdout is NOT a TTY.
 cat > "$WD/driver.sh" <<'DRIVER'
-#!/usr/bin/env bash
+#!/bin/bash
 # Simulate the inline color gate from linuxinstall.sh (lines 42-67).
 # This runs at top-level in a subshell where -t 1 is always false.
 USE_COLOR=1
@@ -101,14 +101,15 @@ fi
 # Force color on via NEOHIRO_COLOR=1 in the driver, but also set NO_COLOR=0.
 make_tput() {
   cat > "$WD/tput" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 echo "256"
 EOF
   chmod +x "$WD/tput"
 }
 # shellcheck disable=SC2218  # make_tput defined immediately above; SC2218 false-positive inside conditional context
 make_tput
-out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=0; '"$WD/driver.sh" 2>&1)"
+# $WD must be on PATH or the driver uses the host tput instead of the stub.
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=0 PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   ok_t "T3b: NO_COLOR=0 does NOT disable color (XDG fix)"
 else
@@ -140,7 +141,7 @@ fi
 # === Test 5: FORCE_TTY=1 with tput=256 opens gate ===
 make_tput() {
   cat > "$WD/tput" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 echo "256"
 EOF
   chmod +x "$WD/tput"
