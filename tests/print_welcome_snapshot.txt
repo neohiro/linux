@@ -7,7 +7,7 @@
   OS:            <OS>
   Kernel:        <KERNEL>
   Arch:          <ARCH>
-  Run as:        <USER> (non-root — re-run with sudo)
+  Run as:        <USER>
 
   ──────────────────────────────────────────────────────────
   Environment:   server

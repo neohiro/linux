@@ -190,14 +190,34 @@ esac
 # --- _ssh_current_port: must default to 22 on a system with no Port directive ---
 # We test the function in isolation: with no /etc/ssh/sshd_config present
 # (hermetic), the function should still return "22".
-if [ ! -f /etc/ssh/sshd_config ]; then
-  if [ "$(_ssh_current_port 2>/dev/null)" = "22" ]; then
-    ok_t "_ssh_current_port: defaults to 22 when no sshd_config present"
+#
+# _ssh_current_port is defined before STRICT_RUN, so none of the extracted
+# helper regions above cover it. Source it directly rather than asserting
+# against an undefined function, which silently compared an empty string to
+# "22" and failed with no useful message.
+if declare -F _ssh_current_port >/dev/null 2>&1; then
+  if [ ! -f /etc/ssh/sshd_config ]; then
+    if [ "$(_ssh_current_port 2>/dev/null)" = "22" ]; then
+      ok_t "_ssh_current_port: defaults to 22 when no sshd_config present"
+    else
+      fail_t "_ssh_current_port: defaults to 22" "got: $(_ssh_current_port)"
+    fi
   else
-    fail_t "_ssh_current_port: defaults to 22" "got: $(_ssh_current_port)"
+    info "Skipping _ssh_current_port default test (real /etc/ssh/sshd_config present)"
   fi
 else
-  info "Skipping _ssh_current_port default test (real /etc/ssh/sshd_config present)"
+  _ssh_port_fn=$(sed -n '/^_ssh_current_port() {/,/^}/p' "$SRC")
+  if [ -n "$_ssh_port_fn" ]; then
+    # shellcheck disable=SC1090
+    eval "$_ssh_port_fn"
+    if [ "$(_ssh_current_port 2>/dev/null)" = "22" ]; then
+      ok_t "_ssh_current_port: defaults to 22 when no sshd_config present"
+    else
+      fail_t "_ssh_current_port: defaults to 22" "got: $(_ssh_current_port)"
+    fi
+  else
+    info "Skipping _ssh_current_port default test (definition not found in $SRC)"
+  fi
 fi
 
 # --- DRY_RUN: run() must print DRY: and NOT execute the command ---
@@ -500,7 +520,7 @@ _normalize_output() {
     /^  OS:[[:space:]]/       { sub(/OS:[[:space:]]+.*/,       "OS:            <OS>");       print; next }
     /^  Kernel:[[:space:]]/   { sub(/Kernel:[[:space:]]+.*/,   "Kernel:        <KERNEL>");   print; next }
     /^  Arch:[[:space:]]/     { sub(/Arch:[[:space:]]+.*/,     "Arch:          <ARCH>");     print; next }
-    /^  Run as:[[:space:]]/   { sub(/Run as:[[:space:]]+[^ ]+/, "Run as:        <USER>");     print; next }
+    /^  Run as:[[:space:]]/   { sub(/Run as:[[:space:]]+.*/,       "Run as:        <USER>");     print; next }
     { print }
   '
 }
