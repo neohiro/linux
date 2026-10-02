@@ -310,7 +310,7 @@ echo "8"
 exit 0
 EOF
 chmod +x "$WD/tput"
-out="$(PATH="$WD:/usr/bin:/bin" FORCE_TTY=1 . "$LIB" && printf 'USE_COLOR=%s\nOUT=' "$USE_COLOR" && _c '1;32m' 'sample' && printf '\n')"
+out="$(PATH="$WD:/usr/bin:/bin" FORCE_TTY=1 TERM=xterm-256color . "$LIB" && printf 'USE_COLOR=%s\nOUT=' "$USE_COLOR" && _c '1;32m' 'sample' && printf '\n')"
 assert_use_color "tput=8 (threshold boundary) -> USE_COLOR=1" 1 "$out"
 assert_out     "tput=8 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
