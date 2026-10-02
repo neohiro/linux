@@ -116,19 +116,17 @@ assert_out() {
 ANSI_GREEN_SAMPLE=$'\033[1;32msample\033[0m'
 
 # --- TEMP DIAGNOSTIC (remove) ---
-if [ "${NEOHIRO_DIAG:-}" = "1" ]; then
-  make_tput 256
-  export PATH="$WD:/usr/bin:/bin"
-  export FORCE_TTY=1
-  echo "DIAG PATH=$PATH"
-  echo "DIAG tput-resolves-to=$(command -v tput)"
-  echo "DIAG tput-colors=$(tput colors 2>&1)"
-  echo "DIAG gate-direct=$(_apply_color_gate 2>&1)"
-  . "$LIB"
-  echo "DIAG USE_COLOR=$USE_COLOR"
-  echo "DIAG TERM=[${TERM:-<unset>}] NO_COLOR=[${NO_COLOR:-<unset>}] FORCE_TTY=[${FORCE_TTY:-<unset>}]"
-  exit 0
-fi
+make_tput 256
+export PATH="$WD:/usr/bin:/bin"
+export FORCE_TTY=1
+unset NO_COLOR 2>/dev/null || true
+printf 'DIAG which-tput=%s\n' "$(command -v tput 2>&1)"
+printf 'DIAG tput-colors=%s\n' "$(tput colors 2>&1)"
+printf 'DIAG gate-direct=%s\n' "$(_apply_color_gate 2>&1)"
+printf 'DIAG TERM=[%s] NO_COLOR=[%s]\n' "${TERM:-<unset>}" "${NO_COLOR:-<unset>}"
+printf 'DIAG stub-contents=%s\n' "$(cat "$WD/tput" 2>&1 | tr '\n' '|')"
+. "$LIB"
+printf 'DIAG USE_COLOR=%s\n' "$USE_COLOR"
 
 # --- Closed-gate tests (USE_COLOR=0) ---
 # All of these should hold regardless of TTY state.
