@@ -24,7 +24,7 @@
       Rollback entries logged  [████████░░░░]
 
   STORAGE
-    Disk freed (approximate)   <DISK>
+    Disk freed (approximate) <DISK>
 
   [!] Rollback log: /tmp/rollback-test.log
     Format: original_path<TAB>backup_path

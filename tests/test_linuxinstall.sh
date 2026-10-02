@@ -521,7 +521,7 @@ _normalize_output() {
     /^  Kernel:[[:space:]]/   { sub(/Kernel:[[:space:]]+.*/,   "Kernel:        <KERNEL>");   print; next }
     /^  Arch:[[:space:]]/     { sub(/Arch:[[:space:]]+.*/,     "Arch:          <ARCH>");     print; next }
     /^  Run as:[[:space:]]/   { sub(/Run as:[[:space:]]+.*/,       "Run as:        <USER>");     print; next }
-    /^[[:space:]]*Disk freed:/ { sub(/Disk freed:[[:space:]]+.*/, "Disk freed (approximate)  <DISK>"); print; next }
+    /^[[:space:]]*Disk freed \(approximate\)/ { sub(/\(approximate\)[[:space:]]+.*/, "(approximate) <DISK>"); print; next }
     { print }
   '
 }
