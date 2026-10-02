@@ -16,9 +16,9 @@ else C_RED=""; C_GRN=""; C_RST=""; fi
 ok_t()   { printf '  %s[OK]  %s%s\n'   "$C_GRN" "$1" "$C_RST"; PASS=$((PASS+1)); }
 fail_t() { printf '  %s[FAIL]%s %s\n    %s\n' "$C_RED" "$C_RST" "$1" "$2"; FAIL=$((FAIL+1)); }
 
-# BASH_BIN reserved for future use (e.g. running driver on a specific bash).
-# shellcheck disable=SC2034
-BASH_BIN="${BASH:-/usr/bin/bash}"
+# BASH_BIN: bash used to run the generated driver. Resolved at runtime rather
+# than hardcoded to /usr/bin/bash, which is absent on some runner images.
+BASH_BIN="${BASH:-$(command -v bash)}"
 
 WD="$(mktemp -d)"
 trap 'rm -rf "$WD"' EXIT
@@ -61,7 +61,7 @@ chmod +x "$WD/driver.sh"
 # === Test 1: Default run (no overrides, non-TTY) ===
 # -t 1 is false (Git Bash under PowerShell), so USE_COLOR=0.
 # Gate must close: plain text only, no stray "m" bytes.
-out="$(/usr/bin/bash "$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" "$WD/driver.sh" 2>&1)"
 # The user's bug: ESC sequences were stripped, leaving "m" as a standalone
 # character prefixing the text (e.g. "mProfile" instead of "[1mProfile").
 # This check strips all ESC sequences first, then looks for bare "m" that
@@ -81,7 +81,7 @@ else
 fi
 
 # === Test 2: NEOHIRO_COLOR=1 forces on (even without TTY) ===
-out="$(/usr/bin/bash -c 'export NEOHIRO_COLOR=1; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export NEOHIRO_COLOR=1; '"$WD/driver.sh" 2>&1)"
 # Must contain ANSI escapes (gate forced open)
 if ! printf '%s' "$out" | grep -q $'\033'; then
   fail_t "T2: NEOHIRO_COLOR=1 emits CSI (forced on)" "no CSI in: $out"
@@ -108,7 +108,7 @@ EOF
 }
 # shellcheck disable=SC2218  # make_tput defined immediately above; SC2218 false-positive inside conditional context
 make_tput
-out="$(/usr/bin/bash -c 'export FORCE_TTY=1 NO_COLOR=0; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=0; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   ok_t "T3b: NO_COLOR=0 does NOT disable color (XDG fix)"
 else
@@ -116,7 +116,7 @@ else
 fi
 
 # === Test 3: NO_COLOR=1 forces off ===
-out="$(/usr/bin/bash -c 'export NO_COLOR=1; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export NO_COLOR=1; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   fail_t "T3: NO_COLOR=1 suppresses CSI" "CSI leaked: $out"
 else
@@ -130,7 +130,7 @@ fi
 # (no bare-m check needed for T3 since no ANSI is emitted)
 
 # === Test 4: FORCE_TTY=1 bypasses -t 1 but NO_COLOR still wins ===
-out="$(/usr/bin/bash -c 'export FORCE_TTY=1 NO_COLOR=1; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 NO_COLOR=1; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   fail_t "T4: NO_COLOR wins over FORCE_TTY+tput" "CSI leaked: $out"
 else
@@ -146,7 +146,7 @@ EOF
   chmod +x "$WD/tput"
 }
 make_tput
-out="$(/usr/bin/bash -c 'export FORCE_TTY=1 PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
+out="$("$BASH_BIN" -c 'export FORCE_TTY=1 PATH="'"$WD"':/usr/bin:/bin"; '"$WD/driver.sh" 2>&1)"
 if printf '%s' "$out" | grep -q $'\033'; then
   ok_t "T5: FORCE_TTY+tput=256 opens gate and emits CSI"
 else

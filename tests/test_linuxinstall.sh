@@ -500,6 +500,7 @@ _normalize_output() {
     /^  OS:[[:space:]]/       { sub(/OS:[[:space:]]+.*/,       "OS:            <OS>");       print; next }
     /^  Kernel:[[:space:]]/   { sub(/Kernel:[[:space:]]+.*/,   "Kernel:        <KERNEL>");   print; next }
     /^  Arch:[[:space:]]/     { sub(/Arch:[[:space:]]+.*/,     "Arch:          <ARCH>");     print; next }
+    /^  Run as:[[:space:]]/   { sub(/Run as:[[:space:]]+[^ ]+/, "Run as:        <USER>");     print; next }
     { print }
   '
 }
