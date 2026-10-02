@@ -574,18 +574,20 @@ if declare -F print_metrics_summary >/dev/null 2>&1; then
   USE_REMOTE_SSH="no"; ENV_TYPE="server"
   ROLLBACK_LOG="/tmp/rollback-test.log"
   _metrics_bar() { printf '  %-28s %s\n' "  $1" "[████████░░░░]"; }
-  _summary_actual=$(print_metrics_summary 2>&1)
+  _summary_raw=$(print_metrics_summary 2>&1)
+  _summary_actual=$(_normalize_output "$_summary_raw")
   if [ -f "$ROOT/tests/print_metrics_summary_snapshot.txt" ]; then
-    _summary_expected=$(cat "$ROOT/tests/print_metrics_summary_snapshot.txt")
+    _summary_expected_raw=$(cat "$ROOT/tests/print_metrics_summary_snapshot.txt")
+    _summary_expected=$(_normalize_output "$_summary_expected_raw")
     if [ "$_summary_actual" = "$_summary_expected" ]; then
       ok_t "print_metrics_summary: snapshot match (print_metrics_summary_snapshot.txt)"
     else
       fail_t "print_metrics_summary: snapshot match" \
              "output diverged from fixture. Run: bash tests/gen_snapshots.sh
 --- expected ---
-$_summary_expected
+$_summary_expected_raw
 --- actual ---
-$_summary_actual"
+$_summary_raw"
     fi
   else
     fail_t "print_metrics_summary: snapshot file" "tests/print_metrics_summary_snapshot.txt missing"
