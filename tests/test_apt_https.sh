@@ -1717,9 +1717,11 @@ for pair in "PIP_INDEX_URL=http://pypi.internal/simple" \
   reset_sandbox
   VAR="${pair%%=*}"
   VAL="${pair#*=}"
-  SRC="$(env_src_id "$VAR")"
+  # NOT named SRC: that is the path to linuxinstall.sh and several later
+  # assertions grep it. Shadowing it here silently broke them.
+  ENV_SRC_ID="$(env_src_id "$VAR")"
   # shellcheck disable=SC2086
-  OUT="$(env "$VAR=$VAL" bash -c ". '$LIB' >/dev/null 2>&1; _apt_https_source_env $SRC" 2>/dev/null)"
+  OUT="$(env "$VAR=$VAL" bash -c ". '$LIB' >/dev/null 2>&1; _apt_https_source_env $ENV_SRC_ID" 2>/dev/null)"
   if printf '%s' "$OUT" | grep -q "$VAR=$VAL"; then
     ok_t "env transport detected: $VAR"
   else
@@ -1953,6 +1955,270 @@ if [ "$(_apt_https_backup_path '/etc/apt/sources.list')" = \
   ok_t "backup name is deterministic across calls"
 else
   fail_t "backup name is deterministic across calls" "name changed between calls"
+fi
+
+# ============================================================================
+# Degraded mode must be quiet, and must never claim an unverified result
+# ============================================================================
+# When lib/apt-https.sh cannot be loaded, a stub replaces the real guard.
+# That stub stands in for a hot-path helper called by every package entry
+# point, and apt_https_status_text returns empty for "found nothing" -- which
+# a caller could easily read as "already HTTPS-only".
+# Grep the resolver block directly rather than extracting it by line range:
+# the range endpoints move every time a guard is added.
+DEG_LATCH="$(grep -c '_APT_HTTPS_DEGRADED_WARNED=1' "$SRC" || true)"
+if [ "${DEG_LATCH:-0}" -ge 1 ]; then
+  ok_t "degraded warning is latched to once per process"
+else
+  fail_t "degraded warning is latched to once per process" \
+        "no latch: every pkg_* call would reprint the warning"
+fi
+
+if grep -q 'apt_https_available()  { return 1; }' "$SRC"; then
+  ok_t "degraded mode reports itself as unavailable"
+else
+  fail_t "degraded mode reports itself as unavailable" \
+        "callers cannot tell a stub from the real guard"
+fi
+
+# The real library must claim availability.
+if grep -qE '^apt_https_available\(\) \{' "$LIB" && \
+   awk '/^apt_https_available\(\) \{/,/^\}/' "$LIB" | grep -q 'return 0'; then
+  ok_t "the real library reports itself available"
+else
+  fail_t "the real library reports itself available" "apt_https_available missing/!=0"
+fi
+
+# The caller that infers "already secure" must consult it.
+if grep -q 'if ! apt_https_available 2>/dev/null; then' "$SRC"; then
+  ok_t "_auto_skip_if_done refuses to skip when the guard is unavailable"
+else
+  fail_t "_auto_skip_if_done refuses to skip when the guard is unavailable" \
+        "would print 'already HTTPS-only' for a guard that never ran"
+fi
+
+# Behavioural: with the stub in place, the skip decision must be "run", and
+# the step must never report that sources are already HTTPS-only.
+cat > "$WD/degraded_probe.sh" <<'DEGEOF'
+set -u
+info() { printf 'INFO:%s\n' "$*"; }
+warn() { printf 'WARN:%s\n' "$*"; }
+ok()   { printf 'OK:%s\n' "$*"; }
+msg()  { :; }
+_APT_HTTPS_DEGRADED_WARNED=""
+_apt_https_unavailable() {
+  [ -n "${_APT_HTTPS_DEGRADED_WARNED:-}" ] && return 0
+  _APT_HTTPS_DEGRADED_WARNED=1
+  printf 'WARN:transport guard is INACTIVE\n' >&2
+  return 0
+}
+apt_https_guard()      { _apt_https_unavailable; return 0; }
+apt_https_enforce()    { _apt_https_unavailable; return 0; }
+apt_https_report()     { _apt_https_unavailable; return 0; }
+apt_https_revert()     { _apt_https_unavailable; return 0; }
+apt_https_status_text(){ return 0; }
+apt_https_available()  { return 1; }
+for i in 1 2 3 4 5; do apt_https_guard "pkg_$i"; done 2>&1 >/dev/null | grep -c 'INACTIVE'
+apt_https_guard "pkg_6" 2>&1 >/dev/null | grep -c 'INACTIVE'
+DEGEOF
+DEG_OUT="$(bash "$WD/degraded_probe.sh" 2>/dev/null)"
+DEG_TOTAL="$(printf '%s\n' "$DEG_OUT" | grep -c '1' || true)"
+if printf '%s\n' "$DEG_OUT" | grep -qx '1'; then
+  ok_t "six degraded guard calls emit exactly one warning"
+else
+  fail_t "six degraded guard calls emit exactly one warning" \
+        "warning lines per call: $(printf '%s' "$DEG_OUT" | tr '\n' '/')"
+fi
+
+# ============================================================================
+# Backups must be written atomically too
+# ============================================================================
+BK_BODY="$(awk '/^_apt_https_backup_once\(\) \{/,/^\}/' "$LIB")"
+if printf '%s' "$BK_BODY" | grep -q 'partial\.\$\$' && \
+   printf '%s' "$BK_BODY" | grep -q 'mv -f "\$stage" "\$dst"'; then
+  ok_t "backup is staged and renamed, never cp-into-place"
+else
+  fail_t "backup is staged and renamed, never cp-into-place" \
+        "a dead cp would leave a truncated .orig"
+fi
+
+# Behavioural: after a rewrite no .partial residue may remain.
+reset_sandbox
+printf 'deb http://partial.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+_APT_HTTPS_DONE=""
+apt_https_enforce "partial" >/dev/null 2>&1
+if find "$BACKUPS" -name '*.partial.*' 2>/dev/null | grep -q .; then
+  fail_t "no .partial residue after a rewrite" \
+        "found: $(find "$BACKUPS" -name '*.partial.*' | tr '\n' ' ')"
+else
+  ok_t "no .partial residue after a rewrite"
+fi
+# The backup must still be complete and restorable.
+BAK="$(_apt_https_backup_path "$SANDBOX/apt/sources.list")"
+if [ -f "$BAK" ] && [ "$(grep -c 'http://partial.example.com' "$BAK")" = "1" ]; then
+  ok_t "backup left by the staged copy is complete"
+else
+  fail_t "backup left by the staged copy is complete" "backup missing or incomplete"
+fi
+
+# ============================================================================
+# Run continuity: an SSH drop must never be unrecoverable
+# ============================================================================
+# The whole point of the tmux wrapper is that the user can always get back to
+# a running install. Three ways that guarantee was broken:
+#   * the re-exec dropped every CLI argument, so the run silently changed
+#     behaviour after wrapping;
+#   * `tmux new-session -A` attached to a leftover session instead of starting
+#     this run, dropping the user into an old, differently-flagged one;
+#   * the recovery command was never printed, and `exec` meant nothing after
+#     the wrap could print it.
+# These are asserted against the real function, driven with a fake tmux and a
+# captured exec, so they cannot regress on a wording change.
+TMUX_FN="$WD/ensure_tmux.sh"
+awk '/^ensure_tmux_if_ssh\(\) \{/,/^\}/' "$SRC" > "$TMUX_FN"
+if [ -s "$TMUX_FN" ]; then
+  ok_t "ensure_tmux_if_ssh extracted for continuity testing"
+else
+  fail_t "ensure_tmux_if_ssh extracted for continuity testing" "function body not found"
+fi
+
+cat > "$WD/tmux_drive.sh" <<'TMUXEOF'
+set -u
+SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22"
+unset TMUX STY 2>/dev/null || true
+ORIG_CWD="/work dir/with space"
+SCRIPT_PATH="/opt/neohiro/linuxinstall.sh"
+TMP_DIR="$WDDRV"
+RECOVERY_CMD="tmux attach -t linux-setup"
+ok()  { printf 'OK:%s\n' "$*"; }
+bold(){ printf 'BOLD:%s\n' "$*"; }
+info(){ printf 'INFO:%s\n' "$*"; }
+warn(){ printf 'WARN:%s\n' "$*"; }
+msg() { :; };  err() { printf 'ERR:%s\n' "$*"; }
+pkg_install() { :; }
+command() { builtin command "$@"; }
+tmux() {
+  case "${1:-}" in
+    has-session) [ "$EXISTING" = "yes" ] && return 0 || return 1 ;;
+  esac
+  printf 'TMUXCALL:%s\n' "$*"
+  return 0
+}
+exec() { printf 'EXECCMD:%s\n' "$*"; return 0; }
+. "$FNFILE"
+ensure_tmux_if_ssh "$@"
+TMUXEOF
+
+drive_tmux() {
+  # $1 = EXISTING (yes/no), rest = args
+  local existing="$1"; shift
+  mkdir -p "$WD/tmuxrun"
+  WDDRV="$WD/tmuxrun" FNFILE="$TMUX_FN" EXISTING="$existing" \
+    bash "$WD/tmux_drive.sh" "$@" 2>/dev/null
+}
+
+OUT_CLEAN="$(drive_tmux no --auto --step=firewall --dry-run)"
+if printf '%s' "$OUT_CLEAN" | grep -qF -- '--step=firewall' && \
+   printf '%s' "$OUT_CLEAN" | grep -qF -- '--dry-run' && \
+   printf '%s' "$OUT_CLEAN" | grep -qF -- '--auto'; then
+  ok_t "continuity: CLI arguments survive the tmux re-exec"
+else
+  fail_t "continuity: CLI arguments survive the tmux re-exec" \
+        "args lost: $(printf '%s' "$OUT_CLEAN" | tr '\n' ' ')"
+fi
+
+if printf '%s' "$OUT_CLEAN" | grep -qF 'new-session -s linux-setup'; then
+  ok_t "continuity: a clean host uses the documented session name"
+else
+  fail_t "continuity: a clean host uses the documented session name" \
+        "$(printf '%s' "$OUT_CLEAN" | grep EXECCMD | head -1)"
+fi
+
+if printf '%s' "$OUT_CLEAN" | grep -qF 'new-session -A'; then
+  fail_t "continuity: never uses -A (which would attach to a stale session)" \
+        "-A present"
+else
+  ok_t "continuity: never uses -A (which would attach to a stale session)"
+fi
+
+OUT_STALE="$(drive_tmux yes --auto)"
+if printf '%s' "$OUT_STALE" | grep -qF 'new-session -s linux-setup-'; then
+  ok_t "continuity: a stale session forces a distinct name, no hijack"
+else
+  fail_t "continuity: a stale session forces a distinct name, no hijack" \
+        "$(printf '%s' "$OUT_STALE" | grep EXECCMD | head -1)"
+fi
+if printf '%s' "$OUT_STALE" | grep -qF 'already exists'; then
+  ok_t "continuity: the stale session is reported, not silently reused"
+else
+  fail_t "continuity: the stale session is reported, not silently reused" "silent"
+fi
+
+# The recovery command must name the session THIS run uses.
+REC="$(printf '%s' "$OUT_STALE" | grep -F 'tmux attach -t' | head -1)"
+SESS="$(printf '%s' "$OUT_STALE" | grep -oE 'new-session -s [^ ]+' | head -1 | awk '{print $3}')"
+if [ -n "$REC" ] && [ -n "$SESS" ] && printf '%s' "$REC" | grep -qF "$SESS"; then
+  ok_t "continuity: the printed recovery command matches the session actually created"
+else
+  fail_t "continuity: the printed recovery command matches the session actually created" \
+        "printed='$REC' session='$SESS'"
+fi
+
+# Metacharacters must be escaped, or tmux's shell would re-interpret them.
+OUT_META="$(drive_tmux no --note='a b; rm -rf /')"
+if printf '%s' "$OUT_META" | grep -qF 'a\ b\;\ rm\ -rf'; then
+  ok_t "continuity: arguments with spaces and metacharacters are %q-escaped"
+else
+  fail_t "continuity: arguments with spaces and metacharacters are %q-escaped" \
+        "$(printf '%s' "$OUT_META" | grep EXECCMD | head -1)"
+fi
+
+# A run with no arguments must not inject an empty one.
+OUT_NOARG="$(drive_tmux no)"
+if printf '%s' "$OUT_NOARG" | grep -qF "''"; then
+  fail_t "continuity: no spurious empty argument when invoked bare" "empty arg emitted"
+else
+  ok_t "continuity: no spurious empty argument when invoked bare"
+fi
+
+# The inner wrapper must tear the session down on success, or the next run
+# inherits a stale session -- which is the hijack scenario above.
+if printf '%s' "$OUT_CLEAN" | grep -qF 'neohiro-tmux-inner'; then
+  ok_t "continuity: the tmux wrapper stages an inner reaper script"
+else
+  fail_t "continuity: the tmux wrapper stages an inner reaper script" "no inner script"
+fi
+INNER_PATH="$(printf '%s' "$OUT_CLEAN" | grep -oE 'bash [^ ]*neohiro-tmux-inner[^ ]*' | head -1 | awk '{print $2}')"
+if [ -n "$INNER_PATH" ] && [ -f "$INNER_PATH" ]; then
+  if grep -q 'kill-session' "$INNER_PATH" && grep -q 'NEOHIRO_TMUX_SESSION' "$INNER_PATH"; then
+    ok_t "continuity: the reaper kills the session on clean exit"
+  else
+    fail_t "continuity: the reaper kills the session on clean exit" "no kill-session in inner script"
+  fi
+else
+  fail_t "continuity: the reaper kills the session on clean exit" \
+        "inner script not found at '$INNER_PATH'"
+fi
+
+# Script hopping: the subscript path must warn when it cannot protect the hop,
+# and must emit a heartbeat so a long step does not look frozen.
+HOP="$(awk '/^run_remote_script\(\) \{/,/^\}/' "$SRC")"
+if printf '%s' "$HOP" | grep -q 'CANNOT be recovered'; then
+  ok_t "continuity: script hop warns when there is no tmux to protect it"
+else
+  fail_t "continuity: script hop warns when there is no tmux to protect it" \
+        "silent unprotected hop"
+fi
+if printf '%s' "$HOP" | grep -q 'still running in tmux session'; then
+  ok_t "continuity: script hop emits a heartbeat while waiting"
+else
+  fail_t "continuity: script hop emits a heartbeat while waiting" \
+        "no heartbeat: a long step looks frozen and invites an orphaning Ctrl-C"
+fi
+if printf '%s' "$HOP" | grep -q 'Ctrl-b then d'; then
+  ok_t "continuity: script hop explains how to detach without stopping it"
+else
+  fail_t "continuity: script hop explains how to detach without stopping it" "no hint"
 fi
 
 # ============================================================================

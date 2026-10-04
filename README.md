@@ -53,6 +53,7 @@ the package name right per distro. This script:
 | Fail2ban, sysctl profile, AppArmor/SELinux check | per-distro package names |
 | Tor, dnscrypt-proxy, unattended-upgrades, DeepClean | optional per profile |
 | **HTTPS-only package transport** | enforced before every `apt`/`dnf`/`yum`/`zypper`/`pacman`/`apk`/`pip`/`npm`/… download — `--apt-https` |
+| **Disconnect-safe** | SSH runs auto-wrap in tmux; subscripts get their own session; the reattach command is always printed |
 | **Rollback log** | `/var/log/linux-install-rollback.log` — `original\tbackup` per file |
 | **SSH self-heal** | `--install-self-heal` — systemd timer or cron, every 60s |
 | **21-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
@@ -401,6 +402,35 @@ one-liner from a local terminal (not over SSH), the tmux wrap is skipped
 automatically and there's nothing to re-attach to. When the script
 finishes successfully, the tmux session closes itself; if it fails, the
 session is left intact for inspection.
+
+### You can always get back to a running install
+
+This is the property that matters when something scary happens mid-run, so
+it is enforced rather than hoped for:
+
+- **The reattach command is printed before the wrap, not after.** The script
+  `exec`s into tmux, so anything printed afterwards would never be seen. You
+  get the exact command — including a PID-suffixed name if the standard one
+  is taken — on screen at the moment you need it.
+- **A leftover session is never hijacked.** If a `linux-setup` session
+  already exists (a previous run that did not exit cleanly), the script says
+  so and starts `linux-setup-<pid>` instead. You are never silently dropped
+  into an old, differently-flagged run while yours never starts.
+- **Your flags survive the wrap.** The re-exec carries `--auto`, `--step`,
+  `--dry-run` and friends through, shell-quoted, so wrapping cannot change
+  what the run does.
+- **Sessions are reaped on success.** A clean exit tears the session down, so
+  the next run starts clean. A failed run leaves it alive — that is your
+  inspection point.
+- **Script hops get their own session.** `DeepClean.sh` /
+  `OptimizeLinuxASR.sh` run in a dedicated `neohiro-sub-<name>-<pid>` tmux
+  session with the reattach command printed, plus a heartbeat every 30s so a
+  long step does not look frozen (a frozen screen invites a Ctrl-C that
+  orphans the work). If there is no tmux to protect the hop, the script says
+  plainly that the step cannot be recovered.
+
+`tmux ls` lists sessions; `tmux attach -t <name>` reattaches; `Ctrl-b` then
+`d` detaches without stopping anything.
 
 ## Reconnecting after a reboot or lockout
 
@@ -761,7 +791,7 @@ dumps — add to `/etc/security/limits.conf`:
 ```bash
 bash tests/run-all.sh                  # every suite, with a summary
 bash tests/test_linuxinstall.sh        # 67 tests: parse, logic, UX coverage, snapshot
-bash tests/test_apt_https.sh           # 253 tests: transport guard + encoding hygiene
+bash tests/test_apt_https.sh           # 275 tests: transport guard, run continuity, encoding
 bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```

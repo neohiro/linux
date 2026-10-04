@@ -276,7 +276,13 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
   fi
 
   if ! declare -F apt_https_guard >/dev/null 2>&1; then
+    # Latch the warning to once per process. This stub stands in for a hot-path
+    # helper called by every pkg_* / update_* entry point, so without a latch
+    # a single run printed the same four lines a dozen times and buried the
+    # actual installer output.
     _apt_https_unavailable() {
+      [ -n "${_APT_HTTPS_DEGRADED_WARNED:-}" ] && return 0
+      _APT_HTTPS_DEGRADED_WARNED=1
       printf '%s\n' "[WARNING] lib/apt-https.sh could not be loaded, so the repository" >&2
       printf '%s\n' "[WARNING] transport guard is INACTIVE for this run: packages may" >&2
       printf '%s\n' "[WARNING] still be fetched over plaintext HTTP. Run from a clone of" >&2
@@ -290,6 +296,9 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
     apt_https_status_text(){ return 0; }
     apt_https_backup_dir() { printf '%s' "${NEOHIRO_APT_BACKUP_DIR:-/var/backups/neohiro-apt-https}"; }
     apt_https_conf_file()  { printf '%s' "${NEOHIRO_APT_ETC_DIR:-/etc}/apt/apt.conf.d/99neohiro-force-https"; }
+    # Reported so no caller can mistake "the guard found nothing" for
+    # "the guard checked and the repos are fine". See _auto_skip_if_done.
+    apt_https_available()  { return 1; }
   fi
   unset _apt_https_resolved _apt_https_dir _ah_cand 2>/dev/null || true
 fi
@@ -485,6 +494,24 @@ print_recovery_if_ssh() {
   print_recovery_cmd
 }
 
+# Wrap an SSH run in a tmux session so a dropped socket cannot abort it.
+#
+# Three things this must get right, each of which was a bug:
+#
+#   1. Arguments must survive the re-exec. `bash "$SCRIPT_PATH"` with no
+#      "$@" silently dropped --auto / --step / --dry-run, so the run behaved
+#      differently after wrapping than the user asked for.
+#   2. A stale session must never be hijacked. `tmux new-session -A` attaches
+#      to an existing session if one exists, which means the new run never
+#      starts and the user is dropped into someone else's (possibly older,
+#      differently-flagged) run with no way back to theirs. A leftover
+#      session from a previous run is exactly how this happens, so the
+#      session is torn down on clean exit and a name collision falls back to
+#      a PID-suffixed name instead of attaching.
+#   3. The recovery command must be on screen BEFORE exec, because exec
+#      replaces this process and nothing after it can print. If the user
+#      detaches or the socket drops, "tmux attach -t <name>" is the only way
+#      back and they must not have to remember it.
 ensure_tmux_if_ssh() {
   [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] || return 0
   [ -z "${TMUX:-}" ] && [ -z "${STY:-}" ] || return 0
@@ -494,28 +521,63 @@ ensure_tmux_if_ssh() {
     fi
   fi
   command -v tmux >/dev/null 2>&1 || {
-    warn "tmux unavailable; SSH disconnect may kill the run. ${RECOVERY_CMD} will NOT exist - run the script from a local terminal instead."
+    warn "tmux unavailable; an SSH disconnect WILL kill this run and there is no way to reattach."
+    warn "Recovery: ${RECOVERY_CMD} will NOT exist -- run the script from a local terminal instead."
     return 0
   }
   [ -n "$SCRIPT_PATH" ] || { warn "SCRIPT_PATH is empty; cannot re-exec inside tmux."; return 0; }
-  bold "SSH session detected. Wrapping this run in a tmux session so disconnects do not abort it."
-  # Quote everything via env+args (no string interpolation) so paths with spaces
-  # or shell metacharacters survive. The inner bash re-execs the same script
-  # by absolute path; on clean exit it tears the tmux session down.
-  local inner
-  inner=$(cat <<'INNER_EOF'
-trap 'tmux kill-session -t linux-setup 2>/dev/null' EXIT
-cd "$1" && shift
-bash "$1" "$@"
+
+  # Never attach to a pre-existing session: pick a free name instead.
+  local _sess="linux-setup"
+  if tmux has-session -t "$_sess" 2>/dev/null; then
+    warn "A tmux session named '$_sess' already exists (a previous run that did not exit cleanly)."
+    warn "Starting this run as '$_sess-$$' instead so it is never mixed up with the old one."
+    _sess="linux-setup-$$"
+  fi
+
+  bold "SSH session detected. Wrapping this run in tmux so disconnects do not abort it."
+  # Shell-quote every argument so paths with spaces or metacharacters survive.
+  # printf '%q ' with zero arguments emits nothing, so a flagless run stays clean.
+  local _args="" _a
+  for _a in "$@"; do _args="$_args$(printf ' %q' "$_a")"; done
+
+  # Print the recovery command BEFORE exec: after exec nothing in this process
+  # can print, and this is the only moment the user is guaranteed to see it.
+  printf '\n'
+  ok "This run is now inside tmux. If you detach or lose the SSH socket, resume with:"
+  bold "  tmux attach -t $_sess"
+  printf '  (detach without stopping: Ctrl-b then d.  list sessions: tmux ls)\n\n'
+
+  # Inner wrapper: tears the session down on a clean exit so the next run is
+  # not poisoned by a leftover session. On failure the session is deliberately
+  # left alive -- that is the recovery path.
+  # Argument order: <session> <cwd> <script> [original args...]
+  local _inner
+  _inner="$(cat <<'INNER_EOF'
+NEOHIRO_TMUX_SESSION="$1"; shift
+trap 'tmux kill-session -t "$NEOHIRO_TMUX_SESSION" 2>/dev/null' EXIT
+cd "$1" || exit 1
+shift
+bash "$@"
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  tmux kill-session -t linux-setup 2>/dev/null
+  tmux kill-session -t "$NEOHIRO_TMUX_SESSION" 2>/dev/null
 fi
 exit "$rc"
 INNER_EOF
-)
-  exec tmux new-session -A -s linux-setup -n setup \
-    "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
+)"
+  local _inner_file="${TMP_DIR:-/tmp}/neohiro-tmux-inner.$$.sh"
+  mkdir -p "$(dirname "$_inner_file")" 2>/dev/null || true
+  if ! printf '%s\n' "$_inner" > "$_inner_file" 2>/dev/null; then
+    warn "Could not stage the tmux inner wrapper; running directly."
+    return 0
+  fi
+
+  # exec: the user ends up living inside tmux, which is the whole point.
+  # Every piece is printf %q-quoted so spaces and metacharacters survive.
+  local _cmd
+  _cmd="bash $(printf '%q' "$_inner_file") $(printf '%q' "$_sess") $(printf '%q' "$ORIG_CWD") $(printf '%q' "$SCRIPT_PATH")${_args}"
+  exec tmux new-session -s "$_sess" -n setup "cd $(printf '%q' "$ORIG_CWD") && $_cmd"
 }
 
 # bold/warn/err/ok/info/msg/_c are provided by lib/color.sh (sourced above).
@@ -852,24 +914,40 @@ run_remote_script() {
     local _tmux_sess="neohiro-sub-$name-$$"
     info "SSH session detected: wrapping $name in tmux ('$_tmux_sess') so disconnects don't kill it."
     info "Reattach anytime:  tmux attach -t $_tmux_sess"
-    # `tmux new-session -d` starts detached. We then `wait-for` it so the
-    # current shell pauses until the subscript finishes — keeps the
-    # parent's progress bar / step sequencing intact.
+    info "(Ctrl-b then d to detach without stopping it)"
+    # `tmux new-session -d` starts detached. We then poll for it so the
+    # parent's progress bar / step sequencing stays intact.
     tmux new-session -d -s "$_tmux_sess" "cd $(printf '%q' "$ORIG_CWD") && ${_env_prefix[*]:-} bash $(printf '%q' "$dst")"
     rc=$?
     if [ "$rc" -ne 0 ]; then
-      err "Could not start tmux for $name — running directly (may be killed by SSH drop)."
+      err "Could not start tmux for $name — running directly (an SSH drop WILL kill it)."
       "${_env_prefix[@]}" bash "$dst"; return $?
     fi
-    # Poll the tmux session until it ends. This avoids a long blocking
-    # wait and lets us show a one-line status every few seconds.
+    # Poll until the session ends. A heartbeat is printed every 30s: without
+    # one the screen looks frozen, which invites a Ctrl-C that kills this poll
+    # while the subscript keeps running detached -- the user is then staring
+    # at a stalled run with no indication of whether it is alive.
+    local _tick=0
     while tmux has-session -t "$_tmux_sess" 2>/dev/null; do
       sleep 5
+      _tick=$((_tick + 5))
+      if [ "$_tick" -ge 30 ]; then
+        _tick=0
+        info "  $name still running in tmux session '$_tmux_sess' (${_tick}s since last check). Reattach: tmux attach -t $_tmux_sess"
+      fi
     done
-    # tmux does not propagate child exit codes through has-session; if
-    # the user needs a non-zero detection they can run the subscript
+    info "$name finished (tmux session '$_tmux_sess' ended)."
+    # tmux does not propagate child exit codes through has-session; if the
+    # user needs a non-zero detection they can run the subscript
     # directly via Maintenance suite.
     return 0
+  fi
+  if [ "$_is_ssh" = "1" ] && [ "$_in_tmux" = "0" ]; then
+    # SSH, interactive, but no tmux to protect the hop. Say so plainly:
+    # this is precisely the case where a dropped socket loses the work with
+    # no way to recover it.
+    warn "No tmux available: $name runs directly and CANNOT be recovered if the SSH socket drops."
+    warn "Install tmux and re-run, or use a local terminal, to make this step disconnect-safe."
   fi
   "${_env_prefix[@]}" bash "$dst"
 }
@@ -1747,6 +1825,13 @@ _auto_skip_if_done() {
   local key="$1"
   case "$key" in
     apt_https)
+      # Never claim the repos are fine unless a real guard actually looked.
+      # When lib/apt-https.sh could not be loaded, apt_https_status_text
+      # returns empty for "nothing found", which would otherwise read as
+      # "already HTTPS-only" -- an unverified security claim printed as fact.
+      if ! apt_https_available 2>/dev/null; then
+        return 1
+      fi
       # Idempotent: if nothing plaintext is left, the guard has already run
       # (a repo added since would show up here again and force a re-run).
       if [ -z "$(apt_https_status_text)" ]; then

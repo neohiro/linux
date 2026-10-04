@@ -314,14 +314,29 @@ _apt_https_backup_path() {
 }
 
 # _apt_https_backup_once <file> — copy <file> aside the first time we touch it.
+#
+# The copy is staged inside the backup directory and renamed into place, for
+# the same reason the rewrite is: `cp` into a destination that does not exist
+# yet leaves a truncated `.orig` if it dies partway. A truncated backup is
+# worse than no backup, because `--apt-https-off` would then confidently
+# restore a broken file. rename(2) means the backup is either absent or
+# complete.
 _apt_https_backup_once() {
-  local src="$1" dst
+  local src="$1" dst stage
   [ -f "$src" ] || return 0
   dst="$(_apt_https_backup_path "$src")"
   [ -f "$dst" ] && return 0
   _apt_priv mkdir -p "$(apt_https_backup_dir)" || return 1
-  if ! _apt_priv cp -p "$src" "$dst"; then
+  stage="${dst}.partial.$$"
+  _apt_priv rm -f "$stage" 2>/dev/null || true
+  if ! _apt_priv cp -p "$src" "$stage"; then
+    _apt_priv rm -f "$stage" 2>/dev/null || true
     warn "Could not back up $src — refusing to edit it."
+    return 1
+  fi
+  if ! _apt_priv mv -f "$stage" "$dst"; then
+    _apt_priv rm -f "$stage" 2>/dev/null || true
+    warn "Could not store the backup for $src — refusing to edit it."
     return 1
   fi
   # Hook into the host's rollback log when one exists so `linuxinstall.sh
@@ -381,6 +396,17 @@ _apt_https_write_conf() {
   rm -f "$tmp"
   [ "$rc" = "0" ] || return 1
   info "apt policy: $conf"
+  return 0
+}
+
+# apt_https_available — is the real guard loaded?
+#
+# Callers that infer "the repositories are fine" from an empty
+# apt_https_status_text must check this first. When the library cannot be
+# loaded, a stub takes its place and status_text returns empty for "found
+# nothing" -- indistinguishable from "checked, all https". Reporting that as
+# verified would be an unverified security claim printed as fact.
+apt_https_available() {
   return 0
 }
 
