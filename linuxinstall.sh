@@ -4259,7 +4259,10 @@ USAGE
   if [ "$EUID" -ne 0 ]; then
     err "This script must be run as root (use sudo)."; exit 1
   fi
-  ensure_tmux_if_ssh
+# Forward the script's arguments: the tmux re-exec restarts this same
+  # script, and without "$@" it would silently drop --auto / --step /
+  # --dry-run, so an SSH run would behave differently from what was asked.
+  ensure_tmux_if_ssh "$@"
   mark_step tmux_wrap "done"
   print_recovery_if_ssh
   _warn_if_not_tmux

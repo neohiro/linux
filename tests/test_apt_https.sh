@@ -1276,26 +1276,29 @@ printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.li
 env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
     NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
     bash "$LIB" --report >/dev/null 2>&1
-if [ $? -eq 0 ]; then
+_RC=$?
+if [ "$_RC" -eq 0 ]; then
   ok_t "lib/apt-https.sh --report exits 0 on a clean system"
 else
-  fail_t "lib/apt-https.sh --report exits 0 on a clean system" "rc=$?"
+  fail_t "lib/apt-https.sh --report exits 0 on a clean system" "rc=$_RC"
 fi
 printf 'deb http://plain.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
 env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
     NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
     bash "$LIB" --report >/dev/null 2>&1
-if [ $? -eq 1 ]; then
+_RC=$?
+if [ "$_RC" -eq 1 ]; then
   ok_t "lib/apt-https.sh --report exits 1 when plaintext remains"
 else
-  fail_t "lib/apt-https.sh --report exits 1 when plaintext remains" "rc=$?"
+  fail_t "lib/apt-https.sh --report exits 1 when plaintext remains" "rc=$_RC"
 fi
 env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
     NEOHIRO_APT_FAMILY=apt bash "$LIB" --nonsense >/dev/null 2>&1
-if [ $? -eq 2 ]; then
+_RC=$?
+if [ "$_RC" -eq 2 ]; then
   ok_t "lib/apt-https.sh exits 2 on an unknown argument"
 else
-  fail_t "lib/apt-https.sh exits 2 on an unknown argument" "rc=$?"
+  fail_t "lib/apt-https.sh exits 2 on an unknown argument" "rc=$_RC"
 fi
 
 # ============================================================================
@@ -1767,10 +1770,11 @@ else
   fail_t "apt_https_status_text aggregates non-apt stores" "gem endpoint missing from aggregate"
 fi
 apt_https_report >/dev/null 2>&1
-if [ $? -eq 1 ]; then
+_RC=$?
+if [ "$_RC" -eq 1 ]; then
   ok_t "report exits 1 when any store is plaintext"
 else
-  fail_t "report exits 1 when any store is plaintext" "rc=$?"
+  fail_t "report exits 1 when any store is plaintext" "rc=$_RC"
 fi
 REPORT_OUT="$(apt_https_report 2>&1)"
 if printf '%s' "$REPORT_OUT" | grep -q 'gem sources'; then
@@ -2125,6 +2129,33 @@ if printf '%s' "$OUT_CLEAN" | grep -qF -- '--step=firewall' && \
 else
   fail_t "continuity: CLI arguments survive the tmux re-exec" \
         "args lost: $(printf '%s' "$OUT_CLEAN" | tr '\n' ' ')"
+fi
+
+# The call site must forward them. Asserting only the function body is not
+# enough: a correct function invoked bare still drops every argument, which
+# is exactly the bug shellcheck's SC2120 caught in CI after the body was
+# already fixed.
+if grep -q 'ensure_tmux_if_ssh "\$@"' "$SRC"; then
+  ok_t "continuity: the call site forwards the script arguments"
+else
+  fail_t "continuity: the call site forwards the script arguments" \
+        "ensure_tmux_if_ssh is called without \"\$@\"; the re-exec drops every flag"
+fi
+if grep -qE '^[[:space:]]*ensure_tmux_if_ssh[[:space:]]*$' "$SRC"; then
+  fail_t "continuity: no bare ensure_tmux_if_ssh call remains" "a bare call was found"
+else
+  ok_t "continuity: no bare ensure_tmux_if_ssh call remains"
+fi
+
+# Guard against the regression that CI caught: the function referencing "$@"
+# while nothing ever passes it. shellcheck flags it as SC2120; assert the
+# shape here so the suite is self-sufficient without shellcheck installed.
+if grep -qE '^ensure_tmux_if_ssh\(\) \{' "$SRC" && \
+   grep -q 'ensure_tmux_if_ssh "\$@"' "$SRC"; then
+  ok_t "continuity: arguments are referenced and supplied (no SC2120 shape)"
+else
+  fail_t "continuity: arguments are referenced and supplied (no SC2120 shape)" \
+        "function reads \"\$@\" but nothing supplies it"
 fi
 
 if printf '%s' "$OUT_CLEAN" | grep -qF 'new-session -s linux-setup'; then
