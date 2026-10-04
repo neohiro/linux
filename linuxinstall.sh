@@ -574,7 +574,7 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
   apt_https_guard() {
     [ -n "$_APT_HTTPS_DONE" ] && return 0
     _APT_HTTPS_DONE=1
-    apt_https_enforce "${1:-guard}"
+    apt_https_enforce "${1:-guard}" || true
     return 0
   }
   apt_https_revert() {

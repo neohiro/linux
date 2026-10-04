@@ -812,22 +812,28 @@ else
   SECONDS=0
   # Sub-commands handled here rather than by the dispatcher, because they
   # only touch the repository transport and never run an update.
+  #
+  # `set -euo pipefail` is active in this branch, so a bare call that returns
+  # non-zero would exit before `exit $?` runs and skip the report. Capture
+  # the status explicitly instead of relying on that coincidence.
+  _ap_https_rc=0
   case "${1:-}" in
     --apt-https|--enforce-https)
       if [ "${2:-}" = "--audit" ]; then
-        apt_https_report
+        apt_https_report || _ap_https_rc=$?
       else
-        apt_https_enforce "updater --apt-https"
+        apt_https_enforce "updater --apt-https" || _ap_https_rc=$?
+        apt_https_report || true
       fi
-      exit $?
+      exit "$_ap_https_rc"
       ;;
     --apt-https-audit)
-      apt_https_report
-      exit $?
+      apt_https_report || _ap_https_rc=$?
+      exit "$_ap_https_rc"
       ;;
     --apt-https-off|--disable-https)
-      apt_https_revert
-      exit $?
+      apt_https_revert || _ap_https_rc=$?
+      exit "$_ap_https_rc"
       ;;
   esac
   _run_all_updates "$@"

@@ -707,12 +707,19 @@ apt_https_enforce() {
 
 # apt_https_guard [label] — hot-path wrapper.  Enforces at most once per
 # process so every package entry point can call it unconditionally.
+#
+# It always returns 0. A guard must never be the reason a package operation
+# fails: call sites are things like `pkg_install`, which run under `set -e`
+# in some of the standalone scripts, and a non-zero return there would abort
+# the caller before it ever reached the package manager. Enforcement failures
+# are reported through apt_https_report and the enforce exit status, not by
+# failing the hot path.
 apt_https_guard() {
   [ -n "$_APT_HTTPS_DONE" ] && return 0
   # Latch first: the verification `apt-get update` below can re-enter the
   # package layer, which must not recurse.
   _APT_HTTPS_DONE=1
-  apt_https_enforce "${1:-guard}"
+  apt_https_enforce "${1:-guard}" || true
   return 0
 }
 
@@ -745,10 +752,17 @@ apt_https_revert() {
 #   sudo bash lib/apt-https.sh --report   audit only
 #   sudo bash lib/apt-https.sh --revert   undo
 if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+  # Standalone: this file sets no `set -e`, but capture the status anyway so
+  # the documented exit-code contract (0 = clean, 1 = plaintext remains,
+  # 2 = no package manager) is explicit rather than an accident of which
+  # command happened to run last.
+  _ap_https_rc=0
   case "${1:---enforce}" in
-    --report|--audit) apt_https_report ;;
-    --revert)         apt_https_revert ;;
-    --enforce)        apt_https_enforce "cli" ;;
-    *) printf 'usage: bash lib/apt-https.sh [--enforce|--report|--revert]\n' >&2; exit 2 ;;
+    --report|--audit) apt_https_report || _ap_https_rc=$? ;;
+    --revert)         apt_https_revert || _ap_https_rc=$? ;;
+    --enforce)        apt_https_enforce "cli" || _ap_https_rc=$? ;;
+    *) printf 'usage: bash lib/apt-https.sh [--enforce|--report|--revert]\n' >&2
+       _ap_https_rc=2 ;;
   esac
+  exit "$_ap_https_rc"
 fi

@@ -384,23 +384,33 @@ apply_fixes() {
 main() {
   # Repository-transport sub-commands: these never touch SSH at all, so
   # they short-circuit before diagnose/apply_fixes.
+  local _rc=0
   case "${1:-}" in
     --apt-https|--enforce-https)
       bold "neohiro/linux - HTTPS package repositories (enforce)"
       require_root
-      apt_https_enforce "restore_ssh --apt-https"
+      # This script runs under `set -eo pipefail`, so a bare
+      # `apt_https_enforce` that returns non-zero would abort the script
+      # before the report printed, and `return $?` after a
+      # `... || true` would report the *report's* status (always 0).
+      # Capture the status explicitly, always show the report, then
+      # propagate enforcement's own result.
+      _rc=0
+      apt_https_enforce "restore_ssh --apt-https" || _rc=$?
       apt_https_report || true
-      return $?
+      return "$_rc"
       ;;
     --apt-https-audit)
-      apt_https_report
-      return $?
+      _rc=0
+      apt_https_report || _rc=$?
+      return "$_rc"
       ;;
     --apt-https-off|--disable-https)
       bold "neohiro/linux - Revert HTTPS package repository enforcement"
       require_root
-      apt_https_revert
-      return $?
+      _rc=0
+      apt_https_revert || _rc=$?
+      return "$_rc"
       ;;
   esac
   bold "neohiro/linux - Restore SSH (standalone)"

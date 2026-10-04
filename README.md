@@ -688,7 +688,7 @@ dumps — add to `/etc/security/limits.conf`:
 ```bash
 bash tests/run-all.sh                  # every suite, with a summary
 bash tests/test_linuxinstall.sh        # 66 tests: parse, logic, UX coverage, snapshot
-bash tests/test_apt_https.sh           # 120 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
+bash tests/test_apt_https.sh           # 145 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
 bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```

@@ -961,6 +961,270 @@ else
 fi
 
 # ============================================================================
+# Runtime: exit codes survive `set -eo pipefail`
+# ============================================================================
+# restore_ssh.sh, DeepClean.sh and the lib/updater.sh standalone branch all
+# run under `set -e`. A bare call that returns non-zero exits before the
+# report prints, and `return $?` after a `... || true` reports the wrong
+# status. Drive the real scripts with a failing enforcement and assert both
+# the exit code and that the report still printed.
+_rrc() {
+  local script="$1" flag="$2"
+  env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
+      NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
+      bash "$ROOT/$script" "$flag" 2>&1
+  printf '__RC=%s\n' "$?"
+}
+
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rrc lib/updater.sh --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=0'; then
+  ok_t "lib/updater.sh --apt-https-audit exits 0 on a clean system"
+else
+  fail_t "lib/updater.sh --apt-https-audit exits 0 on a clean system" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+# Force enforcement to fail: make the backup path unwritable.
+rm -rf "$BACKUPS"; : > "$BACKUPS"
+OUT="$(_rrc restore_ssh.sh --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=0'; then
+  ok_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system"
+else
+  fail_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+  ok_t "restore_ssh.sh --apt-https-audit prints the report"
+else
+  fail_t "restore_ssh.sh --apt-https-audit prints the report" "report missing"
+fi
+
+# Now dirty the sources so the audit must exit 1 even under `set -e`.
+printf 'deb http://plain.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rrc restore_ssh.sh --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=1'; then
+  ok_t "restore_ssh.sh --apt-https-audit exits 1 when plaintext remains"
+else
+  fail_t "restore_ssh.sh --apt-https-audit exits 1 when plaintext remains" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+rm -f "$BACKUPS"
+
+# restore_ssh.sh --apt-https* run under `set -eo pipefail` and gate on
+# require_root, so drive its real main() through a harness with root and the
+# print helpers stubbed. set -e is inherited by the harness, which is the
+# whole point: main() must survive it. The harness runs as its own script so
+# its exit code IS main()'s exit code, without putting main() in a condition
+# (which would disable set -e inside its body).
+build_rs_harness() {
+  {
+    printf '%s\n' 'set -eo pipefail'
+    printf '%s\n' ". \"\$RS_LIB\""
+    printf '%s\n' '_apt_priv() { "$@"; }'
+    printf '%s\n' '_apt_https_privileged_ok() { return 0; }'
+    printf '%s\n' 'apt_https_family() { printf "apt"; }'
+    printf '%s\n' 'bold() { :; }'
+    printf '%s\n' 'require_root() { return 0; }'
+    printf '%s\n' 'diagnose() { err "diagnose must not run for a transport flag"; return 9; }'
+    printf '%s\n' 'apply_fixes() { err "apply_fixes must not run for a transport flag"; return 9; }'
+    awk '/^main\(\) \{/,/^\}/' "$ROOT/restore_ssh.sh"
+    printf '%s\n' 'FIXES=()'
+    printf '%s\n' 'main "$@"'
+  } > "$WD/rs_harness.sh"
+}
+build_rs_harness
+if bash -n "$WD/rs_harness.sh" 2>/dev/null; then
+  ok_t "restore_ssh.sh transport flags are reachable in an isolated harness"
+else
+  fail_t "restore_ssh.sh transport flags are reachable in an isolated harness" \
+        "harness does not parse"
+fi
+
+_rs_run() {
+  env RS_LIB="$LIB" NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
+      NEOHIRO_APT_HTTPS_NOVERIFY=1 \
+      bash "$WD/rs_harness.sh" "$@" 2>&1
+  printf '__RC=%s\n' "$?"
+}
+
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rs_run --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=0'; then
+  ok_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system"
+else
+  fail_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+  ok_t "restore_ssh.sh --apt-https-audit prints the report"
+else
+  fail_t "restore_ssh.sh --apt-https-audit prints the report" "report missing"
+fi
+
+printf 'deb http://plain.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rs_run --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=1'; then
+  ok_t "restore_ssh.sh --apt-https-audit exits 1 when plaintext remains"
+else
+  fail_t "restore_ssh.sh --apt-https-audit exits 1 when plaintext remains" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+
+# The regression these guard: enforcement fails -> the report must STILL
+# print, and the exit code must be enforcement's, not the report's.
+reset_sandbox
+printf 'deb http://refuse.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+rm -rf "$BACKUPS"; : > "$BACKUPS"
+OUT="$(_rs_run --apt-https)"
+if printf '%s' "$OUT" | grep -q '__RC=1'; then
+  ok_t "restore_ssh.sh --apt-https propagates enforcement failure (not 0)"
+else
+  fail_t "restore_ssh.sh --apt-https propagates enforcement failure (not 0)" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+  ok_t "restore_ssh.sh --apt-https prints the report even when enforce fails"
+else
+  fail_t "restore_ssh.sh --apt-https prints the report even when enforce fails" \
+        "set -e aborted before the report"
+fi
+if printf '%s' "$OUT" | grep -q 'diagnose must not run'; then
+  fail_t "restore_ssh.sh --apt-https short-circuits before diagnose" "SSH path was entered"
+else
+  ok_t "restore_ssh.sh --apt-https short-circuits before diagnose"
+fi
+rm -f "$BACKUPS"
+
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rs_run --apt-https-off)"
+if printf '%s' "$OUT" | grep -q '__RC=0'; then
+  ok_t "restore_ssh.sh --apt-https-off exits 0"
+else
+  fail_t "restore_ssh.sh --apt-https-off exits 0" "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+
+# Same contract for the lib/updater.sh standalone CLI.
+reset_sandbox
+printf 'deb http://upd.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+rm -rf "$BACKUPS"; : > "$BACKUPS"
+UPD_OUT="$(_rrc lib/updater.sh --apt-https)"
+if printf '%s' "$UPD_OUT" | grep -q '__RC=1'; then
+  ok_t "lib/updater.sh --apt-https propagates enforcement failure"
+else
+  fail_t "lib/updater.sh --apt-https propagates enforcement failure" \
+        "$(printf '%s' "$UPD_OUT" | grep '__RC=')"
+fi
+if printf '%s' "$UPD_OUT" | grep -q 'Package transport security'; then
+  ok_t "lib/updater.sh --apt-https prints the report even when enforce fails"
+else
+  fail_t "lib/updater.sh --apt-https prints the report even when enforce fails" \
+        "set -e aborted before the report"
+fi
+rm -f "$BACKUPS"
+
+reset_sandbox
+printf 'deb http://upd.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rrc lib/updater.sh --apt-https-audit)"
+if printf '%s' "$OUT" | grep -q '__RC=1'; then
+  ok_t "lib/updater.sh --apt-https-audit exits 1 when plaintext remains"
+else
+  fail_t "lib/updater.sh --apt-https-audit exits 1 when plaintext remains" \
+        "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+
+# And the revert flag must report success.
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+OUT="$(_rrc lib/updater.sh --apt-https-off)"
+if printf '%s' "$OUT" | grep -q '__RC=0'; then
+  ok_t "lib/updater.sh --apt-https-off exits 0"
+else
+  fail_t "lib/updater.sh --apt-https-off exits 0" "$(printf '%s' "$OUT" | grep '__RC=')"
+fi
+
+# Structural guards so the pattern cannot silently regress.
+for f in restore_ssh.sh lib/updater.sh; do
+  if grep -qE 'apt_https_enforce[^|]*\|\| _?[a-z_]*rc=\$\?' "$ROOT/$f"; then
+    ok_t "$f captures the enforce status instead of relying on set -e"
+  else
+    fail_t "$f captures the enforce status instead of relying on set -e" \
+          "no '|| _rc=\$?' after apt_https_enforce"
+  fi
+done
+
+# ============================================================================
+# apt_https_guard must NEVER fail its caller
+# ============================================================================
+# Call sites include pkg_install, which some standalone scripts run under
+# `set -e`. A guard is a precaution, not a gate: it must not be the reason a
+# package operation aborts.
+GUARD_BODY="$(awk '/^apt_https_guard\(\) \{/,/^\}/' "$LIB")"
+if printf '%s' "$GUARD_BODY" | grep -q 'apt_https_enforce .* || true'; then
+  ok_t "apt_https_guard swallows enforcement failure (lib)"
+else
+  fail_t "apt_https_guard swallows enforcement failure (lib)" \
+        "enforce call is not guarded with '|| true'"
+fi
+if printf '%s' "$GUARD_BODY" | grep -q 'return 0'; then
+  ok_t "apt_https_guard always returns 0 (lib)"
+else
+  fail_t "apt_https_guard always returns 0 (lib)" "no unconditional return 0"
+fi
+INLINE_GUARD="$(awk '/^[[:space:]]+apt_https_guard\(\) \{/,/^[[:space:]]+\}/' "$SRC")"
+if printf '%s' "$INLINE_GUARD" | grep -q 'apt_https_enforce .* || true'; then
+  ok_t "apt_https_guard swallows enforcement failure (inline fallback)"
+else
+  fail_t "apt_https_guard swallows enforcement failure (inline fallback)" \
+        "enforce call is not guarded with '|| true'"
+fi
+
+# Behaviour: a guard call must return 0 even when enforcement fails hard.
+reset_sandbox
+printf 'deb http://guardfail.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+rm -rf "$BACKUPS"; : > "$BACKUPS"
+if apt_https_guard "unit" >/dev/null 2>&1; then
+  ok_t "apt_https_guard returns 0 despite an enforcement failure"
+else
+  fail_t "apt_https_guard returns 0 despite an enforcement failure" \
+        "guard propagated non-zero"
+fi
+rm -f "$BACKUPS"
+
+# Standalone lib exit-code contract: 0 clean / 1 plaintext / 2 bad usage.
+reset_sandbox
+printf 'deb https://secure.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
+    NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
+    bash "$LIB" --report >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+  ok_t "lib/apt-https.sh --report exits 0 on a clean system"
+else
+  fail_t "lib/apt-https.sh --report exits 0 on a clean system" "rc=$?"
+fi
+printf 'deb http://plain.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
+    NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
+    bash "$LIB" --report >/dev/null 2>&1
+if [ $? -eq 1 ]; then
+  ok_t "lib/apt-https.sh --report exits 1 when plaintext remains"
+else
+  fail_t "lib/apt-https.sh --report exits 1 when plaintext remains" "rc=$?"
+fi
+env NEOHIRO_APT_ETC_DIR="$SANDBOX" NEOHIRO_APT_BACKUP_DIR="$BACKUPS" \
+    NEOHIRO_APT_FAMILY=apt bash "$LIB" --nonsense >/dev/null 2>&1
+if [ $? -eq 2 ]; then
+  ok_t "lib/apt-https.sh exits 2 on an unknown argument"
+else
+  fail_t "lib/apt-https.sh exits 2 on an unknown argument" "rc=$?"
+fi
+
+# ============================================================================
 # Summary
 # ============================================================================
 printf '\n'
