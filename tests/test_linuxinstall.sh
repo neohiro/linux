@@ -95,7 +95,7 @@ else
 fi
 
 # --- _valid_step: every documented alias must be accepted ---
-EXPECTED_KEYS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
+EXPECTED_KEYS="system system_update dns dnscrypt apt_https firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
 for k in $EXPECTED_KEYS; do
   if _valid_step "$k"; then
     ok_t "_valid_step accepts: $k"

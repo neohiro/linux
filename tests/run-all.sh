@@ -41,6 +41,7 @@ SUITES=(
   "fuzz_smoke|tests/test_color_fuzz.sh|50"
   "color_fuzz|tests/test_color_fuzz.sh|200"
   "linuxinstall|tests/test_linuxinstall.sh|"
+  "apt_https|tests/test_apt_https.sh|"
   "updater|tests/test_updater.sh|"
   "verify_sync|verify_sync.sh|"
 )

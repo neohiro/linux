@@ -17,6 +17,14 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
 fi
 
+# Repository transport guard. DeepClean's apt branch runs
+# `apt-get autoremove --purge`, which resolves dependency chains and can
+# pull packages from a mirror, so HTTPS is enforced before it.
+# shellcheck disable=SC1091
+if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/apt-https.sh" ]; then
+  source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/apt-https.sh"
+fi
+
 # If lib/color.sh was not sourced or did not set USE_COLOR, run the canonical
 # gate inline so _c is safe to call in all execution paths.
 if [ -z "${USE_COLOR:-}" ]; then
@@ -66,6 +74,15 @@ PM=$(pkg_mgr)
 USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
 
 msg "Detected package manager: ${PM:-none}"
+
+# Precaution: `apt-get autoremove --purge` below resolves dependencies and
+# can fetch from a mirror, so force repository traffic over HTTPS first.
+# No-op once per process, and a silent no-op when the lib is unavailable
+# (curl|bash of DeepClean.sh on its own).
+if declare -F apt_https_guard >/dev/null 2>&1 && [ "$PM" = "apt" ]; then
+  apt_https_guard "DeepClean" || true
+fi
+
 msg "Starting DeepClean..."
 
 # 1. Systemd Journal Logs

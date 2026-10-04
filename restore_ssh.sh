@@ -22,6 +22,13 @@ if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; th
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
 fi
 
+# Repository transport guard: installing openssh-server is a package
+# download, so HTTPS is enforced first (no-op once per process).
+# shellcheck disable=SC1091
+if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/apt-https.sh" ]; then
+  source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/apt-https.sh"
+fi
+
 # --- print helpers (format preserved from original restore_ssh.sh) ---
 # If lib/color.sh was sourced, USE_COLOR is set but C_* constants are not
 # (lib/color.sh defines _c, not C_RED/C_GRN/etc.). Run the gate once and
@@ -111,6 +118,10 @@ detect_pkg_mgr() {
 PKG_MGR=$(detect_pkg_mgr)
 
 pkg_install_ssh() {
+  # Precaution: never fetch openssh over a plaintext mirror.
+  if declare -F apt_https_guard >/dev/null 2>&1; then
+    apt_https_guard "restore_ssh:pkg_install_ssh" || true
+  fi
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ;;
     dnf)    run sudo dnf install -y openssh-server ;;
@@ -365,6 +376,27 @@ apply_fixes() {
 }
 
 main() {
+  # Repository-transport sub-commands: these never touch SSH at all, so
+  # they short-circuit before diagnose/apply_fixes.
+  case "${1:-}" in
+    --apt-https|--enforce-https)
+      bold "neohiro/linux - HTTPS package repositories (enforce)"
+      require_root
+      apt_https_enforce "restore_ssh --apt-https"
+      apt_https_report || true
+      return $?
+      ;;
+    --apt-https-audit)
+      apt_https_report
+      return $?
+      ;;
+    --apt-https-off|--disable-https)
+      bold "neohiro/linux - Revert HTTPS package repository enforcement"
+      require_root
+      apt_https_revert
+      return $?
+      ;;
+  esac
   bold "neohiro/linux - Restore SSH (standalone)"
   require_root
   diagnose

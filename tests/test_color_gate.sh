@@ -431,12 +431,18 @@ assert_out     "tput-empty emits plain text" "sample" "$out"
 # was called twice and C_RED got leaked.
 RESTORE="$ROOT/restore_ssh.sh"
 if [ -f "$RESTORE" ]; then
-  # Pull the block we care about (lines 19-50 in current restore_ssh.sh).
-  # Rewrite EUID check so we don't trip the root check.
-  {
-    sed -n '19,54p' "$RESTORE"
-    printf 'printf "C_RED=[%%s]\\n" "$C_RED"\n'
-  } > "$WD/restore_head.sh"
+  # Pull the block we care about: _color_safe() through the C_* constant
+  # assignment, i.e. up to (but not including) the ok() helper.
+  # Anchored on function names, not line numbers, so inserting a source
+  # block near the top of restore_ssh.sh cannot silently shift the slice.
+  _RS_START=$(grep -n '^_color_safe() {' "$RESTORE" | head -1 | cut -d: -f1)
+  _RS_END=$(grep -n '^ok()' "$RESTORE" | head -1 | cut -d: -f1)
+  _RS_END=$((_RS_END - 1))
+  if [ -n "$_RS_START" ] && [ -n "$_RS_END" ] && [ "$_RS_END" -gt "$_RS_START" ]; then
+    {
+      sed -n "${_RS_START},${_RS_END}p" "$RESTORE"
+      printf 'printf "C_RED=[%%s]\\n" "$C_RED"\n'
+    } > "$WD/restore_head.sh"
 
   # Gate closed -> C_RED must be empty
   out="$(NO_COLOR=1 /usr/bin/bash "$WD/restore_head.sh" 2>&1; printf 'C_RED=[%s]\n' "$C_RED")"
@@ -451,6 +457,7 @@ if [ -f "$RESTORE" ]; then
     *$'\033[1;31m'*) ok_t "restore_ssh: NEOHIRO_COLOR=1 -> C_RED contains CSI" ;;
     *) fail_t "restore_ssh: NEOHIRO_COLOR=1 -> C_RED contains CSI" "got: $out" ;;
   esac
+  fi
 fi
 
 echo

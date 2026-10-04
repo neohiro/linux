@@ -40,6 +40,10 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
     source "$_NEOHIRO_LIB_DIR/updater.sh"
   fi
+  # shellcheck disable=SC1091
+  if [ -r "$_NEOHIRO_LIB_DIR/apt-https.sh" ]; then
+    source "$_NEOHIRO_LIB_DIR/apt-https.sh"
+  fi
 else
   # Inline fallback for run-from-pipe (curl ... | bash) where the lib
   # directory is not on disk. Sources the canonical color-gate function from
@@ -158,6 +162,7 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
   VERBOSE="${VERBOSE:-0}"; UPDATED=0; FAILED=0
   _log() { [ "$VERBOSE" = "1" ] && info "$*" || true; }
   _update_apt()    { command -v apt >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_apt" || true
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
@@ -206,6 +211,380 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     _update_brew || true
     _update_firmware || true
     printf '\n'; ok "Update engine complete."; }
+fi
+
+# Inline fallback for lib/apt-https.sh (curl|bash path).  Same public API as
+# the canonical library: apt_https_guard / apt_https_enforce /
+# apt_https_report / apt_https_revert.  Keep the function names in sync with
+# lib/apt-https.sh - tests/test_apt_https.sh asserts parity between the two.
+if ! declare -F apt_https_guard >/dev/null 2>&1; then
+  _APT_HTTPS_DONE="${_APT_HTTPS_DONE:-}"
+  APT_HTTPS_CONF_NAME="99neohiro-force-https"
+  apt_https_etc_dir()    { printf '%s' "${NEOHIRO_APT_ETC_DIR:-/etc}"; }
+  apt_https_backup_dir() { printf '%s' "${NEOHIRO_APT_BACKUP_DIR:-/var/backups/neohiro-apt-https}"; }
+  apt_https_conf_file()  { printf '%s' "$(apt_https_etc_dir)/apt/apt.conf.d/${APT_HTTPS_CONF_NAME}"; }
+  _apt_https_is_root()      { [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" = "0" ]; }
+  _apt_priv() {
+    if [ "${DRY_RUN:-0}" = "1" ]; then printf '  DRY: %s\n' "$*"; return 0; fi
+    if _apt_https_is_root; then "$@"; return $?; fi
+    if command -v sudo >/dev/null 2>&1; then sudo "$@"; return $?; fi
+    return 1
+  }
+  _apt_https_privileged_ok() {
+    _apt_https_is_root && return 0
+    command -v sudo >/dev/null 2>&1 && return 0
+    return 1
+  }
+  apt_https_family() {
+    if [ -n "${NEOHIRO_APT_FAMILY:-}" ]; then printf '%s' "$NEOHIRO_APT_FAMILY"; return 0; fi
+    if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then printf 'pacman'
+    elif command -v zypper >/dev/null 2>&1; then printf 'zypper'
+    elif command -v dnf >/dev/null 2>&1; then printf 'dnf'
+    elif command -v yum >/dev/null 2>&1; then printf 'yum'
+    elif command -v apt-get >/dev/null 2>&1 || [ -f /etc/apt/sources.list ]; then printf 'apt'
+    else printf 'none'; fi
+  }
+  _apt_https_repo_files() {
+    local etc f
+    etc="$(apt_https_etc_dir)"
+    [ -f "${etc}/apt/sources.list" ] && printf '%s\n' "${etc}/apt/sources.list"
+    for f in "${etc}"/apt/sources.list.d/*.list "${etc}"/apt/sources.list.d/*.sources; do
+      [ -f "$f" ] && printf '%s\n' "$f"
+    done
+    return 0
+  }
+  _apt_https_foreign_repo_files() {
+    local etc f
+    etc="$(apt_https_etc_dir)"
+    case "$1" in
+      dnf|yum) for f in "${etc}"/yum.repos.d/*.repo; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
+      zypper)  for f in "${etc}"/zypp/repos.d/*.repo; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
+      pacman)  for f in "${etc}"/pacman.d/*; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
+      *) : ;;
+    esac
+    return 0
+  }
+  _apt_https_plaintext_in_apt_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    case "$f" in
+      *.sources) awk '/^[[:space:]]*URIs:[[:space:]]/ && /http:\/\// { gsub(/^[[:space:]]+/, "", $0); printf "%s:%d: %s\n", FILENAME, NR, $0 }' "$f" 2>/dev/null ;;
+      *)         awk '/^[[:space:]]*#/ { next } /http:\/\// { gsub(/^[[:space:]]+/, "", $0); printf "%s:%d: %s\n", FILENAME, NR, $0 }' "$f" 2>/dev/null ;;
+    esac
+    return 0
+  }
+  _apt_https_plaintext_in_repo_file() {
+    local f="$1" pat="$2"
+    [ -f "$f" ] || return 0
+    awk -v pat="$pat" '/^[[:space:]]*#/ { next } $0 ~ pat && /http:\/\// {
+      line = $0; gsub(/^[[:space:]]+/, "", line); printf "%s:%d: %s\n", FILENAME, NR, line }' "$f" 2>/dev/null
+    return 0
+  }
+  _apt_https_backup_path() {
+    local flat
+    flat="$(printf '%s' "$1" | tr '/' '_')"
+    printf '%s/%s.orig' "$(apt_https_backup_dir)" "$flat"
+  }
+  _apt_https_backup_once() {
+    local src="$1" dst
+    [ -f "$src" ] || return 0
+    dst="$(_apt_https_backup_path "$src")"
+    [ -f "$dst" ] && return 0
+    _apt_priv mkdir -p "$(apt_https_backup_dir)" || return 1
+    _apt_priv cp -p "$src" "$dst" || { warn "Could not back up $src - refusing to edit it."; return 1; }
+    if declare -F record_backup >/dev/null 2>&1; then record_backup "$src" "$dst" 2>/dev/null || true; fi
+    info "Backed up $src -> $dst"
+    return 0
+  }
+  _apt_https_stage() {
+    if declare -F _tmpfile >/dev/null 2>&1; then _tmpfile apt-https; return 0; fi
+    mktemp "${TMPDIR:-/tmp}/neohiro-apt-https.XXXXXX"
+  }
+  _apt_https_write_conf() {
+    local conf tmp rc
+    conf="$(apt_https_conf_file)"
+    tmp="$(_apt_https_stage)"
+    {
+      printf '%s\n' '// Managed by neohiro/linux (lib/apt-https.sh). Do not edit.'
+      printf '%s\n' '// Re-running the installer overwrites this file safely;'
+      printf '%s\n' '// `bash linuxinstall.sh --apt-https-off` removes it.'
+      printf '%s\n' ''
+      printf '%s\n' '// Prefer TLS, and never silently downgrade to plaintext.'
+      printf '%s\n' 'Acquire::https::AllowRedirect "true";'
+      printf '%s\n' 'Acquire::http::AllowRedirect "false";'
+      printf '%s\n' 'Acquire::ftp::AllowRedirect "false";'
+      printf '%s\n' ''
+      printf '%s\n' '// Authenticate the mirror, not just the channel.'
+      printf '%s\n' 'Acquire::https::Verify-Peer "true";'
+      printf '%s\n' 'Acquire::https::Verify-Host "true";'
+      printf '%s\n' ''
+      printf '%s\n' '// Transparent mirrors usually need more than one try.'
+      printf '%s\n' 'Acquire::Retries "3";'
+      printf '%s\n' ''
+      printf '%s\n' '// Pin a corporate proxy by uncommenting and editing:'
+      printf '%s\n' '// Acquire::http::Proxy  "http://proxy.corp.example:3128";'
+      printf '%s\n' '// Acquire::https::Proxy "http://proxy.corp.example:3128";'
+    } > "$tmp"
+    if [ -f "$conf" ] && cmp -s "$tmp" "$conf"; then rm -f "$tmp"; return 0; fi
+    if ! _apt_https_backup_once "$conf"; then rm -f "$tmp"; return 1; fi
+    _apt_priv mkdir -p "$(apt_https_etc_dir)/apt/apt.conf.d" || { rm -f "$tmp"; return 1; }
+    if _apt_priv install -m 0644 "$tmp" "$conf"; then
+      rc=0
+    elif _apt_priv cp "$tmp" "$conf" && _apt_priv chmod 0644 "$conf"; then
+      rc=0
+    else
+      rc=1
+    fi
+    rm -f "$tmp"
+    [ "$rc" = "0" ] || return 1
+    info "apt policy: $conf"
+    return 0
+  }
+  # Result globals, not stdout: these helpers print progress messages, and a
+  # command substitution would fold that text into the value it returns.
+  _APT_HTTPS_VERDICT=""
+  _APT_HTTPS_CHANGED=0
+  _APT_HTTPS_REVERTED=0
+  _APT_HTTPS_REFUSED=0
+  _apt_https_rewrite_file() {
+    local f="$1" tmp expr
+    _APT_HTTPS_VERDICT="clean"
+    [ -f "$f" ] || return 0
+    case "$f" in
+      *.sources) expr='/^[[:space:]]*URIs:[[:space:]]/ s|http://|https://|g' ;;
+      *)         expr='/^[[:space:]]*#/! s|http://|https://|g' ;;
+    esac
+    tmp="$(_apt_https_stage)"
+    if ! sed -E "$expr" "$f" > "$tmp" 2>/dev/null; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
+    if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
+    if ! _apt_https_backup_once "$f"; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
+    if ! _apt_priv cp "$tmp" "$f"; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
+    rm -f "$tmp"
+    _APT_HTTPS_VERDICT="changed"
+    return 0
+  }
+  _apt_https_rewrite_apt_sources() {
+    local f
+    _APT_HTTPS_CHANGED=0
+    _APT_HTTPS_REFUSED=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      _apt_https_rewrite_file "$f"
+      if [ "$_APT_HTTPS_VERDICT" = "changed" ]; then
+        _APT_HTTPS_CHANGED=$((_APT_HTTPS_CHANGED + 1))
+        info "Rewrote plaintext repo URLs -> https: $f"
+      fi
+    done < <(_apt_https_repo_files)
+    return 0
+  }
+  _apt_https_revert_apt_sources() {
+    local f bak backupdir
+    _APT_HTTPS_REVERTED=0
+    backupdir="$(apt_https_backup_dir)"
+    [ -d "$backupdir" ] || return 0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      bak="$(_apt_https_backup_path "$f")"
+      if [ -f "$bak" ] && ! cmp -s "$bak" "$f" && _apt_priv cp "$bak" "$f"; then
+        _APT_HTTPS_REVERTED=$((_APT_HTTPS_REVERTED + 1))
+        info "Restored $f from backup"
+      fi
+    done < <(_apt_https_repo_files)
+    return 0
+  }
+  _apt_https_audit_family() {
+    local fam="$1" f
+    case "$fam" in
+      apt)     while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_apt_file "$f"; done < <(_apt_https_repo_files) ;;
+      dnf|yum) while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)(baseurl|metalink|mirrorlist)[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
+      zypper)  while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)(baseurl|uri|mirrorlist)[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
+      pacman)  while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)Server[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
+      *) : ;;
+    esac
+    return 0
+  }
+  _apt_https_rewrite_family() {
+    local fam="$1" f
+    _APT_HTTPS_CHANGED=0
+    case "$fam" in dnf|yum|zypper|pacman) : ;; *) return 0 ;; esac
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      _apt_https_rewrite_file "$f"
+      [ "$_APT_HTTPS_VERDICT" = "changed" ] && _APT_HTTPS_CHANGED=$((_APT_HTTPS_CHANGED + 1))
+    done < <(_apt_https_foreign_repo_files "$fam")
+    return 0
+  }
+  _apt_https_flatpak_plaintext() {
+    command -v flatpak >/dev/null 2>&1 || return 0
+    flatpak remotes --show-details 2>/dev/null | awk '/http:\/\// { print }' || true
+    return 0
+  }
+  _apt_https_check_ca_certs() {
+    local fam="$1"
+    case "$fam" in
+      apt)     { [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ]; } || { warn "No system CA trust store found; HTTPS package verification will fail."; return 1; } ;;
+      dnf|yum) [ -e /etc/pki/tls/certs/ca-bundle.crt ] || { warn "No system CA trust store found."; return 1; } ;;
+      zypper)  [ -e /etc/ssl/ca-bundle.pem ] || { warn "No system CA trust store found."; return 1; } ;;
+      pacman)  [ -e /etc/ssl/certs/ca-certificates.crt ] || { warn "No system CA trust store found."; return 1; } ;;
+      *)       : ;;
+    esac
+    return 0
+  }
+  _apt_https_block_port80() {
+    [ "${NEOHIRO_APT_BLOCK_PORT80:-0}" = "1" ] || return 0
+    command -v ufw >/dev/null 2>&1 || { warn "NEOHIRO_APT_BLOCK_PORT80=1 but no UFW found; skipping."; return 0; }
+    if ufw status 2>/dev/null | grep -qE '^80/tcp[[:space:]]+DENY[[:space:]]+OUT'; then
+      info "ufw already denies outbound 80/tcp"; return 0
+    fi
+    if [ -n "$(apt_https_status_text)" ]; then
+      warn "Skipping the port-80 block: plaintext repos are still configured."
+      return 0
+    fi
+    if _apt_priv ufw deny out 80/tcp; then
+      ok "Blocked outbound TCP/80 (apt traffic is HTTPS-only from now on)."
+      info "Undo: sudo ufw delete deny out 80/tcp"
+    else
+      warn "Could not add the ufw outbound 80/tcp deny rule."
+    fi
+    return 0
+  }
+  apt_https_status_text() {
+    _apt_https_audit_family "$(apt_https_family)"
+    _apt_https_flatpak_plaintext
+    return 0
+  }
+  apt_https_report() {
+    local fam conf findings
+    fam="$(apt_https_family)"
+    printf '\n%s\n' "$(_c '1;36m' '━━━ Package transport security (HTTPS) ━━━')"
+    printf '  Detected package manager: %s\n' "$fam"
+    case "$fam" in
+      apt)
+        conf="$(apt_https_conf_file)"
+        if [ -f "$conf" ]; then printf '  %s %s\n' "$(_c '1;32m' '[x]')" "apt policy drop-in active: $conf"
+        else printf '  %s %s\n' "$(_c '1;31m' '[ ]')" "apt policy drop-in MISSING: $conf"; fi ;;
+      dnf|yum)   printf '  %s\n' "dnf/yum: repo files audited (no blind rewrite)." ;;
+      zypper)    printf '  %s\n' "zypper: repo files audited (no blind rewrite)." ;;
+      pacman)    printf '  %s\n' "pacman: mirrorlist audited (no blind rewrite)." ;;
+      *)         printf '  %s\n' "No supported package manager detected." ;;
+    esac
+    findings="$(apt_https_status_text)"
+    if [ -n "$findings" ]; then
+      printf '\n  %s\n' "$(_c '1;33m' 'Plaintext (http://) repository entries still present:')"
+      printf '%s\n' "$findings" | sed 's/^/    /'
+      printf '\n  %s\n' "  apt:    fix with  sudo bash linuxinstall.sh --apt-https"
+      printf '%s\n' "  others: set NEOHIRO_APT_HTTPS_REWRITE=1, then re-run the audit"
+    else
+      printf '\n  %s %s\n' "$(_c '1;32m' '[x]')" "No plaintext repository URLs detected."
+    fi
+    _apt_https_check_ca_certs "$fam" || true
+    printf '\n'
+    if [ "$fam" = "none" ]; then return 2; fi
+    [ -n "$findings" ] && return 1
+    return 0
+  }
+  _apt_https_verify_apt_sources() {
+    [ "${NEOHIRO_APT_HTTPS_NOVERIFY:-0}" = "1" ] && return 0
+    [ "${DRY_RUN:-0}" = "1" ] && return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+    info "Verifying the rewritten sources with a real apt-get update..."
+    if _apt_priv env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+      ok "All apt repositories answered over HTTPS."; return 0
+    fi
+    if [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ]; then
+      err "apt-get update failed after the https rewrite and NEOHIRO_APT_HTTPS_STRICT=1."
+      return 1
+    fi
+    warn "apt-get update failed after the https rewrite - rolling back to the backups."
+    _apt_https_revert_apt_sources >/dev/null
+    warn "Reverted. A mirror does not serve the same paths over HTTPS."
+    return 1
+  }
+  apt_https_enforce() {
+    local label="${1:-enforce}" mode fam conf_failed findings rc=0
+    mode="${NEOHIRO_APT_HTTPS:-1}"
+    fam="$(apt_https_family)"
+    if [ "$fam" = "none" ]; then
+      info "No supported package manager detected - HTTPS guard not applicable."
+      return 0
+    fi
+    if [ "$mode" = "0" ]; then
+      info "NEOHIRO_APT_HTTPS=0 - repository transport guard disabled ($label)."
+      return 0
+    fi
+    msg "Repository transport guard ($label): $fam"
+    if [ "$mode" = "audit" ]; then
+      info "NEOHIRO_APT_HTTPS=audit - reporting only, nothing is modified."
+      apt_https_report || true
+      return 0
+    fi
+    if ! _apt_https_privileged_ok; then
+      warn "Not root and no sudo available - cannot enforce HTTPS for repositories."
+      info "Re-run as root, or set NEOHIRO_APT_HTTPS=0 to silence this."
+      return 0
+    fi
+    case "$fam" in
+      apt)
+        conf_failed=0
+        _apt_https_write_conf || conf_failed=1
+        _apt_https_rewrite_apt_sources
+        if [ "$_APT_HTTPS_CHANGED" -gt 0 ]; then
+          ok "Rewrote $_APT_HTTPS_CHANGED apt source file(s) to https://"
+          _apt_https_verify_apt_sources || rc=1
+        elif [ "$_APT_HTTPS_REFUSED" -gt 0 ]; then
+          warn "Could not rewrite $_APT_HTTPS_REFUSED apt source file(s): no writable backup."
+          rc=1
+        else
+          ok "apt repositories already use https://"
+        fi
+        [ "$conf_failed" = "1" ] && { warn "Could not install the apt policy drop-in."; rc=1; }
+        ;;
+      dnf|yum|zypper|pacman)
+        if [ "${NEOHIRO_APT_HTTPS_REWRITE:-0}" = "1" ]; then
+          _apt_https_rewrite_family "$fam"
+          [ "$_APT_HTTPS_CHANGED" -gt 0 ] && ok "Rewrote $_APT_HTTPS_CHANGED $fam repo file(s) to https:// (NEOHIRO_APT_HTTPS_REWRITE=1)"
+        fi
+        ;;
+      *) : ;;
+    esac
+    findings="$(apt_https_status_text)"
+    if [ -n "$findings" ]; then
+      warn "Plaintext repository URLs remain for $fam:"
+      printf '%s\n' "$findings" | sed 's/^/    /'
+      if [ "$fam" != "apt" ]; then
+        info "Point those at an https-capable mirror, or opt in to a blind rewrite"
+        info "with NEOHIRO_APT_HTTPS_REWRITE=1 (verify afterwards)."
+        [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ] && rc=1
+      fi
+    fi
+    _apt_https_check_ca_certs "$fam" || true
+    _apt_https_block_port80
+    return "$rc"
+  }
+  apt_https_guard() {
+    [ -n "$_APT_HTTPS_DONE" ] && return 0
+    _APT_HTTPS_DONE=1
+    apt_https_enforce "${1:-guard}"
+    return 0
+  }
+  apt_https_revert() {
+    local conf bak n
+    conf="$(apt_https_conf_file)"
+    bak="$(_apt_https_backup_path "$conf")"
+    _apt_https_revert_apt_sources
+    n="$_APT_HTTPS_REVERTED"
+    if [ -f "$conf" ] && [ -f "$bak" ]; then
+      _apt_priv cp "$bak" "$conf" && info "Restored $conf from backup"
+    elif [ -f "$conf" ]; then
+      _apt_priv rm -f "$conf" && ok "Removed $conf"
+    fi
+    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+      ok "Reverted $n repository file(s) to their pre-guard contents."
+    fi
+    _APT_HTTPS_DONE=""
+    ok "Repository transport guard disabled."
+    return 0
+  }
 fi
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
@@ -873,6 +1252,9 @@ detect_distro() {
 }
 
 pkg_update() {
+  # Precaution: no repository traffic leaves this host in plaintext. Runs
+  # once per process, so the four pkg_* helpers below cost nothing extra.
+  apt_https_guard "pkg_update" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get update ;;
     dnf)    info "Checking for updates (dnf check-update)..."
@@ -892,6 +1274,7 @@ pkg_update() {
 }
 
 pkg_install() {
+  apt_https_guard "pkg_install" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
     dnf)    run sudo dnf install -y "$@" ;;
@@ -903,6 +1286,7 @@ pkg_install() {
 }
 
 pkg_upgrade() {
+  apt_https_guard "pkg_upgrade" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade ;;
     dnf)    run sudo dnf upgrade --refresh -y ;;
@@ -914,6 +1298,7 @@ pkg_upgrade() {
 }
 
 pkg_autoremove() {
+  apt_https_guard "pkg_autoremove" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove ;;
     dnf)    run sudo dnf autoremove -y ;;
@@ -1210,6 +1595,7 @@ _BAR_Filled='#'; _BAR_Empty='-'
 declare -A CHECKLIST=(
   [tmux_wrap]=pending
   [env_detect]=pending
+  [apt_https]=pending
   [system]=pending
   [system_update]=pending
   [dns]=pending
@@ -1232,6 +1618,7 @@ declare -A CHECKLIST=(
 )
 CHECKLIST_LABEL_tmux_wrap="Auto-wrap SSH session in tmux"
 CHECKLIST_LABEL_env_detect="Detect environment (desktop/server)"
+CHECKLIST_LABEL_apt_https="Force HTTPS for all package repos"
 CHECKLIST_LABEL_system="System update + base packages"
 CHECKLIST_LABEL_system_update="System update + base packages"
 CHECKLIST_LABEL_dns="DNSCrypt + DNS routing"
@@ -1299,7 +1686,7 @@ _should_run_step() {
 # ask_category_enabled() in main(), otherwise --step will be rejected as
 # "unknown" even for legitimate steps.  Aliases (e.g. system_update,
 # ssh_hardening) are accepted alongside the short keys for convenience.
-_VALID_STEPS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
+_VALID_STEPS="system system_update dns dnscrypt apt_https firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
 _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
@@ -1308,6 +1695,7 @@ _valid_step() {
 # Short preview text for each step — printed before the step runs.
 # Keep entries under ~70 chars so the terminal doesn't wrap.
 declare -A _STEP_PREVIEWS
+_STEP_PREVIEWS["apt_https"]="force HTTPS for every apt/repo source; blocks plaintext downgrade."
 _STEP_PREVIEWS["system"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
 _STEP_PREVIEWS["system_update"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
 _STEP_PREVIEWS["dns"]="install dnscrypt-proxy; you choose between DoH, DNSCrypt, and DoT."
@@ -1326,7 +1714,7 @@ _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Rever
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
-_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary"
+_CHECKLIST_ORDER="tmux_wrap env_detect apt_https system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary"
 
 show_progress() {
   local done=0 total=0 key status
@@ -1588,7 +1976,7 @@ ask_profile() {
   printf '  %s  %s\n' "$(_c '1;31m' '6) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes; offers self-heal guard.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Safe recovery tool — re-run anytime without re-hardening.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;1;35m' '7) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
+  printf '  %s  %s\n' "$(_c '1;1;35m' '7) Maintenance')" "$(_c '1;37m' '21 individual tools: HTTPS guard, inspect, update, recover, optimize.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;32m' '8) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
@@ -1608,7 +1996,7 @@ ask_profile() {
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
     "Custom (individual per-category prompts)" \
     "Restore SSH (diagnose & fix common lockout causes)" \
-    "Maintenance suite (20 individual tools, return to this menu)" \
+    "Maintenance suite (21 individual tools, return to this menu)" \
     "DeepClean (cleanup + auto-prune; no hardening)" \
     "Attack Surface Reduction (OptimizeLinuxASR.sh; service-by-service)" \
     "Updates only (system update + kernel + optional packages + auto-update)"
@@ -1624,6 +2012,15 @@ ask_profile() {
 _auto_skip_if_done() {
   local key="$1"
   case "$key" in
+    apt_https)
+      # Idempotent: if nothing plaintext is left, the guard has already run
+      # (a repo added since would show up here again and force a re-run).
+      if [ -z "$(apt_https_status_text)" ]; then
+        info "[AUTO] Repository sources are already HTTPS-only — skipping."
+        return 0
+      fi
+      return 1
+      ;;
     dnscrypt)
       if pkg_is_installed dnscrypt-proxy && systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
         info "[AUTO] dnscrypt-proxy already installed and running — skipping."
@@ -1711,6 +2108,14 @@ _auto_skip_if_done() {
 ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
   _should_run_step "$key" || return 1
+  # Repository-transport hardening is a precaution, not an optional
+  # hardening choice: it is enabled for every profile, including Custom,
+  # so there is no profile in which apt can fetch over plaintext HTTP.
+  # NEOHIRO_APT_HTTPS=0 remains the documented escape hatch.
+  if [ "$key" = "apt_https" ]; then
+    _auto_skip_if_done "$key" && return 0
+    return 0
+  fi
   # AUTO_MODE: every step uses its per-profile default (Standard for desktop,
   # Full for server). No interactive prompts; decisions are logged by prompt_yn.
   # Also skip any step that is already fully applied (idempotent re-runs).
@@ -1845,13 +2250,15 @@ _maintenance_sysinfo() {
 }
 
 # Maintenance menu: expanded suite for SSH recovery, config inspection, key
-# management, self-heal controls, and system diagnostics.
-# The menu uses a magenta header and numbered choices (20 = exit).
+# management, self-heal controls, and system diagnostics. Option 1 forces
+# HTTPS for every package repository before anything is downloaded.
+# The menu uses a magenta header and numbered choices (21 = exit).
 maintenance_menu() {
   local choice rc
   while true; do
     printf '\n%s\n' "$(_c '1;35m' '━━━ Maintenance suite ━━━')"
-    prompt_choice "Maintenance — pick a category (20=exit)" \
+    prompt_choice "Maintenance — pick a category (21=exit)" \
+      "Force HTTPS for package repos (precaution before any download)" \
       "System update (apt update + upgrade + base packages)" \
       "DNSCrypt (DNS encryption)" \
       "Firewall (UFW)" \
@@ -1875,23 +2282,24 @@ maintenance_menu() {
     choice=$REPLY_CHOICE
     rc=0
     case $choice in
-      0) mark_step system_update "running"; show_progress; update_system   || rc=$?; mark_step system_update "$([ $rc -eq 0 ] && echo done || echo skip)"; update_kernel || rc=$?;;
-      1) mark_step dnscrypt "running";      show_progress; setup_dnscrypt  || rc=$?; mark_step dnscrypt      "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      2) mark_step firewall "running";     show_progress; setup_firewall   || rc=$?; mark_step firewall     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      3) mark_step tor "running";          show_progress; setup_tor        || rc=$?; mark_step tor          "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      4) mark_step ssh_hardening "running"; show_progress; harden_ssh       || rc=$?; mark_step ssh_hardening "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      5) mark_step fail2ban "running";     show_progress; setup_fail2ban   || rc=$?; mark_step fail2ban     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      6) mark_step unattended "running";   show_progress; configure_unattended_upgrades || rc=$?; mark_step unattended "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      7) mark_step ipv6 "running";         show_progress; disable_ipv6     || rc=$?; mark_step ipv6         "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      8) mark_step sysctl "running";       show_progress; harden_sysctl    || rc=$?; mark_step sysctl       "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      9) mark_step apparmor "running";     show_progress; setup_apparmor   || rc=$?; mark_step apparmor     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     10) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     11) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     12) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     13) bold "=== SSH diagnostics & lockout fix ==="; restore_ssh_mode || rc=$?;;
-     14) bold "=== Authorized keys ==="; _maintenance_list_keys;;
-     15) bold "=== SSH config review ==="; _ssh_inspect_config || rc=$?;;
-     16) bold "=== SSH self-heal guard ==="
+      0) mark_step apt_https "running"; show_progress; apt_https_enforce "maintenance menu" || rc=$?; apt_https_report || true; mark_step apt_https "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      1) mark_step system_update "running"; show_progress; update_system   || rc=$?; mark_step system_update "$([ $rc -eq 0 ] && echo done || echo skip)"; update_kernel || rc=$?;;
+      2) mark_step dnscrypt "running";      show_progress; setup_dnscrypt  || rc=$?; mark_step dnscrypt      "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      3) mark_step firewall "running";     show_progress; setup_firewall   || rc=$?; mark_step firewall     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      4) mark_step tor "running";          show_progress; setup_tor        || rc=$?; mark_step tor          "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      5) mark_step ssh_hardening "running"; show_progress; harden_ssh       || rc=$?; mark_step ssh_hardening "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      6) mark_step fail2ban "running";     show_progress; setup_fail2ban   || rc=$?; mark_step fail2ban     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      7) mark_step unattended "running";   show_progress; configure_unattended_upgrades || rc=$?; mark_step unattended "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      8) mark_step ipv6 "running";         show_progress; disable_ipv6     || rc=$?; mark_step ipv6         "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      9) mark_step sysctl "running";       show_progress; harden_sysctl    || rc=$?; mark_step sysctl       "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     10) mark_step apparmor "running";     show_progress; setup_apparmor   || rc=$?; mark_step apparmor     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     11) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     12) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     13) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     14) bold "=== SSH diagnostics & lockout fix ==="; restore_ssh_mode || rc=$?;;
+     15) bold "=== Authorized keys ==="; _maintenance_list_keys;;
+     16) bold "=== SSH config review ==="; _ssh_inspect_config || rc=$?;;
+     17) bold "=== SSH self-heal guard ==="
          if [ -f /var/run/neohiro-ssh-watchdog.armed ]; then
            info "Self-heal guard is installed and armed."
            if prompt_yn "Remove the self-heal guard?" "n"; then
@@ -1904,9 +2312,9 @@ maintenance_menu() {
            fi
          fi
          ;;
-     17) bold "=== Log viewer ==="; _maintenance_logs;;
-     18) bold "=== System info ==="; _maintenance_sysinfo;;
-     19) info "Returning to main menu."; break;;
+     18) bold "=== Log viewer ==="; _maintenance_logs;;
+     19) bold "=== System info ==="; _maintenance_sysinfo;;
+     20) info "Returning to main menu."; break;;
     esac
     if [ $rc -eq 0 ]; then
       ok "Done."
@@ -1920,6 +2328,7 @@ maintenance_menu() {
 update_system() {
   msg "Updating system and installing base packages..."
   _warn_if_not_tmux
+  apt_https_guard "update_system" || true
   local upgradable=0
   case "$PKG_MGR" in
     apt) upgradable=$(apt list --upgradable 2>/dev/null | grep -c '/') || upgradable=0 ;;
@@ -1951,6 +2360,7 @@ update_system() {
 update_kernel() {
   msg "System and kernel update..."
   _warn_if_not_tmux
+  apt_https_guard "update_kernel" || true
 
   if [ "$EUID" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
     err "sudo required for kernel update."
@@ -3258,6 +3668,25 @@ run_deepclean() {
 # about enabling automatic (security) updates. Never touches firewall,
 # SSH, sysctl, AppArmor, or any hardening. Use this for a "just sync
 # the system and have the latest binaries" pass.
+# Force HTTPS for every configured package repository, then report the
+# resulting state. Shared by the main workflow step, the maintenance menu,
+# and the --apt-https CLI flag so all three behave identically.
+_step_apt_https() {
+  local rc=0
+  # `if ! cmd; then rc=$?; fi` would capture the negation's status, not the
+  # command's, so use the explicit `|| rc=$?` form.
+  apt_https_enforce "step:apt_https" || rc=$?
+  # Count any backups the guard took so the run summary stays honest.
+  local bdir n=0 b
+  bdir="$(apt_https_backup_dir)"
+  if [ -d "$bdir" ]; then
+    for b in "$bdir"/*.orig; do [ -f "$b" ] && n=$((n + 1)); done
+  fi
+  [ "$n" -gt 0 ] && metrics_add configs_backed_up "$n"
+  apt_https_report || true
+  return "$rc"
+}
+
 updates_only_mode() {
   bold "=== Updates-only mode ==="
   info "This runs the comprehensive update engine (every available package"
@@ -3265,6 +3694,10 @@ updates_only_mode() {
   info "(but does not enable) the core service binaries, and optionally"
   info "enables automatic (security) updates. No firewall, SSH, or hardening."
   echo
+
+  # Precaution before anything is fetched: force repository traffic over
+  # HTTPS (and roll back automatically if a mirror cannot speak TLS).
+  apt_https_guard "updates_only_mode" || true
 
   # 1) Comprehensive system update — every package manager + snap/flatpak
   # + docker images + brew + firmware. Same engine lives in lib/updater.sh
@@ -3883,6 +4316,21 @@ main() {
       rollback_mode "${1#--rollback=}"
       exit $?
       ;;
+    --apt-https|--enforce-https)
+      bold "neohiro/linux - HTTPS package repositories (enforce)"
+      _step_apt_https
+      exit $?
+      ;;
+    --apt-https-audit)
+      bold "neohiro/linux - HTTPS package repositories (audit only)"
+      apt_https_report
+      exit $?
+      ;;
+    --apt-https-off|--disable-https)
+      bold "neohiro/linux - Revert HTTPS package repository enforcement"
+      apt_https_revert
+      exit $?
+      ;;
     --dry-run)
       DRY_RUN=1; shift
       bold "[DRY-RUN] Preview mode - no changes will be made"
@@ -3914,7 +4362,7 @@ main() {
       ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
+Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [--apt-https[=audit|off]] [-h]
 
   (no flag)         Run the full interactive setup & hardening.
   --auto, -y, --yes Run unattended: intelligent profile selection, no prompts,
@@ -3940,6 +4388,19 @@ Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restor
   --rollback        Dry-prints the inverse cp commands needed to undo
                     every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those cp commands (latest backup wins).
+  --apt-https       Force HTTPS for every configured package repository
+                    (writes /etc/apt/apt.conf.d/99neohiro-force-https and
+                    rewrites http:// repo URLs to https://). Runs
+                    automatically before every apt/dnf/yum/zypper/pacman
+                    download/update/upgrade, so this flag is only needed to
+                    apply it on its own. Backups land in
+                    /var/backups/neohiro-apt-https/. A mirror that cannot
+                    speak HTTPS is detected and the rewrite is rolled back
+                    automatically. Alias: --enforce-https
+  --apt-https-audit Report the current transport security of every repo
+                    without changing anything (exit 1 if plaintext remains).
+  --apt-https-off   Revert: restore every backed-up repo file and remove
+                    the apt policy drop-in. Alias: --disable-https
   -h, --help        Show this help.
 
 Environment variables:
@@ -3950,6 +4411,20 @@ Environment variables:
   TOR_NICK=...      Override the Tor relay nickname (default: hostname).
   TOR_CONTACT=...   Override the Tor relay contact (default: you@example.com).
   NEOHIRO_DEBUG_LOG=path  Override debug log location.
+
+Repository transport guard (applies to every package manager):
+  NEOHIRO_APT_HTTPS=1          Enforce HTTPS. Default.
+  NEOHIRO_APT_HTTPS=audit      Report only; never modify anything.
+  NEOHIRO_APT_HTTPS=0          Disable the guard entirely.
+  NEOHIRO_APT_HTTPS_REWRITE=1  Allow http->https rewrite on dnf/yum/zypper/
+                               pacman repo files (off by default; not every
+                               mirror serves the same paths over TLS).
+  NEOHIRO_APT_HTTPS_NOVERIFY=1 Skip the post-rewrite `apt-get update` check.
+  NEOHIRO_APT_HTTPS_STRICT=1   Treat leftover plaintext repos as a hard error.
+  NEOHIRO_APT_BLOCK_PORT80=1   Also add `ufw deny out 80/tcp` so no process can
+                               open a plaintext package connection at all.
+                               Off by default because a blanket outbound
+                               block also affects unrelated protocols.
 USAGE
       exit 0
       ;;
@@ -4062,13 +4537,17 @@ USAGE
     done
   }
   # Workflow order, from most aggressive cleaning to most targeted update:
-  #   1) Attack-surface reduction FIRST — stop unneeded services so they are
+  #   0) HTTPS enforcement for every package repository. This runs FIRST and
+  #      on every profile so nothing below can fetch a package over plaintext
+  #      HTTP (a MITM on the mirror can inject arbitrary .deb/.rpm files).
+  #   1) Attack-surface reduction - stop unneeded services so they are
   #      no longer holding files / kernel modules when we upgrade.
-  #   2) Comprehensive system update + kernel prune — every package manager,
+  #   2) Comprehensive system update + kernel prune - every package manager,
   #      snap, flatpak, docker, brew, firmware, geoip.
   #   3) Hardening layer: firewall, SSH, fail2ban, sysctl, AppArmor, ...
   # Rationale: dropping unwanted services first means the system-update
   # transaction does not need to chase daemons that are about to go away.
+  _run_step apt_https "Force HTTPS for all package repos" "" _step_apt_https y
   _run_step optimize_asr "Attack-surface reduction (stop unneeded services)"  "" run_optimize_asr   n
   # System step is special: it always follows with update_kernel so the
   # new kernel can be detected before the run ends. The comprehensive

@@ -30,7 +30,14 @@ the package name right per distro. This script:
 - **Rollback log per file.** Every config it edits is backed up to a
   timestamped copy; the index lives at `/var/log/linux-install-rollback.log`
   and is one `cp` away from a full undo.
-- **Three security profiles + a 20-tool maintenance suite.** From
+- **HTTPS-only package transport, enforced before every download.** A
+  plaintext `http://` mirror lets anyone on the path swap a `.deb`/`.rpm`
+  for their own. The guard rewrites every repo URL to `https://`, installs
+  an apt policy drop-in that refuses HTTPS→HTTP downgrade redirects, backs
+  the originals up, and auto-reverts if a mirror turns out not to speak
+  TLS. Runs first on every profile — see
+  [Package transport security](#package-transport-security-https).
+- **Three security profiles + a 21-tool maintenance suite.** From
   "Recommended" (firewall + updates, 6 steps, no SSH risk) to "Full"
   (Tor + IPv6 disable + ASR + deep clean, 12 steps). Maintenance menu
   re-runs any step on a live box without re-hardening.
@@ -45,9 +52,10 @@ the package name right per distro. This script:
 | SSH hardening | `PasswordAuthentication no` gated on validated pubkey; port never changed |
 | Fail2ban, sysctl profile, AppArmor/SELinux check | per-distro package names |
 | Tor, dnscrypt-proxy, unattended-upgrades, DeepClean | optional per profile |
+| **HTTPS-only package transport** | enforced before every `apt`/`dnf`/`yum`/`zypper`/`pacman` download — `--apt-https` |
 | **Rollback log** | `/var/log/linux-install-rollback.log` — `original\tbackup` per file |
 | **SSH self-heal** | `--install-self-heal` — systemd timer or cron, every 60s |
-| **20-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
+| **21-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
 
 ## Quick start
 
@@ -82,8 +90,6 @@ the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
 
-<<<<<<< HEAD
-=======
 ## One-step automated setup
 
 Run the general interactive script directly from the repo — it prompts you
@@ -114,7 +120,119 @@ SSH can get you back in.
 `━━━ PROGRESS ████████████░░░░ 12/17 (70%) ━━━`) before every step, so you
 always see what's already done and what's coming.
 
->>>>>>> origin/main
+### Package transport security (HTTPS)
+
+A plaintext `http://` package mirror means anyone who can intercept the
+route — a hostile Wi-Fi, a compromised router, an upstream CDN node — can
+swap the `.deb` / `.rpm` / `.pkgz` you just downloaded for one of theirs.
+Signature checks catch *forged* packages, but they do not stop a
+*downgrade* to an older, genuinely-signed, vulnerable build. Only TLS on
+the transport closes that gap.
+
+So every entry point in this repo runs a guard **before** anything is
+fetched. It is the first workflow step (on every profile, including
+Custom), it runs once per process, and it is idempotent, so re-runs and
+`--auto` are cheap.
+
+```bash
+# Apply it on its own (normally automatic)
+sudo bash linuxinstall.sh --apt-https
+
+# Report only; never modifies anything. Exit 1 if plaintext remains.
+sudo bash linuxinstall.sh --apt-https-audit
+
+# Undo: restore every backup and remove the policy drop-in.
+sudo bash linuxinstall.sh --apt-https-off
+
+# Or standalone, no installer needed:
+sudo bash lib/apt-https.sh            # enforce
+sudo bash lib/apt-https.sh --report   # audit
+sudo bash lib/apt-https.sh --revert   # undo
+```
+
+**On apt** (Debian / Ubuntu / Mint / Pop!_OS / Kali and derivatives) it:
+
+1. Installs `/etc/apt/apt.conf.d/99neohiro-force-https`:
+
+   ```text
+   Acquire::https::AllowRedirect "true";   // https -> https redirects are fine
+   Acquire::http::AllowRedirect  "false";  // https -> http  is REFUSED, not followed
+   Acquire::https::Verify-Peer  "true";
+   Acquire::https::Verify-Host  "true";
+   Acquire::Retries             "3";
+   ```
+
+   The anti-downgrade line is the important one: without it, an
+   `https://` mirror can silently bounce you down to `http://`.
+
+2. Rewrites `http://` → `https://` on active lines in
+   `/etc/apt/sources.list`, `/etc/apt/sources.list.d/*.list` (classic) and
+   `/etc/apt/sources.list.d/*.sources` (DEB822 `URIs:` field only).
+   Commented-out lines and DEB822 structural fields (`Suites:`,
+   `Components:`, `Signed-By:`) are left exactly as they were.
+
+3. Backs every file up to `/var/backups/neohiro-apt-https/` **before** the
+   first edit and logs each one to the rollback log, so
+   `bash linuxinstall.sh --rollback --apply` can undo it too.
+
+4. Verifies with a real `apt-get update`. If a mirror turns out not to
+   serve the same paths over TLS, the rewrite is **rolled back
+   automatically** — you are never left with an unusable package manager.
+   Set `NEOHIRO_APT_HTTPS_STRICT=1` to keep the rewrite and fail loudly
+   instead.
+
+5. Warns if no CA trust store is present, since HTTPS verification is
+   worthless without one.
+
+**On dnf / yum / zypper / pacman / flatpak** it audits and reports every
+plaintext repo URL but does **not** blindly rewrite: plenty of upstream
+mirrors do not serve the same paths over TLS, and silently breaking a
+working repo is worse than the threat it prevents. Point those at an
+https-capable mirror, or opt in to the rewrite with
+`NEOHIRO_APT_HTTPS_REWRITE=1` and re-audit afterwards.
+
+**Where it is wired in:** `pkg_update` / `pkg_install` / `pkg_upgrade` /
+`pkg_autoremove`, `update_system`, `update_kernel`, `updates_only_mode`,
+every `_update_*` in `lib/updater.sh` plus the `_run_all_updates`
+dispatcher, `restore_ssh.sh` (before installing `openssh-server`),
+`DeepClean.sh` (before `apt-get autoremove --purge`), the **Maintenance**
+submenu option 1, the `--step apt_https` mode, and the `--apt-https*`
+flags. `OptimizeLinuxASR.sh` does not download packages, so it needs no
+guard.
+
+| Variable | Effect |
+|---|---|
+| `NEOHIRO_APT_HTTPS=1` | enforce (default) |
+| `NEOHIRO_APT_HTTPS=audit` | report only, never modify |
+| `NEOHIRO_APT_HTTPS=0` | disable the guard entirely |
+| `NEOHIRO_APT_HTTPS_REWRITE=1` | allow the http→https rewrite on dnf/yum/zypper/pacman |
+| `NEOHIRO_APT_HTTPS_NOVERIFY=1` | skip the post-rewrite `apt-get update` check |
+| `NEOHIRO_APT_HTTPS_STRICT=1` | treat leftover plaintext repos as a hard error |
+| `NEOHIRO_APT_BLOCK_PORT80=1` | also `ufw deny out 80/tcp` (opt-in, see below) |
+
+### Optional: block port 80 entirely
+
+If you want belt-and-braces so that *no* process can open an unencrypted
+package connection, add an outbound deny rule:
+
+```bash
+sudo bash linuxinstall.sh --apt-https      # make sure every repo is https first
+sudo ufw deny out 80/tcp && sudo ufw reload
+# or: NEOHIRO_APT_BLOCK_PORT80=1 sudo bash linuxinstall.sh --apt-https
+```
+
+This is **opt-in** because a blanket outbound block also breaks unrelated
+plaintext protocols (local registries, metrics endpoints, captive-portal
+checks). The guard refuses to add the rule while any plaintext repo is
+still configured, since that would only break those repos.
+
+Verify:
+
+```bash
+sudo ufw status | grep -E '80/tcp|Status'     # outbound DENY present
+sudo bash linuxinstall.sh --apt-https-audit   # exit 0 = no plaintext repos left
+```
+
 ### Cross-distro kernel update
 
 `linuxinstall.sh` auto-detects the package manager and updates the kernel
@@ -265,14 +383,15 @@ The Maintenance suite itself is expanded to include:
 
 | # | Option | What it does |
 |---|---|---|
-| 1–13 | system / dns / firewall / tor / ssh / fail2ban / unattended / ipv6 / sysctl / apparmor / pam / OptimizeLinuxASR / DeepClean | Re-run any step on demand |
-| 14 | SSH diagnostics & lockout fix | Same routine as `--restore-ssh` |
-| 15 | Authorized keys | List all keys in every user's `authorized_keys` |
-| 16 | SSH config review | Print every key directive from `sshd_config` and drop-ins |
-| 17 | SSH self-heal guard | Install / remove / status of the per-minute watchdog |
-| 18 | Logs | Tail `/var/log/linux-install-rollback.log` and `/var/log/neohiro-ssh-watchdog.log` |
-| 19 | System info | Uptime, load, memory, disk, CPU, listening ports |
-| 20 | Back to main menu | — |
+| 1 | Force HTTPS for package repos | Enforces TLS for every repo before any download; prints the resulting state |
+| 2–14 | system / dns / firewall / tor / ssh / fail2ban / unattended / ipv6 / sysctl / apparmor / pam / OptimizeLinuxASR / DeepClean | Re-run any step on demand |
+| 15 | SSH diagnostics & lockout fix | Same routine as `--restore-ssh` |
+| 16 | Authorized keys | List all keys in every user's `authorized_keys` |
+| 17 | SSH config review | Print every key directive from `sshd_config` and drop-ins |
+| 18 | SSH self-heal guard | Install / remove / status of the per-minute watchdog |
+| 19 | Logs | Tail `/var/log/linux-install-rollback.log` and `/var/log/neohiro-ssh-watchdog.log` |
+| 20 | System info | Uptime, load, memory, disk, CPU, listening ports |
+| 21 | Back to main menu | — |
 
 The self-heal guard runs as root via `systemd` or cron and **never
 modifies `authorized_keys` or any credentials** — it only fixes config
@@ -541,8 +660,10 @@ dumps — add to `/etc/security/limits.conf`:
 ### Testing
 
 ```bash
-bash tests/test_linuxinstall.sh    # 65 tests: parse, logic, UX coverage, snapshot
-bash tests/test_updater.sh         # 43 tests: dispatcher, race safety, version floor
+bash tests/run-all.sh                  # every suite, with a summary
+bash tests/test_linuxinstall.sh        # 66 tests: parse, logic, UX coverage, snapshot
+bash tests/test_apt_https.sh           # 84 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
+bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```
 

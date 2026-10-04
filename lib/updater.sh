@@ -163,10 +163,21 @@ _cmd() {
   run "$@"
 }
 
+# ── Repository transport guard ────────────────────────────────────────────────
+# Sourced here (after the print helpers and `run` exist) so the update engine
+# can never fetch a package over plaintext HTTP, whether it is run standalone
+# (`sudo bash lib/updater.sh`) or called from linuxinstall.sh. The guard is a
+# no-op when it has already run in this process.
+# shellcheck disable=SC1091
+if [ -r "$(dirname "${BASH_SOURCE[0]:-$0}")/apt-https.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]:-$0}")/apt-https.sh"
+fi
+
 # ── Package managers ─────────────────────────────────────────────────────────
 
 _update_apt() {
   command -v apt >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_apt" || true
   msg "apt: updating package lists..."
   if ! run sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
     err "apt update failed"; _track; return 1
@@ -192,6 +203,7 @@ _update_apt() {
 
 _update_dnf() {
   command -v dnf >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_dnf" || true
   msg "dnf: checking for updates..."
   if ! run sudo dnf upgrade --refresh -y -q; then
     err "dnf upgrade failed"; _track; return 1
@@ -203,6 +215,7 @@ _update_dnf() {
 
 _update_yum() {
   command -v yum >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_yum" || true
   msg "yum: checking for updates..."
   if ! run sudo yum update -y -q; then
     err "yum update failed"; _track; return 1
@@ -214,6 +227,7 @@ _update_yum() {
 
 _update_zypper() {
   command -v zypper >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_zypper" || true
   msg "zypper: refreshing + updating..."
   if ! run sudo zypper --quiet refresh; then
     err "zypper refresh failed"; _track; return 1
@@ -228,6 +242,7 @@ _update_zypper() {
 
 _update_pacman() {
   command -v pacman >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_pacman" || true
   msg "pacman: syncing + upgrading..."
   if ! run sudo pacman -Syu --noconfirm --quiet; then
     err "pacman update failed"; _track; return 1
@@ -242,6 +257,7 @@ _update_pacman() {
 
 _update_snap() {
   command -v snap >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_snap" || true
   msg "snap: refreshing all snaps..."
   # Track snap refresh outcome so the dispatcher summary is accurate.
   if _cmd sudo snap refresh; then
@@ -285,6 +301,7 @@ _update_snap() {
 
 _update_flatpak() {
   command -v flatpak >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_flatpak" || true
   msg "flatpak: updating remote repos + all installations..."
   local rc=0
   # `flatpak remote-ls --updates` exits 0 whether or not there are updates
@@ -347,6 +364,7 @@ _update_docker() {
 
 _update_brew() {
   command -v brew >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_brew" || true
   msg "brew: updating..."
   local brew_failed=0
   if ! HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null; then
@@ -619,6 +637,10 @@ _update_pihole() {
 #   VERBOSE=2        — trace every command
 #   DRY_RUN=1        — simulate all commands without running them
 #
+# Repository transport: apt_https_guard runs before the first sub-step, so
+# nothing in this dispatcher can pull a package over plaintext HTTP. It is
+# idempotent, so the per-_update_* guards cost nothing.
+#
 # Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
 
 _run_all_updates() {
@@ -631,6 +653,9 @@ _run_all_updates() {
       --steps=*)      _steps_overrides="${_p#--steps=}" ;;
     esac
   done
+
+  # Precaution before a single byte is downloaded.
+  apt_https_guard "_run_all_updates" || true
 
   msg "=== Comprehensive system update ==="
   local start_sec=$SECONDS
@@ -763,6 +788,26 @@ else
   # Called as a script. Pass all arguments to _run_all_updates.
   set -euo pipefail
   SECONDS=0
+  # Sub-commands handled here rather than by the dispatcher, because they
+  # only touch the repository transport and never run an update.
+  case "${1:-}" in
+    --apt-https|--enforce-https)
+      if [ "${2:-}" = "--audit" ]; then
+        apt_https_report
+      else
+        apt_https_enforce "updater --apt-https"
+      fi
+      exit $?
+      ;;
+    --apt-https-audit)
+      apt_https_report
+      exit $?
+      ;;
+    --apt-https-off|--disable-https)
+      apt_https_revert
+      exit $?
+      ;;
+  esac
   _run_all_updates "$@"
   exit $?
 fi
