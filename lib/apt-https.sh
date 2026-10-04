@@ -242,6 +242,33 @@ _apt_https_plaintext_in_repo_file() {
   return 0
 }
 
+# _apt_https_plaintext_generic <file> <source-id>
+#
+# The format-agnostic detector: any non-comment line carrying an http:// URL.
+# Used for every non-apt store (apk repositories, docker daemon.json, pip.conf,
+# .npmrc, cargo config.toml, .gemrc, nix.conf, fwupd remotes, ...).
+#
+# Being generic is the point. A per-dialect key list would miss gpgkey=,
+# metalink=, and whatever the next distro release adds, and a miss is exactly
+# the failure this library exists to prevent. Comment lines are skipped so a
+# documentation link in a config file is not mistaken for a fetch target.
+_apt_https_plaintext_generic() {
+  local f="$1" id="${2:-}"
+  [ -f "$f" ] || return 0
+  awk -v id="$id" '
+    /^[[:space:]]*(#|;)/ { next }
+    /http:\/\// {
+      line = $0
+      gsub(/^[[:space:]]+/, "", line)
+      printf "%s:%d: %s\n", FILENAME, NR, line
+    }' "$f" 2>/dev/null
+  return 0
+}
+
+# _apt_https_rewrite_generic <file> — http:// -> https:// on non-comment lines.
+# Same substitution the apt rewrite uses, so behaviour is identical.
+_APT_HTTPS_GENERIC_RE='/^[[:space:]]*(#|;)/! s|http://|https://|g'
+
 # ── Backups ──────────────────────────────────────────────────────────────────
 
 # _apt_https_backup_path <file> — deterministic, path-flattened backup name.
@@ -310,15 +337,11 @@ _apt_https_write_conf() {
     return 1
   fi
   _apt_priv mkdir -p "$(apt_https_etc_dir)/apt/apt.conf.d" || { rm -f "$tmp"; return 1; }
-  if ! _apt_priv install -m 0644 "$tmp" "$conf"; then
-    # `install` is not present on every minimal image; fall back to cp+chmod.
-    if _apt_priv cp "$tmp" "$conf" && _apt_priv chmod 0644 "$conf"; then
-      rc=0
-    else
-      rc=1
-    fi
-  else
+  # Atomic rename into place; see _apt_https_atomic_replace for why.
+  if _apt_https_atomic_replace "$conf" 0644 _apt_https_prep_conf_stage "$tmp"; then
     rc=0
+  else
+    rc=1
   fi
   rm -f "$tmp"
   [ "$rc" = "0" ] || return 1
@@ -333,6 +356,68 @@ _apt_https_stage() {
     return 0
   fi
   mktemp "${TMPDIR:-/tmp}/neohiro-apt-https.XXXXXX"
+}
+
+# _apt_https_atomic_replace <target> <mode|-> <prep-fn> [prep-args...]
+#
+# Runs <prep-fn> <stage> [prep-args...] to build a staging file that lives
+# in the *target's own directory*, then renames it over the target.
+#
+# Why not just `cp tmp target`: cp truncates the destination and then
+# writes. If the process dies mid-copy — OOM, SIGKILL, a container being
+# stopped — the repo file is left truncated, i.e. a broken package manager.
+# rename(2) within a single filesystem is atomic, so a reader (apt itself,
+# or a concurrent run of this script) sees either the whole old file or the
+# whole new one, never a half-written mix. Staging in the target's own
+# directory guarantees the same filesystem, which is what makes the rename
+# atomic instead of a slow cross-device copy.
+#
+# The staging name ends in the PID and therefore never ends in ".list" or
+# ".sources", so apt's own sources.list.d globs cannot pick it up.
+#
+# <mode> is a chmod mode for the result ("-" = leave it alone, which is how
+# the repo rewrite preserves the original file's mode and ownership).
+_apt_https_atomic_replace() {
+  local target="$1" mode="$2" prep="$3"; shift 3
+  local stage
+  stage="${target}.neohiro-rewrite.$$"
+  _apt_priv rm -f "$stage" 2>/dev/null || true
+  if ! "$prep" "$stage" "$@"; then
+    _apt_priv rm -f "$stage" 2>/dev/null || true
+    return 1
+  fi
+  if [ "$mode" != "-" ]; then
+    if ! _apt_priv chmod "$mode" "$stage"; then
+      _apt_priv rm -f "$stage" 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if ! _apt_priv mv -f "$stage" "$target"; then
+    _apt_priv rm -f "$stage" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# _apt_https_prep_conf_stage <stage> <src> — plain content copy.
+_apt_https_prep_conf_stage() {
+  _apt_priv cp "$2" "$1"
+}
+
+# _apt_https_prep_repo_stage <stage> <target> <rewritten-content>
+#
+# Builds the staged rewrite so the renamed result keeps the original file's
+# mode and ownership. `cp -p` clones those attributes onto the staging file,
+# then `cp` over the *existing* staging file replaces only its content --
+# POSIX only applies the source's permissions when cp CREATES the
+# destination, so the cloned attributes survive.
+#
+# This deliberately avoids `sed -i`: whether GNU sed, busybox sed, or a BSD
+# variant preserve the mode across an in-place edit is implementation
+# detail, and this file is edited while root on a machine whose package
+# manager must keep working.
+_apt_https_prep_repo_stage() {
+  _apt_priv cp -p "$2" "$1" && _apt_priv cp "$3" "$1"
 }
 
 # ── apt source rewriting ─────────────────────────────────────────────────────
@@ -351,19 +436,28 @@ _APT_HTTPS_REVERTED=0
 # backup, or the privileged copy failed). Tracked separately so
 # apt_https_enforce never claims "already https" when it actually gave up.
 _APT_HTTPS_REFUSED=0
+# Latch for the CA-trust-store warning, which would otherwise repeat once per
+# call site (enforce AND report both check it). This MUST be initialised here,
+# at the top level: a report-only run never calls the rewrite path, so
+# initialising it inside a function left it unbound under `set -u`.
+_APT_HTTPS_CA_WARNED=""
 
 # _apt_https_rewrite_file <file>
 # Sets _APT_HTTPS_VERDICT to "changed" or "clean". Backs the file up before
 # the first edit and refuses to edit a file it could not back up.
 _apt_https_rewrite_file() {
-  local f="$1" tmp expr
+  local f="$1" tmp expr="${2:-}"
   _APT_HTTPS_VERDICT="clean"
   [ -f "$f" ] || return 0
 
-  case "$f" in
-    *.sources) expr='/^[[:space:]]*URIs:[[:space:]]/ s|http://|https://|g' ;;
-    *)         expr='/^[[:space:]]*#/! s|http://|https://|g' ;;
-  esac
+  if [ -z "$expr" ]; then
+    # DEB822 must only be rewritten on the URIs: field; everything else is a
+    # flat key=value or URL-per-line format, where any active line counts.
+    case "$f" in
+      *.sources) expr='/^[[:space:]]*URIs:[[:space:]]/ s|http://|https://|g' ;;
+      *)         expr="$_APT_HTTPS_GENERIC_RE" ;;
+    esac
+  fi
 
   tmp="$(_apt_https_stage)"
   if ! sed -E "$expr" "$f" > "$tmp" 2>/dev/null; then
@@ -375,13 +469,14 @@ _apt_https_rewrite_file() {
     rm -f "$tmp"
     return 0
   fi
-  # Refuse to edit anything we cannot first back up or cannot write.
+  # Refuse to edit anything we cannot first back up.
   if ! _apt_https_backup_once "$f"; then
     rm -f "$tmp"
     _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1))
     return 0
   fi
-  if ! _apt_priv cp "$tmp" "$f"; then
+  # Atomic replace that keeps the original file's mode and ownership.
+  if ! _apt_https_atomic_replace "$f" - _apt_https_prep_repo_stage "$f" "$tmp"; then
     rm -f "$tmp"
     _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1))
     return 0
@@ -408,9 +503,9 @@ _apt_https_rewrite_apt_sources() {
   return 0
 }
 
-# _apt_https_revert_apt_sources — undo the rewrite from the backups.
-# Sets _APT_HTTPS_REVERTED to the number of files restored.
-_apt_https_revert_apt_sources() {
+# _apt_https_revert_all_sources — undo the rewrite for EVERY source, not just
+# apt. Sets _APT_HTTPS_REVERTED to the number of files restored.
+_apt_https_revert_all_sources() {
   local f bak backupdir
   _APT_HTTPS_REVERTED=0
   backupdir="$(apt_https_backup_dir)"
@@ -424,7 +519,240 @@ _apt_https_revert_apt_sources() {
         info "Restored $f from backup"
       fi
     fi
-  done < <(_apt_https_repo_files)
+  done < <(_apt_https_managed_files)
+  return 0
+}
+
+# Kept as an alias: the original name is referenced by the inline fallback and
+# by callers that only ever touched apt.
+_apt_https_revert_apt_sources() {
+  _apt_https_revert_all_sources
+}
+
+# ── App-store source registry ────────────────────────────────────────────────
+# The precaution is not apt-specific: every distribution and language has its
+# own "app store", and several of them default to plaintext HTTP. This
+# registry is the single list of every source this library inspects.
+#
+# Three per-source questions:
+#   files  — where the transport is configured on disk
+#   env    — where it is configured through the environment
+#   family — the repo-file dialect (drives which keys hold URLs)
+#
+# Detection is deliberately generic: ANY non-comment line containing an
+# http:// URL in one of those files is reported. Per-dialect key regexes
+# (baseurl=, Server=, index-url, registry, substituters, ...) would miss
+# gpgkey=, metalkink= and whatever the next release adds, and a miss is
+# exactly the failure mode this library exists to prevent.
+#
+# Rewriting is a separate, opt-in step (see apt_https_enforce) because
+# whether https://<same-host><same-path> actually exists is not knowable
+# without a network round trip. Rewriting blind would turn a working mirror
+# into a broken one, which is worse than the threat. apt is the exception:
+# it is verified with a real `apt-get update` and rolled back on failure.
+
+# _apt_https_source_ids — every source id, one per line.
+_apt_https_source_ids() {
+  printf '%s\n' \
+    apt dnf yum zypper pacman apk \
+    flatpak snap docker brew pip npm cargo gem nix fwupd
+}
+
+# _apt_https_source_label <id> — human name for the report.
+_apt_https_source_label() {
+  case "$1" in
+    apt)     printf 'apt (Debian/Ubuntu/Mint/Pop!/Kali)' ;;
+    dnf)     printf 'dnf (RHEL 8+/Fedora/Alma/Rocky)' ;;
+    yum)     printf 'yum (CentOS 7/RHEL 7)' ;;
+    zypper)  printf 'zypper (openSUSE/SLES)' ;;
+    pacman)  printf 'pacman (Arch/Manjaro)' ;;
+    apk)     printf 'apk (Alpine)' ;;
+    flatpak) printf 'flatpak remotes' ;;
+    snap)    printf 'snap (store)' ;;
+    docker)  printf 'docker registry config' ;;
+    brew)    printf 'Homebrew taps' ;;
+    pip)     printf 'pip index' ;;
+    npm)     printf 'npm registry' ;;
+    cargo)   printf 'cargo registry' ;;
+    gem)     printf 'gem sources' ;;
+    nix)     printf 'nix substituters/channels' ;;
+    fwupd)   printf 'fwupd remotes (LVFS)' ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+# _apt_https_source_files <id> — config files that carry this source's URLs.
+_apt_https_source_files() {
+  local etc f
+  etc="$(apt_https_etc_dir)"
+  case "$1" in
+    apt)     _apt_https_repo_files ;;
+    dnf|yum) _apt_https_foreign_repo_files dnf ;;
+    zypper)  _apt_https_foreign_repo_files zypper ;;
+    pacman)  _apt_https_foreign_repo_files pacman ;;
+    # Alpine: one URL per line, http:// by default on many images.
+    apk)
+      [ -f "${etc}/apk/repositories" ] && printf '%s\n' "${etc}/apk/repositories"
+      ;;
+    # Registry mirrors / insecure-registries live in daemon.json.
+    docker)
+      [ -f "${etc}/docker/daemon.json" ] && printf '%s\n' "${etc}/docker/daemon.json"
+      ;;
+    # pip: system config plus the two variables that usually win.
+    pip)
+      for f in "${etc}/pip.conf" "${etc}/xdg/pip/pip.conf" \
+               "${HOME:-}/.pip/pip.conf" "${HOME:-}/.config/pip/pip.conf"; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+      done
+      ;;
+    npm)
+      for f in "${etc}/npmrc" "${HOME:-}/.npmrc"; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+      done
+      ;;
+    cargo)
+      [ -f "${HOME:-}/.cargo/config.toml" ] && printf '%s\n' "${HOME:-}/.cargo/config.toml"
+      [ -f "${etc}/cargo/config.toml" ] && printf '%s\n' "${etc}/cargo/config.toml"
+      ;;
+    gem)
+      [ -f "${etc}/gemrc" ] && printf '%s\n' "${etc}/gemrc"
+      [ -f "${HOME:-}/.gemrc" ] && printf '%s\n' "${HOME:-}/.gemrc"
+      ;;
+    nix)
+      [ -f "${etc}/nix/nix.conf" ] && printf '%s\n' "${etc}/nix/nix.conf"
+      ;;
+    fwupd)
+      for f in "${etc}"/fwupd/remotes.d/*.conf; do
+        [ -f "$f" ] && printf '%s\n' "$f"
+      done
+      ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# _apt_https_source_env <id> — transport configured through the environment.
+# Printed as "VAR=value" so the user gets a copy-pasteable fix.
+_apt_https_source_env() {
+  case "$1" in
+    pip)
+      [ -n "${PIP_INDEX_URL:-}" ]     && printf 'PIP_INDEX_URL=%s\n'     "$PIP_INDEX_URL"
+      [ -n "${PIP_EXTRA_INDEX_URL:-}" ] && printf 'PIP_EXTRA_INDEX_URL=%s\n' "$PIP_EXTRA_INDEX_URL"
+      ;;
+    npm)
+      [ -n "${NPM_CONFIG_REGISTRY:-}" ] && printf 'NPM_CONFIG_REGISTRY=%s\n' "$NPM_CONFIG_REGISTRY"
+      [ -n "${npm_config_registry:-}" ] && printf 'npm_config_registry=%s\n' "$npm_config_registry"
+      ;;
+    cargo)
+      [ -n "${CARGO_REGISTRIES_CRATES_IO_INDEX:-}" ] && \
+        printf 'CARGO_REGISTRIES_CRATES_IO_INDEX=%s\n' "$CARGO_REGISTRIES_CRATES_IO_INDEX"
+      ;;
+    gem)
+      [ -n "${GEM_SOURCE:-}" ] && printf 'GEM_SOURCE=%s\n' "$GEM_SOURCE"
+      ;;
+    brew)
+      [ -n "${HOMEBREW_BREW_GIT_REMOTE:-}" ]  && printf 'HOMEBREW_BREW_GIT_REMOTE=%s\n' "$HOMEBREW_BREW_GIT_REMOTE"
+      [ -n "${HOMEBREW_CORE_GIT_REMOTE:-}" ]  && printf 'HOMEBREW_CORE_GIT_REMOTE=%s\n' "$HOMEBREW_CORE_GIT_REMOTE"
+      [ -n "${HOMEBREW_API_DOMAIN:-}" ]       && printf 'HOMEBREW_API_DOMAIN=%s\n' "$HOMEBREW_API_DOMAIN"
+      [ -n "${HOMEBREW_ARTIFACT_DOMAIN:-}" ]  && printf 'HOMEBREW_ARTIFACT_DOMAIN=%s\n' "$HOMEBREW_ARTIFACT_DOMAIN"
+      ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# _apt_https_source_applicable <id> — false when this host has no such store.
+# Keeps the report from listing eleven N/A rows on a minimal box.
+_apt_https_source_applicable() {
+  local id="$1"
+  case "$id" in
+    # Only the package manager actually present should be audited as such.
+    dnf|yum|zypper|pacman)
+      [ "$(apt_https_family)" = "$id" ] || return 1
+      ;;
+    snap)
+      command -v snap >/dev/null 2>&1 || return 1
+      ;;
+    flatpak)
+      command -v flatpak >/dev/null 2>&1 || return 1
+      ;;
+    docker)
+      command -v docker >/dev/null 2>&1 || return 1
+      ;;
+    brew)
+      command -v brew >/dev/null 2>&1 || return 1
+      ;;
+    pip)
+      command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1 || return 1
+      ;;
+    npm)
+      command -v npm >/dev/null 2>&1 || return 1
+      ;;
+    cargo)
+      command -v cargo >/dev/null 2>&1 || return 1
+      ;;
+    gem)
+      command -v gem >/dev/null 2>&1 || return 1
+      ;;
+    apk)
+      command -v apk >/dev/null 2>&1 || return 1
+      ;;
+    *) : ;;
+  esac
+  return 0
+}
+
+# _apt_https_source_plaintext <id> — report this source's plaintext endpoints.
+_apt_https_source_plaintext() {
+  local id="$1" f
+  case "$id" in
+    apt)
+      while IFS= read -r f; do
+        [ -n "$f" ] && _apt_https_plaintext_in_apt_file "$f"
+      done < <(_apt_https_repo_files)
+      ;;
+    flatpak)
+      _apt_https_flatpak_plaintext
+      ;;
+    *)
+      while IFS= read -r f; do
+        [ -n "$f" ] && _apt_https_plaintext_generic "$f" "$id"
+      done < <(_apt_https_source_files "$id")
+      ;;
+  esac
+  _apt_https_source_env "$id"
+  return 0
+}
+
+# _apt_https_source_prefer_https <id>
+# Rewrites http:// -> https:// on non-comment lines of every config file for
+# this source. Sets _APT_HTTPS_CHANGED / _APT_HTTPS_REFUSED. Opt-in only,
+# except for apt (see apt_https_enforce).
+_apt_https_source_prefer_https() {
+  local id="$1" f
+  _APT_HTTPS_CHANGED=0
+  _APT_HTTPS_REFUSED=0
+  [ "$id" = "apt" ] && { _apt_https_rewrite_apt_sources; return 0; }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _apt_https_rewrite_file "$f"
+    if [ "$_APT_HTTPS_VERDICT" = "changed" ]; then
+      _APT_HTTPS_CHANGED=$((_APT_HTTPS_CHANGED + 1))
+      info "Rewrote plaintext URLs -> https: $f"
+    fi
+  done < <(_apt_https_source_files "$id")
+  return 0
+}
+
+# _apt_https_managed_files — every file this library may have edited.
+_apt_https_managed_files() {
+  local id f
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] && printf '%s\n' "$f"
+    done < <(_apt_https_source_files "$id")
+  done < <(_apt_https_source_ids)
   return 0
 }
 
@@ -493,6 +821,10 @@ _apt_https_flatpak_plaintext() {
 
 # HTTPS verification is worthless without a trust store.  Warn (never fail)
 # when it is missing, because installing it would itself need a download.
+#
+# Latched to once per process: apt_https_enforce and apt_https_report both
+# check this, and the maintenance menu and --apt-https path call both, which
+# used to print the identical warning two or three times in one run.
 _apt_https_check_ca_certs() {
   local fam="$1" p
   case "$fam" in
@@ -507,6 +839,8 @@ _apt_https_check_ca_certs() {
     pacman)  [ -e /etc/ssl/certs/ca-certificates.crt ] && return 0; p="ca-certificates" ;;
     *)       return 0 ;;
   esac
+  [ -n "$_APT_HTTPS_CA_WARNED" ] && return 1
+  _APT_HTTPS_CA_WARNED=1
   warn "No system CA trust store found. HTTPS verification of packages will fail."
   info "Install '$p' after the sources are trusted, then re-run: apt_https_enforce"
   return 1
@@ -549,54 +883,75 @@ _apt_https_block_port80() {
 
 # ── Status / report ──────────────────────────────────────────────────────────
 
-# apt_https_status_text — every plaintext repo line still configured.
+# apt_https_status_text — every plaintext endpoint across every app store.
+# One line per offending config line, plus "VAR=value" for env-configured
+# transports, so the output is directly actionable.
 apt_https_status_text() {
-  local fam
-  fam="$(apt_https_family)"
-  _apt_https_audit_family "$fam"
-  _apt_https_flatpak_plaintext
+  local id
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    _apt_https_source_applicable "$id" || continue
+    _apt_https_source_plaintext "$id"
+  done < <(_apt_https_source_ids)
   return 0
 }
 
-# apt_https_report — human-readable state summary.
-# Returns 0 when everything is https, 1 when plaintext remains, 2 when the
-# family is unknown.
+# _apt_https_plaintext_for <id> — findings for one source only.
+apt_https_plaintext_for() {
+  _apt_https_source_applicable "$1" || return 0
+  _apt_https_source_plaintext "$1"
+}
+
+# apt_https_report — per-source state summary.
+# Returns 0 when nothing anywhere uses plaintext, 1 when any source does,
+# 2 when no package manager at all was detected.
 apt_https_report() {
-  local fam missing conf findings
+  local fam conf findings id label n clean applicable
   fam="$(apt_https_family)"
-  printf '\n%s\n' "$(_c '1;36m' '━━━ Package transport security (HTTPS) ━━━')"
-  printf '  Detected package manager: %s\n' "$fam"
-
-  case "$fam" in
-    apt)
-      conf="$(apt_https_conf_file)"
-      if [ -f "$conf" ]; then
-        printf '  %s %s\n' "$(_c '1;32m' '[x]')" "apt policy drop-in active: $conf"
-      else
-        printf '  %s %s\n' "$(_c '1;31m' '[ ]')" "apt policy drop-in MISSING: $conf"
-      fi
-      ;;
-    dnf|yum)   printf '  %s\n' "dnf/yum: repo files audited (no blind rewrite)." ;;
-    zypper)    printf '  %s\n' "zypper: repo files audited (no blind rewrite)." ;;
-    pacman)    printf '  %s\n' "pacman: mirrorlist audited (no blind rewrite)." ;;
-    *)         printf '  %s\n' "No supported package manager detected." ;;
-  esac
-
-  findings="$(apt_https_status_text)"
-  if [ -n "$findings" ]; then
-    printf '\n  %s\n' "$(_c '1;33m' 'Plaintext (http://) repository entries still present:')"
-    printf '%s\n' "$findings" | sed 's/^/    /'
-    printf '\n  %s\n' "  apt:    fix with  sudo bash linuxinstall.sh --apt-https"
-    printf '%s\n' "  others: set NEOHIRO_APT_HTTPS_REWRITE=1, then re-run the audit"
-  else
-    printf '\n  %s %s\n' "$(_c '1;32m' '[x]')" "No plaintext repository URLs detected."
+  printf '\n%s\n' "$(_c '1;36m' '━━━ App-store transport security (HTTPS) ━━━')"
+  printf '  %-34s %s\n' "Package manager:" "$fam"
+  if [ "$fam" = "apt" ]; then
+    conf="$(apt_https_conf_file)"
+    if [ -f "$conf" ]; then
+      printf '  %s %s\n' "$(_c '1;32m' '[x]')" "apt policy drop-in active: $conf"
+    else
+      printf '  %s %s\n' "$(_c '1;31m' '[ ]')" "apt policy drop-in MISSING: $conf"
+    fi
   fi
+  printf '\n  %s\n' "$(_c '1;37m' 'Store                           Result')"
+
+  clean=1
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    _apt_https_source_applicable "$id" || continue
+    label="$(_apt_https_source_label "$id")"
+    findings="$(apt_https_plaintext_for "$id")"
+    if [ -z "$findings" ]; then
+      printf '  %-30s %s\n' "$label" "$(_c '1;32m' 'https only')"
+    else
+      n="$(printf '%s\n' "$findings" | wc -l | tr -d ' ')"
+      printf '  %-30s %s\n' "$label" "$(_c '1;31m' "$n plaintext endpoint(s)")"
+      printf '%s\n' "$findings" | sed 's/^/      /'
+      clean=0
+    fi
+  done < <(_apt_https_source_ids)
+
   _apt_https_check_ca_certs "$fam" || true
+
+  printf '\n'
+  if [ "$clean" = "1" ]; then
+    printf '  %s %s\n' "$(_c '1;32m' '[x]')" "No plaintext endpoints in any configured app store."
+  else
+    printf '  %s %s\n' "$(_c '1;33m' '[!]')" "Some stores still fetch over plaintext HTTP."
+    printf '  %s\n' "  apt:    sudo bash linuxinstall.sh --apt-https   (automatic, verified)"
+    printf '%s\n' "  others: repoint at an https:// endpoint, or opt in with"
+    printf '%s\n' "          NEOHIRO_APT_HTTPS_REWRITE=1 and re-audit afterwards."
+  fi
   printf '\n'
 
   if [ "$fam" = "none" ]; then return 2; fi
-  [ -n "$findings" ] && return 1
-  return 0
+  [ "$clean" = "1" ] && return 0
+  return 1
 }
 
 # ── Enforce ──────────────────────────────────────────────────────────────────
@@ -628,11 +983,11 @@ _apt_https_verify_apt_sources() {
 # apt_https_enforce [label] — apply the precaution once, unconditionally.
 # [label] is a short breadcrumb describing the caller, e.g. "pkg_install".
 apt_https_enforce() {
-  local label="${1:-enforce}" mode fam conf_failed findings rc=0
+  local label="${1:-enforce}" mode fam conf_failed findings rc=0 rewrite id n
   mode="${NEOHIRO_APT_HTTPS:-1}"
 
   fam="$(apt_https_family)"
-  if [ "$fam" = "none" ]; then
+  if [ "$fam" = "none" ] && [ "$mode" != "audit" ]; then
     info "No supported package manager detected — HTTPS guard not applicable."
     return 0
   fi
@@ -642,7 +997,7 @@ apt_https_enforce() {
     return 0
   fi
 
-  msg "Repository transport guard ($label): $fam"
+  msg "Repository transport guard ($label): package manager = $fam"
 
   if [ "$mode" = "audit" ]; then
     info "NEOHIRO_APT_HTTPS=audit — reporting only, nothing is modified."
@@ -656,48 +1011,62 @@ apt_https_enforce() {
     return 0
   fi
 
-  case "$fam" in
-    apt)
-      conf_failed=0
-      _apt_https_write_conf || conf_failed=1
-      _apt_https_rewrite_apt_sources
-      if [ "$_APT_HTTPS_CHANGED" -gt 0 ]; then
-        ok "Rewrote $_APT_HTTPS_CHANGED apt source file(s) to https://"
-        _apt_https_verify_apt_sources || rc=1
-      elif [ "$_APT_HTTPS_REFUSED" -gt 0 ]; then
-        warn "Could not rewrite $_APT_HTTPS_REFUSED apt source file(s): no writable backup."
-        info "Check that $(apt_https_backup_dir) is writable by root, then re-run."
-        rc=1
-      else
-        ok "apt repositories already use https://"
-      fi
-      if [ "$conf_failed" = "1" ]; then
-        warn "Could not install the apt policy drop-in."
-        rc=1
-      fi
-      ;;
-    dnf|yum|zypper|pacman)
-      if [ "${NEOHIRO_APT_HTTPS_REWRITE:-0}" = "1" ]; then
-        _apt_https_rewrite_family "$fam"
-        if [ "$_APT_HTTPS_CHANGED" -gt 0 ]; then
-          ok "Rewrote $_APT_HTTPS_CHANGED $fam repo file(s) to https:// (NEOHIRO_APT_HTTPS_REWRITE=1)"
-          info "Re-check with --apt-https-audit; not every mirror serves the same paths over TLS."
-        fi
-      fi
-      ;;
-    *) : ;;
-  esac
+  # ---- automatic: apt only -------------------------------------------------
+  # The one store we rewrite unattended, because a real `apt-get update` can
+  # verify the result and roll the rewrite back if the mirror cannot speak TLS.
+  if [ "$fam" = "apt" ]; then
+    conf_failed=0
+    _apt_https_write_conf || conf_failed=1
+    _apt_https_rewrite_apt_sources
+    if [ "$_APT_HTTPS_CHANGED" -gt 0 ]; then
+      ok "Rewrote $_APT_HTTPS_CHANGED apt source file(s) to https://"
+      _apt_https_verify_apt_sources || rc=1
+    elif [ "$_APT_HTTPS_REFUSED" -gt 0 ]; then
+      warn "Could not rewrite $_APT_HTTPS_REFUSED apt source file(s): no writable backup."
+      info "Check that $(apt_https_backup_dir) is writable by root, then re-run."
+      rc=1
+    else
+      ok "apt repositories already use https://"
+    fi
+    if [ "$conf_failed" = "1" ]; then
+      warn "Could not install the apt policy drop-in."
+      rc=1
+    fi
+  fi
 
-  # A verification failure rolls the rewrite back; report whatever remains.
+  # ---- opt-in: every other store -------------------------------------------
+  # Whether https://<same host><same path> exists is unknowable without a
+  # network round trip, so this is never automatic.
+  if [ "${NEOHIRO_APT_HTTPS_REWRITE:-0}" = "1" ]; then
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      [ "$id" = "apt" ] && continue
+      _apt_https_source_applicable "$id" || continue
+      _apt_https_source_prefer_https "$id"
+      n="$_APT_HTTPS_CHANGED"
+      if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+        ok "Rewrote $n $(_apt_https_source_label "$id") file(s) to https://"
+      fi
+      if [ "${_APT_HTTPS_REFUSED:-0}" -gt 0 ] 2>/dev/null; then
+        warn "Could not rewrite $_APT_HTTPS_REFUSED $(_apt_https_source_label "$id") file(s): no writable backup."
+      fi
+    done < <(_apt_https_source_ids)
+    info "Rewrote non-apt stores because NEOHIRO_APT_HTTPS_REWRITE=1."
+    info "Re-audit with --apt-https-audit; not every mirror serves the same paths over TLS."
+  fi
+
+  # ---- report ---------------------------------------------------------------
   findings="$(apt_https_status_text)"
   if [ -n "$findings" ]; then
-    warn "Plaintext repository URLs remain for $fam:"
+    warn "Plaintext endpoints still configured:"
     printf '%s\n' "$findings" | sed 's/^/    /'
-    if [ "$fam" != "apt" ]; then
-      info "Point those at an https-capable mirror, or opt in to a blind rewrite"
-      info "with NEOHIRO_APT_HTTPS_REWRITE=1 (verify afterwards)."
-      [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ] && rc=1
+    [ "$fam" = "apt" ] || info "Repoint these at an https:// endpoint, or opt in to a"
+    [ "$fam" = "apt" ] || info "blind rewrite with NEOHIRO_APT_HTTPS_REWRITE=1."
+    if [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ]; then
+      rc=1
     fi
+  else
+    ok "Every configured app store uses https://"
   fi
 
   _apt_https_check_ca_certs "$fam" || true

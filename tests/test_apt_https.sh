@@ -39,8 +39,9 @@ trap cleanup EXIT
 
 SANDBOX="$WD/etc"
 BACKUPS="$WD/backups"
+FAKEHOME="$WD/home"
 FAKEBIN="$WD/bin"
-mkdir -p "$FAKEBIN"
+mkdir -p "$FAKEBIN" "$FAKEHOME"
 
 # Fake ufw: `ufw status` reports nothing installed yet; any mutating call is
 # recorded so a test can assert it happened (or did not).
@@ -86,8 +87,30 @@ reset_sandbox() {
   export NEOHIRO_APT_HTTPS_NOVERIFY=1
   unset NEOHIRO_APT_HTTPS NEOHIRO_APT_HTTPS_REWRITE NEOHIRO_APT_FAMILY \
         NEOHIRO_APT_HTTPS_STRICT NEOHIRO_APT_BLOCK_PORT80 2>/dev/null || true
+  # Hermeticity: the pip/npm/cargo/gem detectors read config from $HOME and
+  # transport from the environment. Point HOME at the sandbox and clear every
+  # transport variable so the developer's real ~/.npmrc or PIP_INDEX_URL
+  # cannot make this suite report findings it did not create.
+  export HOME="$FAKEHOME"
+  unset PIP_INDEX_URL PIP_EXTRA_INDEX_URL NPM_CONFIG_REGISTRY npm_config_registry \
+        CARGO_REGISTRIES_CRATES_IO_INDEX GEM_SOURCE \
+        HOMEBREW_BREW_GIT_REMOTE HOMEBREW_CORE_GIT_REMOTE \
+        HOMEBREW_API_DOMAIN HOMEBREW_ARTIFACT_DOMAIN 2>/dev/null || true
   _APT_HTTPS_DONE=""
   DRY_RUN=0
+}
+
+# _mode_supported — false on filesystems that do not model POSIX permissions
+# (Git Bash on NTFS, some container overlay/CIFS mounts). Permission
+# assertions must self-skip there rather than fail spuriously.
+_mode_supported() {
+  local f="$WD/modeprobe"
+  : > "$f"
+  chmod 0600 "$f" 2>/dev/null
+  if [ "$(ls -l "$f" 2>/dev/null | cut -c1-10)" = "-rw-------" ]; then
+    rm -f "$f"; return 0
+  fi
+  rm -f "$f"; return 1
 }
 
 # ============================================================================
@@ -499,7 +522,7 @@ if grep -q '^baseurl=http://' "$SANDBOX/yum.repos.d/epel.repo"; then
 else
   fail_t "dnf: no blind rewrite by default" "file was rewritten without opt-in"
 fi
-if printf '%s' "$DNFOUT" | grep -q 'Plaintext repository URLs remain'; then
+if printf '%s' "$DNFOUT" | grep -q 'Plaintext endpoints still configured'; then
   ok_t "dnf: leftover plaintext is reported loudly"
 else
   fail_t "dnf: leftover plaintext is reported loudly" "no warning emitted"
@@ -997,7 +1020,7 @@ else
   fail_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system" \
         "$(printf '%s' "$OUT" | grep '__RC=')"
 fi
-if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+if printf '%s' "$OUT" | grep -q 'App-store transport security'; then
   ok_t "restore_ssh.sh --apt-https-audit prints the report"
 else
   fail_t "restore_ssh.sh --apt-https-audit prints the report" "report missing"
@@ -1060,7 +1083,7 @@ else
   fail_t "restore_ssh.sh --apt-https-audit exits 0 on a clean system" \
         "$(printf '%s' "$OUT" | grep '__RC=')"
 fi
-if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+if printf '%s' "$OUT" | grep -q 'App-store transport security'; then
   ok_t "restore_ssh.sh --apt-https-audit prints the report"
 else
   fail_t "restore_ssh.sh --apt-https-audit prints the report" "report missing"
@@ -1087,7 +1110,7 @@ else
   fail_t "restore_ssh.sh --apt-https propagates enforcement failure (not 0)" \
         "$(printf '%s' "$OUT" | grep '__RC=')"
 fi
-if printf '%s' "$OUT" | grep -q 'Package transport security'; then
+if printf '%s' "$OUT" | grep -q 'App-store transport security'; then
   ok_t "restore_ssh.sh --apt-https prints the report even when enforce fails"
 else
   fail_t "restore_ssh.sh --apt-https prints the report even when enforce fails" \
@@ -1120,7 +1143,7 @@ else
   fail_t "lib/updater.sh --apt-https propagates enforcement failure" \
         "$(printf '%s' "$UPD_OUT" | grep '__RC=')"
 fi
-if printf '%s' "$UPD_OUT" | grep -q 'Package transport security'; then
+if printf '%s' "$UPD_OUT" | grep -q 'App-store transport security'; then
   ok_t "lib/updater.sh --apt-https prints the report even when enforce fails"
 else
   fail_t "lib/updater.sh --apt-https prints the report even when enforce fails" \
@@ -1222,6 +1245,190 @@ if [ $? -eq 2 ]; then
   ok_t "lib/apt-https.sh exits 2 on an unknown argument"
 else
   fail_t "lib/apt-https.sh exits 2 on an unknown argument" "rc=$?"
+fi
+
+# ============================================================================
+# Regression: set -u safety of every module-level global
+# ============================================================================
+# A guard variable initialised inside a function instead of at the top level
+# is unbound on any code path that does not call that function, which kills
+# an audit-only run under `set -u`. Load the lib the way the strictest host
+# does and touch every path that reads these globals.
+cat > "$WD/setu_probe.sh" <<'SETU_EOF'
+set -u
+. "$RS_LIB" >/dev/null 2>&1
+apt_https_report >/dev/null 2>&1
+printf 'REPORT=%s\n' "$?"
+apt_https_status_text >/dev/null
+printf 'STATUS=ok\n'
+apt_https_plaintext_for apt >/dev/null 2>&1
+printf 'FORAPT=%s\n' "$?"
+apt_https_revert >/dev/null 2>&1
+printf 'REVERT=%s\n' "$?"
+SETU_EOF
+SETU_OUT="$(env RS_LIB="$LIB" NEOHIRO_APT_ETC_DIR="$SANDBOX" \
+  NEOHIRO_APT_BACKUP_DIR="$BACKUPS" HOME="$FAKEHOME" \
+  NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS_NOVERIFY=1 \
+  bash "$WD/setu_probe.sh" 2>&1)"
+if printf '%s' "$SETU_OUT" | grep -q 'unbound variable'; then
+  fail_t "lib is set -u clean on an audit-only path" \
+        "$(printf '%s' "$SETU_OUT" | grep 'unbound' | head -1)"
+else
+  ok_t "lib is set -u clean on an audit-only path"
+fi
+if printf '%s' "$SETU_OUT" | grep -q 'REPORT=' && \
+   printf '%s' "$SETU_OUT" | grep -q 'STATUS=ok' && \
+   printf '%s' "$SETU_OUT" | grep -q 'FORAPT=' && \
+   printf '%s' "$SETU_OUT" | grep -q 'REVERT='; then
+  ok_t "set -u harness reached report, status, per-source and revert"
+else
+  fail_t "set -u harness reached report, status, per-source and revert" \
+        "got: $(printf '%s' "$SETU_OUT" | tr '\n' ' ')"
+fi
+
+# Structural: the latches and result globals must be initialised at the top
+# level of the file, not inside a function body.
+for v in _APT_HTTPS_VERDICT _APT_HTTPS_CHANGED _APT_HTTPS_REVERTED \
+         _APT_HTTPS_REFUSED _APT_HTTPS_CA_WARNED; do
+  if grep -qE "^${v}=|^  ${v}=" "$LIB"; then
+    ok_t "$v is initialised at the top level of lib/apt-https.sh"
+  else
+    fail_t "$v is initialised at the top level of lib/apt-https.sh" \
+          "no top-level assignment found"
+  fi
+  if grep -qE "^  ${v}=" "$SRC"; then
+    ok_t "$v is initialised at the top level of the inline fallback"
+  else
+    fail_t "$v is initialised at the top level of the inline fallback" \
+          "no top-level assignment found"
+  fi
+done
+
+# ============================================================================
+# CA-trust-store check: latch, and no false warning on a healthy host
+# ============================================================================
+# The probe paths are absolute system paths that a non-root test cannot
+# create, so the "trust store present" branch is pinned structurally rather
+# than by faking the filesystem. Getting this wrong is what caused a run to
+# warn on every invocation, so the guard against it matters.
+CA_BODY="$(awk '/^_apt_https_check_ca_certs\(\) \{/,/^\}/' "$LIB")"
+if printf '%s' "$CA_BODY" | grep -q '_APT_HTTPS_CA_WARNED'; then
+  ok_t "CA warning is latched to once per process (lib)"
+else
+  fail_t "CA warning is latched to once per process (lib)" "no latch found"
+fi
+# Either shape is acceptable as long as a present trust store returns before
+# the warning: an early `return 0` inside the case, or a "missing" flag.
+if printf '%s' "$CA_BODY" | grep -qE 'then[[:space:]]*$|missing=0|\[ "\$missing" = "0" \] && return 0' && \
+   printf '%s' "$CA_BODY" | grep -q 'return 0'; then
+  ok_t "CA check returns before warning when a trust store IS present (lib)"
+else
+  fail_t "CA check returns before warning when a trust store IS present (lib)" \
+        "no early return: a case arm can fall through and warn on a healthy host"
+fi
+CA_INLINE="$(awk '/^[[:space:]]+_apt_https_check_ca_certs\(\) \{/,/^[[:space:]]+\}/' "$SRC")"
+if printf '%s' "$CA_INLINE" | grep -qE '\[ "\$missing" = "0" \] && return 0'; then
+  ok_t "CA check returns early when a trust store IS present (inline fallback)"
+else
+  fail_t "CA check returns early when a trust store IS present (inline fallback)" \
+        "inline copy lacks the early return"
+fi
+
+# Behavioural half: this host has no /etc CA bundle, so the missing branch is
+# live -- assert it warns exactly once no matter how many call sites fire.
+reset_sandbox
+CA_CALLS="$(bash -c "
+  . '$LIB' >/dev/null 2>&1
+  warn() { printf 'WARN\n'; }
+  info() { printf 'INFO\n'; }
+  _apt_https_check_ca_certs apt >/dev/null 2>&1 || true
+  _apt_https_check_ca_certs apt >/dev/null 2>&1 || true
+  _apt_https_check_ca_certs apt >/dev/null 2>&1 || true
+" 2>&1)"
+CA_WARNS="$(printf '%s\n' "$CA_CALLS" | grep -c '^WARN$' || true)"
+if [ "$CA_WARNS" -le 1 ]; then
+  ok_t "CA warning emitted at most once across repeated checks"
+else
+  fail_t "CA warning emitted at most once across repeated checks" "saw $CA_WARNS warnings"
+fi
+
+# ============================================================================
+# Regression: atomic replace leaves no staging residue
+# ============================================================================
+reset_sandbox
+printf 'deb http://atomic.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+printf 'deb [arch=amd64] http://atomic2.example.com/debian main\n' >> "$SANDBOX/apt/sources.list"
+printf 'Types: deb\nURIs: http://atomic3.example.com/debian main\n' > "$SANDBOX/apt/sources.list.d/a.sources"
+_APT_HTTPS_DONE=""
+apt_https_enforce "atomic" >/dev/null 2>&1
+RESIDUE="$(find "$SANDBOX" -name '*neohiro-rewrite*' 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$RESIDUE" = "0" ]; then
+  ok_t "atomic rewrite leaves no staging files behind"
+else
+  fail_t "atomic rewrite leaves no staging files behind" \
+        "$RESIDUE residue file(s): $(find "$SANDBOX" -name '*neohiro-rewrite*' 2>/dev/null | tr '\n' ' ')"
+fi
+
+# The rewritten content must be correct.
+if grep -q 'https://atomic.example.com' "$SANDBOX/apt/sources.list" && \
+   grep -q 'https://atomic3.example.com' "$SANDBOX/apt/sources.list.d/a.sources"; then
+  ok_t "atomic rewrite produced the expected content"
+else
+  fail_t "atomic rewrite produced the expected content" "content wrong after rename"
+fi
+
+# Mode preservation is only observable on a filesystem that models POSIX
+# permissions. Git Bash on NTFS reports 0644 for everything, so asserting it
+# there would fail spuriously. Skip explicitly rather than pretend to pass.
+if _mode_supported; then
+  printf 'deb http://mode.example.com/ubuntu main\n' > "$SANDBOX/apt/sources.list"
+  chmod 0640 "$SANDBOX/apt/sources.list"
+  _APT_HTTPS_DONE=""
+  apt_https_enforce "atomic-mode" >/dev/null 2>&1
+  MODE_AFTER="$(ls -l "$SANDBOX/apt/sources.list" 2>/dev/null | cut -c1-10)"
+  case "$MODE_AFTER" in
+    -rw-r-----) ok_t "atomic rewrite preserves the original file mode (0640)" ;;
+    *) fail_t "atomic rewrite preserves the original file mode (0640)" "got: $MODE_AFTER" ;;
+  esac
+else
+  ok_t "atomic rewrite preserves the original file mode (skipped: filesystem does not model POSIX modes)"
+fi
+
+# The rewrite must clone attributes with cp -p and then overwrite content,
+# never rely on `sed -i` keeping the mode (implementation detail, differs
+# between GNU and busybox sed).
+PREP_BODY="$(awk '/^_apt_https_prep_repo_stage\(\) \{/,/^\}/' "$LIB")"
+if printf '%s' "$PREP_BODY" | grep -q 'cp -p' && printf '%s' "$PREP_BODY" | grep -q 'cp "\$3"'; then
+  ok_t "repo staging clones attributes with cp -p then replaces content"
+else
+  fail_t "repo staging clones attributes with cp -p then replaces content" \
+        "unexpected staging implementation: $PREP_BODY"
+fi
+if printf '%s' "$PREP_BODY" | grep -q 'sed -i'; then
+  fail_t "repo staging does not rely on sed -i for mode preservation" "sed -i still used"
+else
+  ok_t "repo staging does not rely on sed -i for mode preservation"
+fi
+
+# The policy drop-in must still land as 0644.
+CONF_MODE="$(ls -l "$(apt_https_conf_file)" 2>/dev/null | cut -c1-10)"
+case "$CONF_MODE" in
+  -rw-r--r--) ok_t "atomic drop-in install lands as 0644" ;;
+  *) fail_t "atomic drop-in install lands as 0644" "got: $CONF_MODE" ;;
+esac
+
+# Structural: the rewrite must go through mv, not cp-into-place.
+if grep -q '_apt_https_atomic_replace' "$LIB" && grep -q '_apt_https_atomic_replace' "$SRC"; then
+  ok_t "lib and inline fallback both route writes through _apt_https_atomic_replace"
+else
+  fail_t "lib and inline fallback both route writes through _apt_https_atomic_replace" \
+        "atomic helper not wired in one of the two copies"
+fi
+if grep -q '_apt_priv mv -f "\$stage" "\$target"' "$LIB" && \
+   grep -q '_apt_priv mv -f "\$stage" "\$target"' "$SRC"; then
+  ok_t "atomic replace finishes with rename(2) via mv -f"
+else
+  fail_t "atomic replace finishes with rename(2) via mv -f" "mv of the stage file missing"
 fi
 
 # ============================================================================

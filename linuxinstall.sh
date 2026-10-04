@@ -310,6 +310,25 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
     if declare -F _tmpfile >/dev/null 2>&1; then _tmpfile apt-https; return 0; fi
     mktemp "${TMPDIR:-/tmp}/neohiro-apt-https.XXXXXX"
   }
+  # Atomic replace: build the result in a staging file inside the target's
+  # own directory, then rename it over the target. `cp` into place truncates
+  # first, so a crash mid-copy would leave a truncated repo file; rename(2) on
+  # one filesystem cannot. The staging name ends in the PID, so it never ends
+  # in .list/.sources and apt's own globs cannot see it.
+  _apt_https_atomic_replace() {
+    local target="$1" mode="$2" prep="$3"; shift 3
+    local stage
+    stage="${target}.neohiro-rewrite.$$"
+    _apt_priv rm -f "$stage" 2>/dev/null || true
+    if ! "$prep" "$stage" "$@"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
+    if [ "$mode" != "-" ]; then
+      if ! _apt_priv chmod "$mode" "$stage"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
+    fi
+    if ! _apt_priv mv -f "$stage" "$target"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
+    return 0
+  }
+  _apt_https_prep_conf_stage() { _apt_priv cp "$2" "$1"; }
+  _apt_https_prep_repo_stage() { _apt_priv cp -p "$2" "$1" && _apt_priv cp "$3" "$1"; }
   _apt_https_write_conf() {
     local conf tmp rc
     conf="$(apt_https_conf_file)"
@@ -338,9 +357,7 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
     if [ -f "$conf" ] && cmp -s "$tmp" "$conf"; then rm -f "$tmp"; return 0; fi
     if ! _apt_https_backup_once "$conf"; then rm -f "$tmp"; return 1; fi
     _apt_priv mkdir -p "$(apt_https_etc_dir)/apt/apt.conf.d" || { rm -f "$tmp"; return 1; }
-    if _apt_priv install -m 0644 "$tmp" "$conf"; then
-      rc=0
-    elif _apt_priv cp "$tmp" "$conf" && _apt_priv chmod 0644 "$conf"; then
+    if _apt_https_atomic_replace "$conf" 0644 _apt_https_prep_conf_stage "$tmp"; then
       rc=0
     else
       rc=1
@@ -356,6 +373,9 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
   _APT_HTTPS_CHANGED=0
   _APT_HTTPS_REVERTED=0
   _APT_HTTPS_REFUSED=0
+  # Warning latch. Declared at the top level so an audit-only run under
+  # `set -u` never sees it unbound.
+  _APT_HTTPS_CA_WARNED=""
   _apt_https_rewrite_file() {
     local f="$1" tmp expr
     _APT_HTTPS_VERDICT="clean"
@@ -368,13 +388,15 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
     if ! sed -E "$expr" "$f" > "$tmp" 2>/dev/null; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
     if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
     if ! _apt_https_backup_once "$f"; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
-    if ! _apt_priv cp "$tmp" "$f"; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
+    if ! _apt_https_atomic_replace "$f" - _apt_https_prep_repo_stage "$f" "$expr"; then
+      rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0
+    fi
     rm -f "$tmp"
     _APT_HTTPS_VERDICT="changed"
     return 0
   }
   _apt_https_rewrite_apt_sources() {
-    local f
+local f
     _APT_HTTPS_CHANGED=0
     _APT_HTTPS_REFUSED=0
     while IFS= read -r f; do
@@ -430,15 +452,24 @@ if ! declare -F apt_https_guard >/dev/null 2>&1; then
     return 0
   }
   _apt_https_check_ca_certs() {
-    local fam="$1"
+    local fam="$1" missing=0
+    # Latched: both apt_https_enforce and apt_https_report check this, so
+    # without a latch one run printed the same warning two or three times.
+    # Each arm must fall through to the same `missing` flag; returning from
+    # inside the case would skip the latch and warn on a healthy host.
     case "$fam" in
-      apt)     { [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ]; } || { warn "No system CA trust store found; HTTPS package verification will fail."; return 1; } ;;
-      dnf|yum) [ -e /etc/pki/tls/certs/ca-bundle.crt ] || { warn "No system CA trust store found."; return 1; } ;;
-      zypper)  [ -e /etc/ssl/ca-bundle.pem ] || { warn "No system CA trust store found."; return 1; } ;;
-      pacman)  [ -e /etc/ssl/certs/ca-certificates.crt ] || { warn "No system CA trust store found."; return 1; } ;;
-      *)       : ;;
+      apt)     { [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ]; } || missing=1 ;;
+      dnf|yum) [ -e /etc/pki/tls/certs/ca-bundle.crt ] || missing=1 ;;
+      zypper)  [ -e /etc/ssl/ca-bundle.pem ] || missing=1 ;;
+      pacman)  [ -e /etc/ssl/certs/ca-certificates.crt ] || missing=1 ;;
+      *)       return 0 ;;
     esac
-    return 0
+    [ "$missing" = "0" ] && return 0
+    [ -n "${_APT_HTTPS_CA_WARNED:-}" ] && return 1
+    _APT_HTTPS_CA_WARNED=1
+    warn "No system CA trust store found. HTTPS verification of packages will fail."
+    info "Install 'ca-certificates' after the sources are trusted, then re-run: apt_https_enforce"
+    return 1
   }
   _apt_https_block_port80() {
     [ "${NEOHIRO_APT_BLOCK_PORT80:-0}" = "1" ] || return 0
