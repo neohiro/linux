@@ -31,11 +31,11 @@ the package name right per distro. This script:
   timestamped copy; the index lives at `/var/log/linux-install-rollback.log`
   and is one `cp` away from a full undo.
 - **HTTPS-only package transport, enforced before every download.** A
-  plaintext `http://` mirror lets anyone on the path swap a `.deb`/`.rpm`
-  for their own. The guard rewrites every repo URL to `https://`, installs
-  an apt policy drop-in that refuses HTTPS→HTTP downgrade redirects, backs
-  the originals up, and auto-reverts if a mirror turns out not to speak
-  TLS. Runs first on every profile — see
+  plaintext `http://` mirror lets anyone on the path swap a `.deb`/`.rpm`/wheel
+  for their own. The guard audits **every** app store on the box — apt, dnf,
+  yum, zypper, pacman, apk, flatpak, snap, docker, brew, pip, npm, cargo,
+  gem, nix, fwupd — rewrites apt automatically with rollback if a mirror
+  can't speak TLS, and reports the rest. See
   [Package transport security](#package-transport-security-https).
 - **Three security profiles + a 21-tool maintenance suite.** From
   "Recommended" (firewall + updates, 6 steps, no SSH risk) to "Full"
@@ -52,7 +52,7 @@ the package name right per distro. This script:
 | SSH hardening | `PasswordAuthentication no` gated on validated pubkey; port never changed |
 | Fail2ban, sysctl profile, AppArmor/SELinux check | per-distro package names |
 | Tor, dnscrypt-proxy, unattended-upgrades, DeepClean | optional per profile |
-| **HTTPS-only package transport** | enforced before every `apt`/`dnf`/`yum`/`zypper`/`pacman` download — `--apt-https` |
+| **HTTPS-only package transport** | enforced before every `apt`/`dnf`/`yum`/`zypper`/`pacman`/`apk`/`pip`/`npm`/… download — `--apt-https` |
 | **Rollback log** | `/var/log/linux-install-rollback.log` — `original\tbackup` per file |
 | **SSH self-heal** | `--install-self-heal` — systemd timer or cron, every 60s |
 | **21-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
@@ -122,9 +122,9 @@ always see what's already done and what's coming.
 
 ### Package transport security (HTTPS)
 
-A plaintext `http://` package mirror means anyone who can intercept the
-route — a hostile Wi-Fi, a compromised router, an upstream CDN node — can
-swap the `.deb` / `.rpm` / `.pkgz` you just downloaded for one of theirs.
+A plaintext `http://` mirror means anyone who can intercept the route — a
+hostile Wi-Fi, a compromised router, an upstream CDN node — can swap the
+`.deb` / `.rpm` / `.pkgz` / wheel you just downloaded for one of theirs.
 Signature checks catch *forged* packages, but they do not stop a
 *downgrade* to an older, genuinely-signed, vulnerable build. Only TLS on
 the transport closes that gap.
@@ -138,7 +138,7 @@ Custom), it runs once per process, and it is idempotent, so re-runs and
 # Apply it on its own (normally automatic)
 sudo bash linuxinstall.sh --apt-https
 
-# Report only; never modifies anything. Exit 1 if plaintext remains.
+# Report only; never modifies anything. Exit 1 if anything is plaintext.
 sudo bash linuxinstall.sh --apt-https-audit
 
 # Undo: restore every backup and remove the policy drop-in.
@@ -150,7 +150,58 @@ sudo bash lib/apt-https.sh --report   # audit
 sudo bash lib/apt-https.sh --revert   # undo
 ```
 
-**On apt** (Debian / Ubuntu / Mint / Pop!_OS / Kali and derivatives) it:
+#### What is checked
+
+This is **not** apt-specific. Every distro and language has its own "app
+store", and several ship plaintext HTTP by default. The audit spans all of
+them and only lists the ones actually installed:
+
+| Store | Where the transport is configured |
+|---|---|
+| `apt` | `/etc/apt/sources.list`, `sources.list.d/*.list`, DEB822 `*.sources` |
+| `dnf` / `yum` | `/etc/yum.repos.d/*.repo` (`baseurl`, `metalink`, `mirrorlist`, `gpgkey`) |
+| `zypper` | `/etc/zypp/repos.d/*.repo` |
+| `pacman` | `/etc/pacman.d/*` (`Server=`) |
+| `apk` (Alpine) | `/etc/apk/repositories` — **plaintext `http://` by default on many images** |
+| `flatpak` | `flatpak remotes` |
+| `snap` | store is snapd-managed; no operator-configurable transport |
+| `docker` | `/etc/docker/daemon.json` (`registry-mirrors`, `insecure-registries`) |
+| `brew` | `HOMEBREW_BREW_GIT_REMOTE`, `HOMEBREW_API_DOMAIN`, … |
+| `pip` | `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `pip.conf` |
+| `npm` | `NPM_CONFIG_REGISTRY`, `.npmrc` |
+| `cargo` | `CARGO_REGISTRIES_CRATES_IO_INDEX`, `~/.cargo/config.toml` |
+| `gem` | `GEM_SOURCE`, `.gemrc` |
+| `nix` | `nix.conf` (`substituters`, `channel`) |
+| `fwupd` | `/etc/fwupd/remotes.d/*.conf` (LVFS `UpdateURI`) |
+
+Detection is deliberately format-agnostic: **any non-comment line carrying an
+`http://` URL** is reported. A per-dialect key list would miss `gpgkey=`,
+`metalink=`, and whatever the next release adds — and a miss is exactly the
+failure this is meant to prevent. The one exception is JSON, which has no
+comment syntax: there, `http://` must sit at the start of a JSON string, so a
+`"_comment": "see http://docs.internal"` note is not mistaken for a registry.
+
+`--apt-https-audit` prints a per-store verdict:
+
+```
+━━━ App-store transport security (HTTPS) ━━━
+  Package manager:                   apt
+  [x] apt policy drop-in active: /etc/apt/apt.conf.d/99neohiro-force-https
+
+  Store                           Result
+  apt (Debian/Ubuntu/Mint/Pop!/Kali) https only
+  apk (Alpine)                   2 plaintext endpoint(s)
+      /etc/apk/repositories:1: http://dl-cdn.alpinelinux.org/alpine/v3.19/main
+  pip index                      1 plaintext endpoint(s)
+      /etc/pip.conf:2: index-url = http://pypi.internal/simple
+```
+
+#### What is changed automatically
+
+Only **apt** is rewritten unattended, because it is the one store where the
+result can be *verified*: after rewriting, a real `apt-get update` runs, and if
+a mirror turns out not to serve the same paths over TLS the rewrite is **rolled
+back automatically**. You are never left with a broken package manager.
 
 1. Installs `/etc/apt/apt.conf.d/99neohiro-force-https`:
 
@@ -166,36 +217,52 @@ sudo bash lib/apt-https.sh --revert   # undo
    `https://` mirror can silently bounce you down to `http://`.
 
 2. Rewrites `http://` → `https://` on active lines in
-   `/etc/apt/sources.list`, `/etc/apt/sources.list.d/*.list` (classic) and
-   `/etc/apt/sources.list.d/*.sources` (DEB822 `URIs:` field only).
+   `/etc/apt/sources.list`, `sources.list.d/*.list` (classic) and
+   `sources.list.d/*.sources` (DEB822 `URIs:` field only).
    Commented-out lines and DEB822 structural fields (`Suites:`,
-   `Components:`, `Signed-By:`) are left exactly as they were.
+   `Components:`, `Signed-By:`) are left byte-identical.
 
 3. Backs every file up to `/var/backups/neohiro-apt-https/` **before** the
-   first edit and logs each one to the rollback log, so
+   first edit and records each in the rollback log, so
    `bash linuxinstall.sh --rollback --apply` can undo it too.
 
-4. Verifies with a real `apt-get update`. If a mirror turns out not to
-   serve the same paths over TLS, the rewrite is **rolled back
-   automatically** — you are never left with an unusable package manager.
-   Set `NEOHIRO_APT_HTTPS_STRICT=1` to keep the rewrite and fail loudly
-   instead.
+4. Applies each change with a **staging file in the same directory followed by
+   `rename(2)`**, not `cp` into place. `cp` truncates first, so a crash
+   mid-copy leaves a truncated `sources.list`; a rename is atomic, so a reader
+   sees either the whole old file or the whole new one. Original mode and
+   ownership are preserved.
 
 5. Warns if no CA trust store is present, since HTTPS verification is
    worthless without one.
 
-**On dnf / yum / zypper / pacman / flatpak** it audits and reports every
-plaintext repo URL but does **not** blindly rewrite: plenty of upstream
-mirrors do not serve the same paths over TLS, and silently breaking a
-working repo is worse than the threat it prevents. Point those at an
-https-capable mirror, or opt in to the rewrite with
-`NEOHIRO_APT_HTTPS_REWRITE=1` and re-audit afterwards.
+#### Changing the others
 
-**Where it is wired in:** `pkg_update` / `pkg_install` / `pkg_upgrade` /
-`pkg_autoremove`, `update_system`, `update_kernel`, `updates_only_mode`,
-`restore_ssh.sh` (before installing `openssh-server`), `DeepClean.sh`
-(before `apt-get autoremove --purge`), the **Maintenance** submenu option 1,
-the `--step apt_https` mode, and the `--apt-https*` flags.
+For every other store the guard **reports but does not rewrite**. Whether
+`https://<same host><same path>` actually exists cannot be known without a
+network round trip, and silently breaking a working mirror is worse than the
+threat it prevents. Two options:
+
+```bash
+# Repoint the endpoint at an https-capable mirror (recommended), or
+NEOHIRO_APT_HTTPS_REWRITE=1 sudo bash linuxinstall.sh --apt-https
+```
+
+The opt-in sweeps **every** installed store (apk, pip, npm, cargo, gem, nix,
+docker, fwupd, and the RPM/Arch/SUSE repo formats) in one pass, backing each
+up and honouring the same atomic replace. Re-audit afterwards, because some
+mirrors genuinely do not serve the same paths over TLS. Stores whose tool is
+not installed are left alone.
+
+`NEOHIRO_APT_HTTPS_STRICT=1` turns any leftover plaintext endpoint into a
+hard error, which is what you want in CI.
+
+#### Where it is wired in
+
+`pkg_update` / `pkg_install` / `pkg_upgrade` / `pkg_autoremove`,
+`update_system`, `update_kernel`, `updates_only_mode`, `restore_ssh.sh`
+(before installing `openssh-server`), `DeepClean.sh` (before
+`apt-get autoremove --purge`), the **Maintenance** submenu option 1, the
+`--step apt_https` mode, and the `--apt-https*` flags.
 
 In `lib/updater.sh` it guards the `_run_all_updates` dispatcher plus every
 sub-step that touches the network: `_update_apt`, `_update_dnf`,
@@ -203,10 +270,7 @@ sub-step that touches the network: `_update_apt`, `_update_dnf`,
 `_update_flatpak`, `_update_docker`, `_update_brew`, `_update_firmware`,
 `_update_geoip`, `_update_pihole`. (`_update_virsh`, `_update_suse_snapper`
 and `_update_btrfs_balance` only read or write local state, so they are
-deliberately not guarded.) `linuxinstall.sh` carries a mirrored set of
-guards for its own inline `_update_*` copies, which is what runs under
-`curl | sudo bash` — the documented primary install method, where
-`lib/updater.sh` is never on disk.
+deliberately not guarded.)
 
 Two subtleties worth knowing:
 
@@ -225,14 +289,23 @@ Two subtleties worth knowing:
 
 `OptimizeLinuxASR.sh` does not download packages, so it needs no guard.
 
+#### Under `curl | sudo bash`
+
+`curl ... | sudo bash` has no `lib/` directory next to it. Rather than carry
+a second copy of this logic (which is how fixes silently fail to reach the
+most common install path), the script resolves `lib/apt-https.sh` from disk
+if present, otherwise fetches it from the same raw base it already trusts for
+`DeepClean.sh`, and sources that. If neither is possible it says so loudly
+and runs with the guard inactive — it never pretends to be enforcing.
+
 | Variable | Effect |
 |---|---|
 | `NEOHIRO_APT_HTTPS=1` | enforce (default) |
 | `NEOHIRO_APT_HTTPS=audit` | report only, never modify |
 | `NEOHIRO_APT_HTTPS=0` | disable the guard entirely |
-| `NEOHIRO_APT_HTTPS_REWRITE=1` | allow the http→https rewrite on dnf/yum/zypper/pacman |
+| `NEOHIRO_APT_HTTPS_REWRITE=1` | also rewrite the non-apt stores |
 | `NEOHIRO_APT_HTTPS_NOVERIFY=1` | skip the post-rewrite `apt-get update` check |
-| `NEOHIRO_APT_HTTPS_STRICT=1` | treat leftover plaintext repos as a hard error |
+| `NEOHIRO_APT_HTTPS_STRICT=1` | treat leftover plaintext as a hard error |
 | `NEOHIRO_APT_BLOCK_PORT80=1` | also `ufw deny out 80/tcp` (opt-in, see below) |
 | `NEOHIRO_APT_FAMILY=apt\|dnf\|yum\|zypper\|pacman\|none` | pin the detected family (CI containers, testing) |
 
@@ -687,11 +760,18 @@ dumps — add to `/etc/security/limits.conf`:
 
 ```bash
 bash tests/run-all.sh                  # every suite, with a summary
-bash tests/test_linuxinstall.sh        # 66 tests: parse, logic, UX coverage, snapshot
-bash tests/test_apt_https.sh           # 145 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
+bash tests/test_linuxinstall.sh        # 67 tests: parse, logic, UX coverage, snapshot
+bash tests/test_apt_https.sh           # 247 tests: transport guard + encoding hygiene
 bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```
+
+`test_apt_https.sh` is hermetic: it relocates the whole `/etc` tree into a
+temp sandbox, stubs `sudo`/`ufw`/`apk` on `PATH`, and never makes a network
+call. It also enforces repository encoding hygiene (valid UTF-8, no
+double-encoding artifacts, LF endings), because these scripts are full of
+box-drawing characters and a silent re-encode is otherwise invisible until a
+snapshot diff catches it.
 
 To regenerate snapshot fixtures after a deliberate UX change:
 ```bash

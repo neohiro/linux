@@ -223,409 +223,75 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     printf '\n'; ok "Update engine complete."; }
 fi
 
-# Inline fallback for lib/apt-https.sh (curl|bash path).  Same public API as
-# the canonical library: apt_https_guard / apt_https_enforce /
-# apt_https_report / apt_https_revert.  Keep the function names in sync with
-# lib/apt-https.sh - tests/test_apt_https.sh asserts parity between the two.
+# ── lib/apt-https.sh resolution (curl|bash path) ─────────────────────────────
+# `curl ... | sudo bash` has no lib/ directory next to this script, so this
+# block used to carry a full inline copy of the repository transport guard.
+# That was ~400 lines of security-critical code duplicated from a canonical
+# source, which is the worst possible arrangement: fixes and new store
+# coverage silently did not reach the most common install path.
+#
+# Instead, resolve the canonical library -- from disk if it is there,
+# otherwise by fetching it from the same raw base this script already trusts
+# for DeepClean.sh and OptimizeLinuxASR.sh -- and source that. One
+# implementation, no drift, and the curl|bash path gets the same coverage as a
+# clone (every distro package manager plus apk, flatpak, docker, brew, pip,
+# npm, cargo, gem, nix and fwupd).
+#
+# If neither works (no network, filtered egress), define the public entry
+# points as loud no-ops so every caller still works and the operator is told
+# the precaution is inactive rather than being left to assume it is on.
 if ! declare -F apt_https_guard >/dev/null 2>&1; then
-  _APT_HTTPS_DONE="${_APT_HTTPS_DONE:-}"
-  APT_HTTPS_CONF_NAME="99neohiro-force-https"
-  apt_https_etc_dir()    { printf '%s' "${NEOHIRO_APT_ETC_DIR:-/etc}"; }
-  apt_https_backup_dir() { printf '%s' "${NEOHIRO_APT_BACKUP_DIR:-/var/backups/neohiro-apt-https}"; }
-  apt_https_conf_file()  { printf '%s' "$(apt_https_etc_dir)/apt/apt.conf.d/${APT_HTTPS_CONF_NAME}"; }
-  _apt_https_is_root()      { [ "${EUID:-$(id -u 2>/dev/null || echo 1000)}" = "0" ]; }
-  _apt_priv() {
-    if [ "${DRY_RUN:-0}" = "1" ]; then printf '  DRY: %s\n' "$*"; return 0; fi
-    if _apt_https_is_root; then "$@"; return $?; fi
-    if command -v sudo >/dev/null 2>&1; then sudo "$@"; return $?; fi
-    return 1
-  }
-  _apt_https_privileged_ok() {
-    _apt_https_is_root && return 0
-    command -v sudo >/dev/null 2>&1 && return 0
-    return 1
-  }
-  apt_https_family() {
-    if [ -n "${NEOHIRO_APT_FAMILY:-}" ]; then printf '%s' "$NEOHIRO_APT_FAMILY"; return 0; fi
-    if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then printf 'pacman'
-    elif command -v zypper >/dev/null 2>&1; then printf 'zypper'
-    elif command -v dnf >/dev/null 2>&1; then printf 'dnf'
-    elif command -v yum >/dev/null 2>&1; then printf 'yum'
-    elif command -v apt-get >/dev/null 2>&1 || [ -f /etc/apt/sources.list ]; then printf 'apt'
-    else printf 'none'; fi
-  }
-  _apt_https_repo_files() {
-    local etc f
-    etc="$(apt_https_etc_dir)"
-    [ -f "${etc}/apt/sources.list" ] && printf '%s\n' "${etc}/apt/sources.list"
-    for f in "${etc}"/apt/sources.list.d/*.list "${etc}"/apt/sources.list.d/*.sources; do
-      [ -f "$f" ] && printf '%s\n' "$f"
-    done
-    return 0
-  }
-  _apt_https_foreign_repo_files() {
-    local etc f
-    etc="$(apt_https_etc_dir)"
-    case "$1" in
-      dnf|yum) for f in "${etc}"/yum.repos.d/*.repo; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
-      zypper)  for f in "${etc}"/zypp/repos.d/*.repo; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
-      pacman)  for f in "${etc}"/pacman.d/*; do [ -f "$f" ] && printf '%s\n' "$f"; done ;;
-      *) : ;;
-    esac
-    return 0
-  }
-  _apt_https_plaintext_in_apt_file() {
-    local f="$1"
-    [ -f "$f" ] || return 0
-    case "$f" in
-      *.sources) awk '/^[[:space:]]*URIs:[[:space:]]/ && /http:\/\// { gsub(/^[[:space:]]+/, "", $0); printf "%s:%d: %s\n", FILENAME, NR, $0 }' "$f" 2>/dev/null ;;
-      *)         awk '/^[[:space:]]*#/ { next } /http:\/\// { gsub(/^[[:space:]]+/, "", $0); printf "%s:%d: %s\n", FILENAME, NR, $0 }' "$f" 2>/dev/null ;;
-    esac
-    return 0
-  }
-  _apt_https_plaintext_in_repo_file() {
-    local f="$1" pat="$2"
-    [ -f "$f" ] || return 0
-    awk -v pat="$pat" '/^[[:space:]]*#/ { next } $0 ~ pat && /http:\/\// {
-      line = $0; gsub(/^[[:space:]]+/, "", line); printf "%s:%d: %s\n", FILENAME, NR, line }' "$f" 2>/dev/null
-    return 0
-  }
-  _apt_https_backup_path() {
-    local flat
-    flat="$(printf '%s' "$1" | tr '/' '_')"
-    printf '%s/%s.orig' "$(apt_https_backup_dir)" "$flat"
-  }
-  _apt_https_backup_once() {
-    local src="$1" dst
-    [ -f "$src" ] || return 0
-    dst="$(_apt_https_backup_path "$src")"
-    [ -f "$dst" ] && return 0
-    _apt_priv mkdir -p "$(apt_https_backup_dir)" || return 1
-    _apt_priv cp -p "$src" "$dst" || { warn "Could not back up $src - refusing to edit it."; return 1; }
-    if declare -F record_backup >/dev/null 2>&1; then record_backup "$src" "$dst" 2>/dev/null || true; fi
-    info "Backed up $src -> $dst"
-    return 0
-  }
-  _apt_https_stage() {
-    if declare -F _tmpfile >/dev/null 2>&1; then _tmpfile apt-https; return 0; fi
-    mktemp "${TMPDIR:-/tmp}/neohiro-apt-https.XXXXXX"
-  }
-  # Atomic replace: build the result in a staging file inside the target's
-  # own directory, then rename it over the target. `cp` into place truncates
-  # first, so a crash mid-copy would leave a truncated repo file; rename(2) on
-  # one filesystem cannot. The staging name ends in the PID, so it never ends
-  # in .list/.sources and apt's own globs cannot see it.
-  _apt_https_atomic_replace() {
-    local target="$1" mode="$2" prep="$3"; shift 3
-    local stage
-    stage="${target}.neohiro-rewrite.$$"
-    _apt_priv rm -f "$stage" 2>/dev/null || true
-    if ! "$prep" "$stage" "$@"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
-    if [ "$mode" != "-" ]; then
-      if ! _apt_priv chmod "$mode" "$stage"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
+  _apt_https_resolved=""
+  for _ah_cand in \
+      "${_NEOHIRO_LIB_DIR:-}/apt-https.sh" \
+      "/usr/local/lib/neohiro/apt-https.sh" \
+      "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" 2>/dev/null)/lib/apt-https.sh"; do
+    if [ -n "$_ah_cand" ] && [ -r "$_ah_cand" ] && [ -s "$_ah_cand" ]; then
+      _apt_https_resolved="$_ah_cand"
+      break
     fi
-    if ! _apt_priv mv -f "$stage" "$target"; then _apt_priv rm -f "$stage" 2>/dev/null || true; return 1; fi
-    return 0
-  }
-  _apt_https_prep_conf_stage() { _apt_priv cp "$2" "$1"; }
-  _apt_https_prep_repo_stage() { _apt_priv cp -p "$2" "$1" && _apt_priv cp "$3" "$1"; }
-  _apt_https_write_conf() {
-    local conf tmp rc
-    conf="$(apt_https_conf_file)"
-    tmp="$(_apt_https_stage)"
-    {
-      printf '%s\n' '// Managed by neohiro/linux (lib/apt-https.sh). Do not edit.'
-      printf '%s\n' '// Re-running the installer overwrites this file safely;'
-      printf '%s\n' '// `bash linuxinstall.sh --apt-https-off` removes it.'
-      printf '%s\n' ''
-      printf '%s\n' '// Prefer TLS, and never silently downgrade to plaintext.'
-      printf '%s\n' 'Acquire::https::AllowRedirect "true";'
-      printf '%s\n' 'Acquire::http::AllowRedirect "false";'
-      printf '%s\n' 'Acquire::ftp::AllowRedirect "false";'
-      printf '%s\n' ''
-      printf '%s\n' '// Authenticate the mirror, not just the channel.'
-      printf '%s\n' 'Acquire::https::Verify-Peer "true";'
-      printf '%s\n' 'Acquire::https::Verify-Host "true";'
-      printf '%s\n' ''
-      printf '%s\n' '// Transparent mirrors usually need more than one try.'
-      printf '%s\n' 'Acquire::Retries "3";'
-      printf '%s\n' ''
-      printf '%s\n' '// Pin a corporate proxy by uncommenting and editing:'
-      printf '%s\n' '// Acquire::http::Proxy  "http://proxy.corp.example:3128";'
-      printf '%s\n' '// Acquire::https::Proxy "http://proxy.corp.example:3128";'
-    } > "$tmp"
-    if [ -f "$conf" ] && cmp -s "$tmp" "$conf"; then rm -f "$tmp"; return 0; fi
-    if ! _apt_https_backup_once "$conf"; then rm -f "$tmp"; return 1; fi
-    _apt_priv mkdir -p "$(apt_https_etc_dir)/apt/apt.conf.d" || { rm -f "$tmp"; return 1; }
-    if _apt_https_atomic_replace "$conf" 0644 _apt_https_prep_conf_stage "$tmp"; then
-      rc=0
-    else
-      rc=1
-    fi
-    rm -f "$tmp"
-    [ "$rc" = "0" ] || return 1
-    info "apt policy: $conf"
-    return 0
-  }
-  # Result globals, not stdout: these helpers print progress messages, and a
-  # command substitution would fold that text into the value it returns.
-  _APT_HTTPS_VERDICT=""
-  _APT_HTTPS_CHANGED=0
-  _APT_HTTPS_REVERTED=0
-  _APT_HTTPS_REFUSED=0
-  # Warning latch. Declared at the top level so an audit-only run under
-  # `set -u` never sees it unbound.
-  _APT_HTTPS_CA_WARNED=""
-  _apt_https_rewrite_file() {
-    local f="$1" tmp expr
-    _APT_HTTPS_VERDICT="clean"
-    [ -f "$f" ] || return 0
-    case "$f" in
-      *.sources) expr='/^[[:space:]]*URIs:[[:space:]]/ s|http://|https://|g' ;;
-      *)         expr='/^[[:space:]]*#/! s|http://|https://|g' ;;
-    esac
-    tmp="$(_apt_https_stage)"
-    if ! sed -E "$expr" "$f" > "$tmp" 2>/dev/null; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
-    if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
-    if ! _apt_https_backup_once "$f"; then rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0; fi
-    if ! _apt_https_atomic_replace "$f" - _apt_https_prep_repo_stage "$f" "$expr"; then
-      rm -f "$tmp"; _APT_HTTPS_REFUSED=$((_APT_HTTPS_REFUSED + 1)); return 0
-    fi
-    rm -f "$tmp"
-    _APT_HTTPS_VERDICT="changed"
-    return 0
-  }
-  _apt_https_rewrite_apt_sources() {
-local f
-    _APT_HTTPS_CHANGED=0
-    _APT_HTTPS_REFUSED=0
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      _apt_https_rewrite_file "$f"
-      if [ "$_APT_HTTPS_VERDICT" = "changed" ]; then
-        _APT_HTTPS_CHANGED=$((_APT_HTTPS_CHANGED + 1))
-        info "Rewrote plaintext repo URLs -> https: $f"
+  done
+
+  if [ -z "$_apt_https_resolved" ]; then
+    _apt_https_dir="$(mktemp -d "${TMPDIR:-/tmp}/neohiro-https.XXXXXX" 2>/dev/null)" || _apt_https_dir=""
+    if [ -n "$_apt_https_dir" ]; then
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_RAW_BASE}/lib/apt-https.sh" \
+             -o "$_apt_https_dir/apt-https.sh" 2>/dev/null || true
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$_apt_https_dir/apt-https.sh" \
+             "${REPO_RAW_BASE}/lib/apt-https.sh" 2>/dev/null || true
       fi
-    done < <(_apt_https_repo_files)
-    return 0
-  }
-  _apt_https_revert_apt_sources() {
-    local f bak backupdir
-    _APT_HTTPS_REVERTED=0
-    backupdir="$(apt_https_backup_dir)"
-    [ -d "$backupdir" ] || return 0
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      bak="$(_apt_https_backup_path "$f")"
-      if [ -f "$bak" ] && ! cmp -s "$bak" "$f" && _apt_priv cp "$bak" "$f"; then
-        _APT_HTTPS_REVERTED=$((_APT_HTTPS_REVERTED + 1))
-        info "Restored $f from backup"
-      fi
-    done < <(_apt_https_repo_files)
-    return 0
-  }
-  _apt_https_audit_family() {
-    local fam="$1" f
-    case "$fam" in
-      apt)     while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_apt_file "$f"; done < <(_apt_https_repo_files) ;;
-      dnf|yum) while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)(baseurl|metalink|mirrorlist)[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
-      zypper)  while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)(baseurl|uri|mirrorlist)[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
-      pacman)  while IFS= read -r f; do [ -n "$f" ] && _apt_https_plaintext_in_repo_file "$f" '^([[:space:]]*)Server[[:space:]]*='; done < <(_apt_https_foreign_repo_files "$fam") ;;
-      *) : ;;
-    esac
-    return 0
-  }
-  _apt_https_rewrite_family() {
-    local fam="$1" f
-    _APT_HTTPS_CHANGED=0
-    case "$fam" in dnf|yum|zypper|pacman) : ;; *) return 0 ;; esac
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      _apt_https_rewrite_file "$f"
-      [ "$_APT_HTTPS_VERDICT" = "changed" ] && _APT_HTTPS_CHANGED=$((_APT_HTTPS_CHANGED + 1))
-    done < <(_apt_https_foreign_repo_files "$fam")
-    return 0
-  }
-  _apt_https_flatpak_plaintext() {
-    command -v flatpak >/dev/null 2>&1 || return 0
-    flatpak remotes --show-details 2>/dev/null | awk '/http:\/\// { print }' || true
-    return 0
-  }
-  _apt_https_check_ca_certs() {
-    local fam="$1" missing=0
-    # Latched: both apt_https_enforce and apt_https_report check this, so
-    # without a latch one run printed the same warning two or three times.
-    # Each arm must fall through to the same `missing` flag; returning from
-    # inside the case would skip the latch and warn on a healthy host.
-    case "$fam" in
-      apt)     { [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ]; } || missing=1 ;;
-      dnf|yum) [ -e /etc/pki/tls/certs/ca-bundle.crt ] || missing=1 ;;
-      zypper)  [ -e /etc/ssl/ca-bundle.pem ] || missing=1 ;;
-      pacman)  [ -e /etc/ssl/certs/ca-certificates.crt ] || missing=1 ;;
-      *)       return 0 ;;
-    esac
-    [ "$missing" = "0" ] && return 0
-    [ -n "${_APT_HTTPS_CA_WARNED:-}" ] && return 1
-    _APT_HTTPS_CA_WARNED=1
-    warn "No system CA trust store found. HTTPS verification of packages will fail."
-    info "Install 'ca-certificates' after the sources are trusted, then re-run: apt_https_enforce"
-    return 1
-  }
-  _apt_https_block_port80() {
-    [ "${NEOHIRO_APT_BLOCK_PORT80:-0}" = "1" ] || return 0
-    command -v ufw >/dev/null 2>&1 || { warn "NEOHIRO_APT_BLOCK_PORT80=1 but no UFW found; skipping."; return 0; }
-    if ufw status 2>/dev/null | grep -qE '^80/tcp[[:space:]]+DENY[[:space:]]+OUT'; then
-      info "ufw already denies outbound 80/tcp"; return 0
-    fi
-    if [ -n "$(apt_https_status_text)" ]; then
-      warn "Skipping the port-80 block: plaintext repos are still configured."
-      return 0
-    fi
-    if _apt_priv ufw deny out 80/tcp; then
-      ok "Blocked outbound TCP/80 (apt traffic is HTTPS-only from now on)."
-      info "Undo: sudo ufw delete deny out 80/tcp"
-    else
-      warn "Could not add the ufw outbound 80/tcp deny rule."
-    fi
-    return 0
-  }
-  apt_https_status_text() {
-    _apt_https_audit_family "$(apt_https_family)"
-    _apt_https_flatpak_plaintext
-    return 0
-  }
-  apt_https_report() {
-    local fam conf findings
-    fam="$(apt_https_family)"
-    printf '\n%s\n' "$(_c '1;36m' '━━━ Package transport security (HTTPS) ━━━')"
-    printf '  Detected package manager: %s\n' "$fam"
-    case "$fam" in
-      apt)
-        conf="$(apt_https_conf_file)"
-        if [ -f "$conf" ]; then printf '  %s %s\n' "$(_c '1;32m' '[x]')" "apt policy drop-in active: $conf"
-        else printf '  %s %s\n' "$(_c '1;31m' '[ ]')" "apt policy drop-in MISSING: $conf"; fi ;;
-      dnf|yum)   printf '  %s\n' "dnf/yum: repo files audited (no blind rewrite)." ;;
-      zypper)    printf '  %s\n' "zypper: repo files audited (no blind rewrite)." ;;
-      pacman)    printf '  %s\n' "pacman: mirrorlist audited (no blind rewrite)." ;;
-      *)         printf '  %s\n' "No supported package manager detected." ;;
-    esac
-    findings="$(apt_https_status_text)"
-    if [ -n "$findings" ]; then
-      printf '\n  %s\n' "$(_c '1;33m' 'Plaintext (http://) repository entries still present:')"
-      printf '%s\n' "$findings" | sed 's/^/    /'
-      printf '\n  %s\n' "  apt:    fix with  sudo bash linuxinstall.sh --apt-https"
-      printf '%s\n' "  others: set NEOHIRO_APT_HTTPS_REWRITE=1, then re-run the audit"
-    else
-      printf '\n  %s %s\n' "$(_c '1;32m' '[x]')" "No plaintext repository URLs detected."
-    fi
-    _apt_https_check_ca_certs "$fam" || true
-    printf '\n'
-    if [ "$fam" = "none" ]; then return 2; fi
-    [ -n "$findings" ] && return 1
-    return 0
-  }
-  _apt_https_verify_apt_sources() {
-    [ "${NEOHIRO_APT_HTTPS_NOVERIFY:-0}" = "1" ] && return 0
-    [ "${DRY_RUN:-0}" = "1" ] && return 0
-    command -v apt-get >/dev/null 2>&1 || return 0
-    info "Verifying the rewritten sources with a real apt-get update..."
-    if _apt_priv env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
-      ok "All apt repositories answered over HTTPS."; return 0
-    fi
-    if [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ]; then
-      err "apt-get update failed after the https rewrite and NEOHIRO_APT_HTTPS_STRICT=1."
-      return 1
-    fi
-    warn "apt-get update failed after the https rewrite - rolling back to the backups."
-    _apt_https_revert_apt_sources >/dev/null
-    warn "Reverted. A mirror does not serve the same paths over HTTPS."
-    return 1
-  }
-  apt_https_enforce() {
-    local label="${1:-enforce}" mode fam conf_failed findings rc=0
-    mode="${NEOHIRO_APT_HTTPS:-1}"
-    fam="$(apt_https_family)"
-    if [ "$fam" = "none" ]; then
-      info "No supported package manager detected - HTTPS guard not applicable."
-      return 0
-    fi
-    if [ "$mode" = "0" ]; then
-      info "NEOHIRO_APT_HTTPS=0 - repository transport guard disabled ($label)."
-      return 0
-    fi
-    msg "Repository transport guard ($label): $fam"
-    if [ "$mode" = "audit" ]; then
-      info "NEOHIRO_APT_HTTPS=audit - reporting only, nothing is modified."
-      apt_https_report || true
-      return 0
-    fi
-    if ! _apt_https_privileged_ok; then
-      warn "Not root and no sudo available - cannot enforce HTTPS for repositories."
-      info "Re-run as root, or set NEOHIRO_APT_HTTPS=0 to silence this."
-      return 0
-    fi
-    case "$fam" in
-      apt)
-        conf_failed=0
-        _apt_https_write_conf || conf_failed=1
-        _apt_https_rewrite_apt_sources
-        if [ "$_APT_HTTPS_CHANGED" -gt 0 ]; then
-          ok "Rewrote $_APT_HTTPS_CHANGED apt source file(s) to https://"
-          _apt_https_verify_apt_sources || rc=1
-        elif [ "$_APT_HTTPS_REFUSED" -gt 0 ]; then
-          warn "Could not rewrite $_APT_HTTPS_REFUSED apt source file(s): no writable backup."
-          rc=1
-        else
-          ok "apt repositories already use https://"
-        fi
-        [ "$conf_failed" = "1" ] && { warn "Could not install the apt policy drop-in."; rc=1; }
-        ;;
-      dnf|yum|zypper|pacman)
-        if [ "${NEOHIRO_APT_HTTPS_REWRITE:-0}" = "1" ]; then
-          _apt_https_rewrite_family "$fam"
-          [ "$_APT_HTTPS_CHANGED" -gt 0 ] && ok "Rewrote $_APT_HTTPS_CHANGED $fam repo file(s) to https:// (NEOHIRO_APT_HTTPS_REWRITE=1)"
-        fi
-        ;;
-      *) : ;;
-    esac
-    findings="$(apt_https_status_text)"
-    if [ -n "$findings" ]; then
-      warn "Plaintext repository URLs remain for $fam:"
-      printf '%s\n' "$findings" | sed 's/^/    /'
-      if [ "$fam" != "apt" ]; then
-        info "Point those at an https-capable mirror, or opt in to a blind rewrite"
-        info "with NEOHIRO_APT_HTTPS_REWRITE=1 (verify afterwards)."
-        [ "${NEOHIRO_APT_HTTPS_STRICT:-0}" = "1" ] && rc=1
+      if [ -s "$_apt_https_dir/apt-https.sh" ]; then
+        _apt_https_resolved="$_apt_https_dir/apt-https.sh"
+      else
+        rm -rf "$_apt_https_dir" 2>/dev/null || true
       fi
     fi
-    _apt_https_check_ca_certs "$fam" || true
-    _apt_https_block_port80
-    return "$rc"
-  }
-  apt_https_guard() {
-    [ -n "$_APT_HTTPS_DONE" ] && return 0
-    _APT_HTTPS_DONE=1
-    apt_https_enforce "${1:-guard}" || true
-    return 0
-  }
-  apt_https_revert() {
-    local conf bak n
-    conf="$(apt_https_conf_file)"
-    bak="$(_apt_https_backup_path "$conf")"
-    _apt_https_revert_apt_sources
-    n="$_APT_HTTPS_REVERTED"
-    if [ -f "$conf" ] && [ -f "$bak" ]; then
-      _apt_priv cp "$bak" "$conf" && info "Restored $conf from backup"
-    elif [ -f "$conf" ]; then
-      _apt_priv rm -f "$conf" && ok "Removed $conf"
-    fi
-    if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
-      ok "Reverted $n repository file(s) to their pre-guard contents."
-    fi
-    _APT_HTTPS_DONE=""
-    ok "Repository transport guard disabled."
-    return 0
-  }
+  fi
+
+  if [ -n "$_apt_https_resolved" ]; then
+    # shellcheck disable=SC1090
+    . "$_apt_https_resolved" 2>/dev/null || _apt_https_resolved=""
+  fi
+
+  if ! declare -F apt_https_guard >/dev/null 2>&1; then
+    _apt_https_unavailable() {
+      printf '%s\n' "[WARNING] lib/apt-https.sh could not be loaded, so the repository" >&2
+      printf '%s\n' "[WARNING] transport guard is INACTIVE for this run: packages may" >&2
+      printf '%s\n' "[WARNING] still be fetched over plaintext HTTP. Run from a clone of" >&2
+      printf '%s\n' "[WARNING] neohiro/linux to get the full guard." >&2
+      return 0
+    }
+    apt_https_guard()      { _apt_https_unavailable; return 0; }
+    apt_https_enforce()    { _apt_https_unavailable; return 0; }
+    apt_https_report()     { _apt_https_unavailable; return 0; }
+    apt_https_revert()     { _apt_https_unavailable; return 0; }
+    apt_https_status_text(){ return 0; }
+    apt_https_backup_dir() { printf '%s' "${NEOHIRO_APT_BACKUP_DIR:-/var/backups/neohiro-apt-https}"; }
+    apt_https_conf_file()  { printf '%s' "${NEOHIRO_APT_ETC_DIR:-/etc}/apt/apt.conf.d/99neohiro-force-https"; }
+  fi
+  unset _apt_https_resolved _apt_https_dir _ah_cand 2>/dev/null || true
 fi
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
@@ -4457,17 +4123,19 @@ Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restor
                     every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those cp commands (latest backup wins).
   --apt-https       Force HTTPS for every configured package repository
-                    (writes /etc/apt/apt.conf.d/99neohiro-force-https and
-                    rewrites http:// repo URLs to https://). Runs
-                    automatically before every apt/dnf/yum/zypper/pacman
-                    download/update/upgrade, so this flag is only needed to
-                    apply it on its own. Backups land in
+                    and app store (writes
+                    /etc/apt/apt.conf.d/99neohiro-force-https and rewrites
+                    http:// repo URLs to https://). Runs automatically
+                    before every apt/dnf/yum/zypper/pacman/apk/pip/npm/...
+                    download, so this flag is only needed to apply it on
+                    its own. Backups land in
                     /var/backups/neohiro-apt-https/. A mirror that cannot
                     speak HTTPS is detected and the rewrite is rolled back
                     automatically. Alias: --enforce-https
-  --apt-https-audit Report the current transport security of every repo
-                    without changing anything (exit 1 if plaintext remains).
-  --apt-https-off   Revert: restore every backed-up repo file and remove
+  --apt-https-audit Report the transport security of every app store
+                    without changing anything (exit 1 if plaintext
+                    remains).
+  --apt-https-off   Revert: restore every backed-up config file and remove
                     the apt policy drop-in. Alias: --disable-https
   -h, --help        Show this help.
 
@@ -4480,19 +4148,23 @@ Environment variables:
   TOR_CONTACT=...   Override the Tor relay contact (default: you@example.com).
   NEOHIRO_DEBUG_LOG=path  Override debug log location.
 
-Repository transport guard (applies to every package manager):
+Repository transport guard (applies to every package/app store):
   NEOHIRO_APT_HTTPS=1          Enforce HTTPS. Default.
   NEOHIRO_APT_HTTPS=audit      Report only; never modify anything.
   NEOHIRO_APT_HTTPS=0          Disable the guard entirely.
-  NEOHIRO_APT_HTTPS_REWRITE=1  Allow http->https rewrite on dnf/yum/zypper/
-                               pacman repo files (off by default; not every
-                               mirror serves the same paths over TLS).
+  NEOHIRO_APT_HTTPS_REWRITE=1  Also rewrite http->https in the non-apt
+                               stores (apk, pip, npm, cargo, gem, nix,
+                               docker, fwupd, dnf/yum, zypper, pacman).
+                               Off by default: not every mirror serves the
+                               same paths over TLS.
   NEOHIRO_APT_HTTPS_NOVERIFY=1 Skip the post-rewrite `apt-get update` check.
-  NEOHIRO_APT_HTTPS_STRICT=1   Treat leftover plaintext repos as a hard error.
+  NEOHIRO_APT_HTTPS_STRICT=1   Treat leftover plaintext as a hard error.
   NEOHIRO_APT_BLOCK_PORT80=1   Also add `ufw deny out 80/tcp` so no process can
                                open a plaintext package connection at all.
                                Off by default because a blanket outbound
                                block also affects unrelated protocols.
+  NEOHIRO_APT_FAMILY=apt|dnf|zypper|pacman|none
+                               Pin the detected package manager (CI images).
 USAGE
       exit 0
       ;;

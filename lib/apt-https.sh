@@ -250,18 +250,36 @@ _apt_https_plaintext_in_repo_file() {
 #
 # Being generic is the point. A per-dialect key list would miss gpgkey=,
 # metalink=, and whatever the next distro release adds, and a miss is exactly
-# the failure this library exists to prevent. Comment lines are skipped so a
-# documentation link in a config file is not mistaken for a fetch target.
+# the failure this library exists to prevent.
+#
+# One deliberate exception: JSON has no comment syntax, so skipping "#" lines
+# cannot distinguish a doc link from a fetch target. In a .json file we
+# therefore require http:// to sit at the start of a JSON string, which is
+# where a URL value lives. Without this, docker daemon.json entries like
+# {"_comment": "see http://docs.internal"} would be reported as plaintext
+# registries and train users to ignore the report.
 _apt_https_plaintext_generic() {
   local f="$1" id="${2:-}"
   [ -f "$f" ] || return 0
-  awk -v id="$id" '
-    /^[[:space:]]*(#|;)/ { next }
-    /http:\/\// {
-      line = $0
-      gsub(/^[[:space:]]+/, "", line)
-      printf "%s:%d: %s\n", FILENAME, NR, line
-    }' "$f" 2>/dev/null
+  case "$f" in
+    *.json)
+      awk '
+        /"http:\/\// {
+          line = $0
+          gsub(/^[[:space:]]+/, "", line)
+          printf "%s:%d: %s\n", FILENAME, NR, line
+        }' "$f" 2>/dev/null
+      ;;
+    *)
+      awk '
+        /^[[:space:]]*(#|;)/ { next }
+        /http:\/\// {
+          line = $0
+          gsub(/^[[:space:]]+/, "", line)
+          printf "%s:%d: %s\n", FILENAME, NR, line
+        }' "$f" 2>/dev/null
+      ;;
+  esac
   return 0
 }
 

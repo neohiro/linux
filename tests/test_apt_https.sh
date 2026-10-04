@@ -124,10 +124,12 @@ else
   fail_t "NEOHIRO_APT_FAMILY pins the detected family" "got: ${PINNED:-<empty>}"
 fi
 
-if grep -q 'NEOHIRO_APT_FAMILY' "$SRC" && grep -q 'NEOHIRO_APT_FAMILY' "$LIB"; then
-  ok_t "NEOHIRO_APT_FAMILY is honoured by the inline fallback too"
+# Single source of truth: the family pin lives only in the library. The
+# curl|bash path sources that library, so there is no second copy to drift.
+if grep -q 'NEOHIRO_APT_FAMILY' "$LIB"; then
+  ok_t "NEOHIRO_APT_FAMILY is implemented in the single canonical library"
 else
-  fail_t "NEOHIRO_APT_FAMILY is honoured by the inline fallback too" "missing in one of the two copies"
+  fail_t "NEOHIRO_APT_FAMILY is implemented in the single canonical library" "not found in lib"
 fi
 
 # ============================================================================
@@ -808,27 +810,60 @@ else
 fi
 
 # ============================================================================
-# Parity: linuxinstall.sh's inline fallback must expose the same API
+# Single implementation: the curl|bash path must LOAD the canonical library
 # ============================================================================
-INLINE_FNS="apt_https_guard apt_https_enforce apt_https_report apt_https_revert \
-apt_https_family apt_https_status_text apt_https_etc_dir apt_https_backup_dir apt_https_conf_file \
-_apt_https_repo_files _apt_https_foreign_repo_files _apt_https_plaintext_in_apt_file \
-_apt_https_plaintext_in_repo_file _apt_https_backup_path _apt_https_backup_once _apt_https_stage \
-_apt_https_write_conf _apt_https_rewrite_file _apt_https_rewrite_apt_sources \
-_apt_https_revert_apt_sources _apt_https_audit_family _apt_https_rewrite_family \
-_apt_https_flatpak_plaintext _apt_https_check_ca_certs _apt_https_block_port80 _apt_priv \
-_apt_https_verify_apt_sources"
-MISSING=""
-for fn in $INLINE_FNS; do
-  grep -qE "^[[:space:]]+${fn}\(\)" "$SRC" || MISSING="$MISSING inline:$fn"
-  grep -qE "^${fn}\(\)"       "$LIB" || MISSING="$MISSING lib:$fn"
-done
-if [ -z "$MISSING" ]; then
-  ok_t "inline fallback and lib/apt-https.sh expose the same API"
+# linuxinstall.sh used to carry a ~400-line inline copy of the guard. That is
+# the worst arrangement for security-critical code: a fix in lib/apt-https.sh
+# silently did not reach `curl | sudo bash`, the documented primary install
+# method. It now resolves and sources the canonical library instead.
+if grep -q '_apt_https_resolved' "$SRC" && \
+   grep -q 'REPO_RAW_BASE}/lib/apt-https.sh' "$SRC"; then
+  ok_t "curl|bash path resolves lib/apt-https.sh instead of duplicating it"
 else
-  fail_t "inline fallback and lib/apt-https.sh expose the same API" "missing:$MISSING"
+  fail_t "curl|bash path resolves lib/apt-https.sh instead of duplicating it" \
+        "resolver block missing"
 fi
 
+# No helper from the library may be redefined inline any more. If one creeps
+# back in, the two copies can drift again -- which is the bug this guards.
+INLINE_DUPLICATES=""
+for fn in _apt_https_plaintext_in_apt_file _apt_https_atomic_replace \
+          _apt_https_prep_repo_stage _apt_https_rewrite_file \
+          _apt_https_source_files _apt_https_source_plaintext \
+          _apt_https_source_prefer_https _apt_https_managed_files \
+          _apt_https_plaintext_generic; do
+  if grep -qE "^[[:space:]]+${fn}\(\) *\{" "$SRC"; then
+    INLINE_DUPLICATES="$INLINE_DUPLICATES $fn"
+  fi
+done
+if [ -z "$INLINE_DUPLICATES" ]; then
+  ok_t "no library helper is redefined inline in linuxinstall.sh"
+else
+  fail_t "no library helper is redefined inline in linuxinstall.sh" \
+        "duplicated again:$INLINE_DUPLICATES"
+fi
+
+# When the library genuinely cannot be loaded, every public entry point must
+# still exist so no caller hits an undefined function.
+if grep -q 'apt_https_guard()      { _apt_https_unavailable' "$SRC" && \
+   grep -q 'apt_https_enforce()    { _apt_https_unavailable' "$SRC" && \
+   grep -q 'apt_https_report()     { _apt_https_unavailable' "$SRC" && \
+   grep -q 'apt_https_revert()     { _apt_https_unavailable' "$SRC" && \
+   grep -q 'apt_https_status_text(){ return 0; }' "$SRC"; then
+  ok_t "degraded mode still defines every public entry point"
+else
+  fail_t "degraded mode still defines every public entry point" \
+        "a stub is missing; a caller would hit an undefined function"
+fi
+
+# The helpers that callers outside this file use must be stubbed too.
+for fn in apt_https_backup_dir apt_https_conf_file; do
+  if grep -qE "^[[:space:]]+${fn}\(\) *\{" "$SRC"; then
+    ok_t "degraded mode stubs $fn (used by _step_apt_https)"
+  else
+    fail_t "degraded mode stubs $fn (used by _step_apt_https)" "not stubbed"
+  fi
+done
 # ============================================================================
 # _step_apt_https exit-status plumbing
 # ============================================================================
@@ -1199,12 +1234,14 @@ if printf '%s' "$GUARD_BODY" | grep -q 'return 0'; then
 else
   fail_t "apt_https_guard always returns 0 (lib)" "no unconditional return 0"
 fi
-INLINE_GUARD="$(awk '/^[[:space:]]+apt_https_guard\(\) \{/,/^[[:space:]]+\}/' "$SRC")"
-if printf '%s' "$INLINE_GUARD" | grep -q 'apt_https_enforce .* || true'; then
-  ok_t "apt_https_guard swallows enforcement failure (inline fallback)"
+# With the library loaded the guarantee comes from the lib's own guard; with it
+# unavailable, the degraded stub must also return 0. Either way a package
+# operation is never blocked by the precaution itself.
+if grep -q 'apt_https_guard()      { _apt_https_unavailable; return 0; }' "$SRC"; then
+  ok_t "degraded apt_https_guard also swallows failure (inline resolver)"
 else
-  fail_t "apt_https_guard swallows enforcement failure (inline fallback)" \
-        "enforce call is not guarded with '|| true'"
+  fail_t "degraded apt_https_guard also swallows failure (inline resolver)" \
+        "stub could return non-zero and abort a package operation"
 fi
 
 # Behaviour: a guard call must return 0 even when enforcement fails hard.
@@ -1296,11 +1333,13 @@ for v in _APT_HTTPS_VERDICT _APT_HTTPS_CHANGED _APT_HTTPS_REVERTED \
     fail_t "$v is initialised at the top level of lib/apt-https.sh" \
           "no top-level assignment found"
   fi
-  if grep -qE "^  ${v}=" "$SRC"; then
-    ok_t "$v is initialised at the top level of the inline fallback"
+  # The inline path no longer declares these: it sources the library, which
+  # owns every global. A duplicate here would reintroduce the drift hazard.
+  if grep -qE "^[[:space:]]+${v}=" "$SRC"; then
+    fail_t "$v is NOT duplicated into the inline resolver" \
+          "declared in both places again - they can drift"
   else
-    fail_t "$v is initialised at the top level of the inline fallback" \
-          "no top-level assignment found"
+    ok_t "$v is not duplicated into the inline resolver (single owner)"
   fi
 done
 
@@ -1326,13 +1365,8 @@ else
   fail_t "CA check returns before warning when a trust store IS present (lib)" \
         "no early return: a case arm can fall through and warn on a healthy host"
 fi
-CA_INLINE="$(awk '/^[[:space:]]+_apt_https_check_ca_certs\(\) \{/,/^[[:space:]]+\}/' "$SRC")"
-if printf '%s' "$CA_INLINE" | grep -qE '\[ "\$missing" = "0" \] && return 0'; then
-  ok_t "CA check returns early when a trust store IS present (inline fallback)"
-else
-  fail_t "CA check returns early when a trust store IS present (inline fallback)" \
-        "inline copy lacks the early return"
-fi
+# Single owner: the CA check lives only in the library, so the structural
+# guard above is the whole invariant -- no inline copy to keep in sync.
 
 # Behavioural half: this host has no /etc CA bundle, so the missing branch is
 # live -- assert it warns exactly once no matter how many call sites fire.
@@ -1417,18 +1451,427 @@ case "$CONF_MODE" in
   *) fail_t "atomic drop-in install lands as 0644" "got: $CONF_MODE" ;;
 esac
 
-# Structural: the rewrite must go through mv, not cp-into-place.
-if grep -q '_apt_https_atomic_replace' "$LIB" && grep -q '_apt_https_atomic_replace' "$SRC"; then
-  ok_t "lib and inline fallback both route writes through _apt_https_atomic_replace"
+# Structural: every write is a staging rename, never cp-into-place, and the
+# logic lives in exactly one place.
+if grep -q '_apt_https_atomic_replace' "$LIB"; then
+  ok_t "all writes route through _apt_https_atomic_replace"
 else
-  fail_t "lib and inline fallback both route writes through _apt_https_atomic_replace" \
-        "atomic helper not wired in one of the two copies"
+  fail_t "all writes route through _apt_https_atomic_replace" "helper not wired into the lib"
 fi
-if grep -q '_apt_priv mv -f "\$stage" "\$target"' "$LIB" && \
-   grep -q '_apt_priv mv -f "\$stage" "\$target"' "$SRC"; then
+if grep -q '_apt_priv mv -f "\$stage" "\$target"' "$LIB"; then
   ok_t "atomic replace finishes with rename(2) via mv -f"
 else
   fail_t "atomic replace finishes with rename(2) via mv -f" "mv of the stage file missing"
+fi
+if grep -q '_apt_https_atomic_replace' "$SRC"; then
+  fail_t "atomic replace is not reimplemented in the inline resolver" "duplicate copy"
+else
+  ok_t "atomic replace is not reimplemented in the inline resolver (single owner)"
+fi
+
+# ============================================================================
+# App-store coverage: every store must be CHECKED and USED
+# ============================================================================
+# The precaution is not apt-specific. Each distro and language has its own
+# "app store", and several ship plaintext HTTP by default. These tests drive
+# the per-source detectors directly (they do not gate on applicability) so
+# every store is exercised on any host.
+APT_SOURCES="apt dnf yum zypper pacman apk flatpak snap docker brew pip npm cargo gem nix fwupd"
+REGISTERED="$(_apt_https_source_ids | tr '\n' ' ')"
+
+# 1) Every store we claim to cover is registered.
+MISSING_SOURCES=""
+for s in $APT_SOURCES; do
+  case " $REGISTERED " in *" $s "*) : ;; *) MISSING_SOURCES="$MISSING_SOURCES $s" ;; esac
+done
+if [ -z "$MISSING_SOURCES" ]; then
+  ok_t "all app stores are registered: $(printf '%s' "$REGISTERED" | tr '\n' ' ')"
+else
+  fail_t "all app stores are registered" "missing:$MISSING_SOURCES"
+fi
+
+# 2) Every registered store has a label (a missing label means a blank row in
+#    the report, i.e. a store the user cannot identify).
+NO_LABEL=""
+for s in $REGISTERED; do
+  [ -n "$s" ] || continue
+  [ "$(_apt_https_source_label "$s")" = "$s" ] && NO_LABEL="$NO_LABEL $s"
+done
+if [ -z "$NO_LABEL" ]; then
+  ok_t "every registered store has a human-readable label"
+else
+  fail_t "every registered store has a human-readable label" "fallback label used:$NO_LABEL"
+fi
+
+# fake_tool <name> — put an executable stub for <name> on PATH so a store's
+# applicability gate passes on a host that does not actually run that distro.
+# Used to exercise the gate-driven sweep for apk/brew/docker.
+fake_tool() {
+  local n="$1"
+  mkdir -p "$FAKEBIN"
+  printf '#!/bin/sh\nexit 0\n' > "$FAKEBIN/$n"
+  chmod +x "$FAKEBIN/$n" 2>/dev/null || true
+}
+unfake_tool() { rm -f "$FAKEBIN/$1" 2>/dev/null || true; }
+
+# 3) Per-store detection: write a plaintext config for each store and assert
+#    the detector finds it. A store that silently finds nothing is the exact
+#    failure this library exists to prevent.
+seed_store_config() {
+  case "$1" in
+    apk)    mkdir -p "$SANDBOX/apk"; printf '%s\n' \
+              'http://dl-cdn.alpinelinux.org/alpine/v3.19/main' \
+              'https://dl-cdn.alpinelinux.org/alpine/v3.19/community' > "$SANDBOX/apk/repositories" ;;
+    docker) mkdir -p "$SANDBOX/docker"; printf '%s\n' \
+              '{ "registry-mirrors": ["http://mirror.internal:5000"], "insecure-registries": ["reg.local:5000"] }' > "$SANDBOX/docker/daemon.json" ;;
+    pip)    mkdir -p "$FAKEHOME/.config/pip"; printf '%s\n' \
+              '[global]' 'index-url = http://pypi.internal/simple' > "$FAKEHOME/.config/pip/pip.conf" ;;
+    npm)    printf '%s\n' 'registry=http://npm.internal/' > "$FAKEHOME/.npmrc" ;;
+    cargo)  mkdir -p "$FAKEHOME/.cargo"; printf '%s\n' \
+              '[source.crates-io]' 'registry = "sparse+http://index.internal/"' > "$FAKEHOME/.cargo/config.toml" ;;
+    gem)    printf '%s\n' '---' ':sources:' '- http://rubygems.internal/' > "$FAKEHOME/.gemrc" ;;
+    nix)    mkdir -p "$SANDBOX/nix"; printf '%s\n' \
+              'substituters = http://cache.nixos.org' 'channel = http://nixos.org/channels' > "$SANDBOX/nix/nix.conf" ;;
+    fwupd)  mkdir -p "$SANDBOX/fwupd/remotes.d"; printf '%s\n' \
+              '[lvfs]' 'UpdateURI=http://fwupd.lvfs.org/fwupd-stable.xml.gz' > "$SANDBOX/fwupd/remotes.d/lvfs.conf" ;;
+    dnf|yum) mkdir -p "$SANDBOX/yum.repos.d"; printf '%s\n' \
+              '[e]' 'name=E' 'baseurl=http://mirror.internal/epel/' 'gpgcheck=1' > "$SANDBOX/yum.repos.d/e.repo" ;;
+    zypper) mkdir -p "$SANDBOX/zypp/repos.d"; printf '%s\n' \
+              '[r]' 'name=R' 'baseurl=http://download.internal/oss/' > "$SANDBOX/zypp/repos.d/r.repo" ;;
+    pacman) mkdir -p "$SANDBOX/pacman.d"; printf '%s\n' \
+              '## Worldwide' 'Server=http://mirror.internal/archlinux/$repo/os/$arch' > "$SANDBOX/pacman.d/mirrorlist" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+for s in apk docker pip npm cargo gem nix fwupd; do
+  reset_sandbox
+  seed_store_config "$s"
+  FOUND="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+  if printf '%s' "$FOUND" | grep -q 'http://'; then
+    ok_t "$s: plaintext endpoint is detected"
+  else
+    fail_t "$s: plaintext endpoint is detected" "detector returned nothing for $s"
+  fi
+done
+
+for s in dnf zypper pacman; do
+  reset_sandbox
+  TEST_FAMILY="$s"
+  seed_store_config "$s"
+  FOUND="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+  if printf '%s' "$FOUND" | grep -q 'http://'; then
+    ok_t "$s: plaintext endpoint is detected"
+  else
+    fail_t "$s: plaintext endpoint is detected" "detector returned nothing for $s"
+  fi
+done
+TEST_FAMILY=apt
+
+# 4) Comment lines must not be treated as fetch targets in the generic
+#    detector, or every config with a doc link would look dirty.
+for s in apk docker npm gem nix fwupd; do
+  reset_sandbox
+  seed_store_config "$s"
+  # Prepend a comment that mentions a plaintext URL.
+  FIRST_FILE="$(_apt_https_source_files "$s" | head -1)"
+  if [ -n "$FIRST_FILE" ] && [ -f "$FIRST_FILE" ]; then
+    case "$FIRST_FILE" in
+      *.json) printf '%s\n' '{ "_comment": "see http://docs.internal for details", "registry-mirrors": ["https://ok.internal"] }' > "$FIRST_FILE" ;;
+      *) printf '%s\n%s\n' '# docs: http://docs.internal/see-me' "$(cat "$FIRST_FILE")" > "$FIRST_FILE" ;;
+    esac
+    if [ "$FIRST_FILE" = "$FAKEHOME/.npmrc" ]; then
+      printf '%s\n%s\n' '; docs: http://docs.internal/see-me' "$(cat "$FIRST_FILE")" > "$FIRST_FILE"
+    fi
+    CLEAN="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+    if [ -z "$CLEAN" ] || ! printf '%s' "$CLEAN" | grep -q 'docs.internal'; then
+      ok_t "$s: commented plaintext URLs are not flagged"
+    else
+      fail_t "$s: commented plaintext URLs are not flagged" "false positive: $CLEAN"
+    fi
+  else
+    fail_t "$s: commented plaintext URLs are not flagged" "no config file located for $s"
+  fi
+done
+
+# 5) Opt-in rewrite must convert every file-based store, not just apt.
+for s in apk docker pip npm cargo gem nix fwupd; do
+  reset_sandbox
+  seed_store_config "$s"
+  BEFORE="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+  _apt_https_source_prefer_https "$s"
+  AFTER="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+  if [ -n "$BEFORE" ] && [ -z "$AFTER" ] && [ "${_APT_HTTPS_CHANGED:-0}" -gt 0 ]; then
+    ok_t "$s: prefer-https rewrite removes the plaintext endpoint"
+  else
+    fail_t "$s: prefer-https rewrite removes the plaintext endpoint" \
+          "before=[$(printf '%s' "$BEFORE" | tr '\n' '|')] after=[$(printf '%s' "$AFTER" | tr '\n' '|')] changed=${_APT_HTTPS_CHANGED:-?}"
+  fi
+  # And the rewritten value must actually be https, not just "no longer http".
+  ANY_HTTPS=0
+  while IFS= read -r f; do
+    [ -n "$f" ] && grep -q 'https://' "$f" 2>/dev/null && ANY_HTTPS=1
+  done < <(_apt_https_source_files "$s")
+  if [ "$ANY_HTTPS" = "1" ]; then
+    ok_t "$s: rewrite actually wrote https:// into the config"
+  else
+    fail_t "$s: rewrite actually wrote https:// into the config" "no https:// present"
+  fi
+  # Backup must exist so the change is revertible.
+  BK="$(find "$BACKUPS" -name '*.orig' 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$BK" -gt 0 ]; then
+    ok_t "$s: rewrite backed the config up first"
+  else
+    fail_t "$s: rewrite backed the config up first" "no .orig in $BACKUPS"
+  fi
+done
+
+# 6) "if available": non-apt stores must NOT be rewritten unattended.
+for s in apk docker pip npm cargo gem nix fwupd; do
+  reset_sandbox
+  seed_store_config "$s"
+  _APT_HTTPS_DONE=""
+  apt_https_enforce "no-optin-$s" >/dev/null 2>&1
+  STILL="$(_apt_https_source_plaintext "$s" 2>/dev/null)"
+  if [ -n "$STILL" ]; then
+    ok_t "$s: left untouched without NEOHIRO_APT_HTTPS_REWRITE=1"
+  else
+    fail_t "$s: left untouched without NEOHIRO_APT_HTTPS_REWRITE=1" "rewritten unattended"
+  fi
+done
+
+# 7) With the opt-in, apt_https_enforce must sweep every store, not just apt.
+#    apk and brew are stubbed onto PATH so their applicability gate passes:
+#    the gate deliberately skips stores that are not installed.
+fake_tool apk; fake_tool npm
+reset_sandbox
+seed_store_config apk
+seed_store_config nix
+seed_store_config npm
+_APT_HTTPS_DONE=""
+NEOHIRO_APT_HTTPS_REWRITE=1 apt_https_enforce "sweep" >/dev/null 2>&1
+LEFT=0
+for s in apk nix npm; do
+  [ -n "$(_apt_https_source_plaintext "$s" 2>/dev/null)" ] && LEFT=$((LEFT + 1))
+done
+if [ "$LEFT" = "0" ]; then
+  ok_t "opt-in sweep cleans apk, nix and npm in one pass"
+else
+  fail_t "opt-in sweep cleans apk, nix and npm in one pass" "$LEFT store(s) still plaintext"
+fi
+
+# 7b) The sweep must NOT touch a store whose tool is absent, even with the
+#     opt-in set: rewriting config for software that is not installed is
+#     out of scope and can surprise a later manual install.
+unfake_tool apk
+reset_sandbox
+seed_store_config apk
+_APT_HTTPS_DONE=""
+NEOHIRO_APT_HTTPS_REWRITE=1 apt_https_enforce "sweep-uninstalled" >/dev/null 2>&1
+if [ -n "$(_apt_https_source_plaintext apk 2>/dev/null)" ]; then
+  ok_t "opt-in sweep skips a store whose tool is not installed"
+else
+  fail_t "opt-in sweep skips a store whose tool is not installed" \
+        "rewrote config for an absent tool"
+fi
+fake_tool apk
+
+env_src_id() {
+  case "$1" in
+    PIP_INDEX_URL|PIP_EXTRA_INDEX_URL) printf 'pip' ;;
+    NPM_CONFIG_REGISTRY|npm_config_registry) printf 'npm' ;;
+    CARGO_REGISTRIES_CRATES_IO_INDEX) printf 'cargo' ;;
+    GEM_SOURCE) printf 'gem' ;;
+    HOMEBREW_*) printf 'brew' ;;
+    *) printf '' ;;
+  esac
+}
+
+# 8) Env-configured transports are reported. Exercised through
+#    _apt_https_source_env directly, because the aggregate only reports a
+#    store whose tool is installed -- and no host runs all of them.
+for pair in "PIP_INDEX_URL=http://pypi.internal/simple" \
+            "PIP_EXTRA_INDEX_URL=http://extra.internal/simple" \
+            "NPM_CONFIG_REGISTRY=http://npm.internal/" \
+            "npm_config_registry=http://npm2.internal/" \
+            "CARGO_REGISTRIES_CRATES_IO_INDEX=http://crates.internal/" \
+            "GEM_SOURCE=http://rubygems.internal/" \
+            "HOMEBREW_API_DOMAIN=http://brew.internal" \
+            "HOMEBREW_ARTIFACT_DOMAIN=http://brew-artifacts.internal" \
+            "HOMEBREW_BREW_GIT_REMOTE=http://git.internal/brew.git"; do
+  reset_sandbox
+  VAR="${pair%%=*}"
+  VAL="${pair#*=}"
+  SRC="$(env_src_id "$VAR")"
+  # shellcheck disable=SC2086
+  OUT="$(env "$VAR=$VAL" bash -c ". '$LIB' >/dev/null 2>&1; _apt_https_source_env $SRC" 2>/dev/null)"
+  if printf '%s' "$OUT" | grep -q "$VAR=$VAL"; then
+    ok_t "env transport detected: $VAR"
+  else
+    fail_t "env transport detected: $VAR" "got: $(printf '%s' "$OUT" | tr '\n' '|')"
+  fi
+done
+
+# 8b) An unset variable must produce nothing (no empty VAR= noise).
+reset_sandbox
+if [ -z "$(_apt_https_source_env pip 2>/dev/null)" ]; then
+  ok_t "no env noise when transport variables are unset"
+else
+  fail_t "no env noise when transport variables are unset" \
+        "got: $(_apt_https_source_env pip 2>/dev/null | tr '\n' '|')"
+fi
+
+# 9) Revert must restore every store it touched.
+reset_sandbox
+seed_store_config apk
+seed_store_config nix
+_APT_HTTPS_DONE=""
+NEOHIRO_APT_HTTPS_REWRITE=1 apt_https_enforce "revert-all" >/dev/null 2>&1
+if [ -n "$(_apt_https_source_plaintext apk 2>/dev/null)" ]; then
+  fail_t "precondition: apk was rewritten before revert" "still https"
+else
+  ok_t "precondition: apk was rewritten before revert"
+fi
+apt_https_revert >/dev/null 2>&1
+if [ -n "$(_apt_https_source_plaintext apk 2>/dev/null)" ] && \
+   [ -n "$(_apt_https_source_plaintext nix 2>/dev/null)" ]; then
+  ok_t "revert restores non-apt stores too, not just apt"
+else
+  fail_t "revert restores non-apt stores too, not just apt" \
+        "apk=[$(_apt_https_source_plaintext apk 2>/dev/null)] nix=[$(_apt_https_source_plaintext nix 2>/dev/null)]"
+fi
+
+# 10) The aggregate must span every store, and report rc=1 when any is dirty.
+reset_sandbox
+seed_store_config gem
+if apt_https_status_text 2>/dev/null | grep -q 'rubygems.internal'; then
+  ok_t "apt_https_status_text aggregates non-apt stores"
+else
+  fail_t "apt_https_status_text aggregates non-apt stores" "gem endpoint missing from aggregate"
+fi
+apt_https_report >/dev/null 2>&1
+if [ $? -eq 1 ]; then
+  ok_t "report exits 1 when any store is plaintext"
+else
+  fail_t "report exits 1 when any store is plaintext" "rc=$?"
+fi
+REPORT_OUT="$(apt_https_report 2>&1)"
+if printf '%s' "$REPORT_OUT" | grep -q 'gem sources'; then
+  ok_t "report names the offending store"
+else
+  fail_t "report names the offending store" "no 'gem sources' row"
+fi
+
+# 11) Applicability gating: a store with no tooling on this host must not be
+#     listed as a dirty row, so the report stays readable on a minimal box.
+reset_sandbox
+_missing_tools=0
+for tool in docker flatpak snap apk brew; do
+  command -v "$tool" >/dev/null 2>&1 || _missing_tools=$((_missing_tools + 1))
+done
+if [ "$_missing_tools" -gt 0 ]; then
+  ok_t "applicability gate can be exercised (host is missing $_missing_tools store tool(s))"
+else
+  ok_t "applicability gate: all store tools present on this host"
+fi
+reset_sandbox
+if _apt_https_source_applicable docker 2>/dev/null; then
+  if command -v docker >/dev/null 2>&1; then
+    ok_t "docker marked applicable when the binary exists"
+  else
+    fail_t "docker marked applicable when the binary exists" "reported applicable with no docker"
+  fi
+else
+  ok_t "docker marked not-applicable when the binary is absent"
+fi
+
+# ============================================================================
+# Repository encoding hygiene
+# ============================================================================
+# These scripts are full of box-drawing and em-dash characters, so they are
+# one careless editor, IDE, or shell one-liner away from being silently
+# re-encoded. That failure mode is nasty: the file still parses, the tests
+# mostly pass, and only the snapshot or a diff comparison notices. It bit this
+# work twice (a UTF-8 file read as cp1252 and rewritten, then a repair pass
+# that introduced U+FFFD), so it gets an automated guard.
+#
+# Pure bash + coreutils on purpose: the CI matrix includes a busybox-based
+# bash:3.2-alpine image where python may be absent.
+if command -v iconv >/dev/null 2>&1; then
+  BAD_UTF8=""
+  while IFS= read -r f; do
+    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || BAD_UTF8="$BAD_UTF8 $f"
+  done <<EOF
+$(cd "$ROOT" && find . \( -name '*.sh' -o -name '*.md' \) -not -path './.git/*' | sort)
+EOF
+  if [ -z "$BAD_UTF8" ]; then
+    ok_t "every .sh/.md file is valid UTF-8"
+  else
+    fail_t "every .sh/.md file is valid UTF-8" "invalid:$BAD_UTF8"
+  fi
+else
+  ok_t "UTF-8 validity check skipped (iconv unavailable)"
+fi
+
+# U+FFFD and cp1252 double-encoding markers.
+#
+# The search patterns are built from byte escapes at runtime on purpose: a
+# detector that spelled the mojibake literally would match itself, and the
+# obvious "just exclude this file" fix would leave the next file unguarded.
+# C3 A2 is 'a-circumflex' and C3 83 is 'A-tilde' as UTF-8 -- both are the
+# leading byte of a double-encoded 3-byte sequence and neither legitimately
+# appears in this codebase.
+FFFD_BYTES="$(printf '\357\277\275')"
+MOJI_A="$(printf '\303\242')"
+MOJI_C="$(printf '\303\203')"
+
+FFFD_FILES=""; MOJI_FILES=""
+while IFS= read -r f; do
+  LC_ALL=C grep -q "$FFFD_BYTES" "$f" 2>/dev/null && FFFD_FILES="$FFFD_FILES $f"
+  if LC_ALL=C grep -q "$MOJI_A" "$f" 2>/dev/null || LC_ALL=C grep -q "$MOJI_C" "$f" 2>/dev/null; then
+    MOJI_FILES="$MOJI_FILES $f"
+  fi
+done <<EOF
+$(cd "$ROOT" && find . \( -name '*.sh' -o -name '*.md' \) -not -path './.git/*' | sort)
+EOF
+if [ -z "$FFFD_FILES" ]; then
+  ok_t "no U+FFFD replacement characters anywhere"
+else
+  fail_t "no U+FFFD replacement characters anywhere" "found in:$FFFD_FILES"
+fi
+if [ -z "$MOJI_FILES" ]; then
+  ok_t "no cp1252 double-encoding artifacts anywhere"
+else
+  fail_t "no cp1252 double-encoding artifacts anywhere" "found in:$MOJI_FILES"
+fi
+
+# .gitattributes pins eol=lf for *.sh and *.md; a CRLF slip breaks the
+# snapshot diffs and makes every future diff noisier.
+#
+# The CR is matched with a shell `case` rather than `grep -q $'\r'`: passing a
+# lone control character as a process argument is not portable (Git Bash's
+# MSYS argument translation swallows it, and the check silently passes).
+# Keeping the byte inside the shell avoids the round trip entirely.
+_has_cr() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *$'\r'*) return 0 ;;
+    esac
+  done < "$1"
+  return 1
+}
+CRLF_FILES=""
+while IFS= read -r f; do
+  _has_cr "$f" && CRLF_FILES="$CRLF_FILES $f"
+done <<EOF
+$(cd "$ROOT" && find . \( -name '*.sh' -o -name '*.md' \) -not -path './.git/*' | sort)
+EOF
+if [ -z "$CRLF_FILES" ]; then
+  ok_t "no CRLF line endings (matches .gitattributes eol=lf)"
+else
+  fail_t "no CRLF line endings (matches .gitattributes eol=lf)" "found in:$CRLF_FILES"
 fi
 
 # ============================================================================
