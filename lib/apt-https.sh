@@ -289,11 +289,28 @@ _APT_HTTPS_GENERIC_RE='/^[[:space:]]*(#|;)/! s|http://|https://|g'
 
 # ── Backups ──────────────────────────────────────────────────────────────────
 
-# _apt_https_backup_path <file> — deterministic, path-flattened backup name.
+# _apt_https_backup_path <file> — deterministic, collision-resistant name.
+#
+# The path is flattened so it is a legal filename inside the backup
+# directory, but flattening alone is NOT injective: /a/b/c and /a_b/c both
+# become _a_b_c. A collision here means reverting one file restores another
+# file's contents, which is a silent, hard-to-trace corruption of a package
+# manager. So append a checksum of the real path.
+#
+# cksum (POSIX) is used rather than a shell hash so the value is stable
+# across shells, runs, and machines -- these backups may be inspected or
+# moved during an incident.
 _apt_https_backup_path() {
-  local flat
-  flat="$(printf '%s' "$1" | tr '/' '_')"
-  printf '%s/%s.orig' "$(apt_https_backup_dir)" "$flat"
+  local flat sum
+  flat="$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_')"
+  sum="$(printf '%s' "$1" | cksum 2>/dev/null | tr -d ' ' | cut -d' ' -f1)"
+  if [ -n "$sum" ]; then
+    printf '%s/%s-%s.orig' "$(apt_https_backup_dir)" "$flat" "$sum"
+  else
+    # cksum unavailable: the flattened name alone is still better than
+    # hashing nothing, and this is recorded so it is not mistaken for a bug.
+    printf '%s/%s.orig' "$(apt_https_backup_dir)" "$flat"
+  fi
 }
 
 # _apt_https_backup_once <file> — copy <file> aside the first time we touch it.
@@ -440,12 +457,13 @@ _apt_https_prep_repo_stage() {
 
 # ── apt source rewriting ─────────────────────────────────────────────────────
 #
-# The three functions below report their result through globals
-# (_APT_HTTPS_VERDICT / _APT_HTTPS_CHANGED / _APT_HTTPS_REVERTED) instead of
-# stdout.  They emit progress messages of their own, and a command
-# substitution would fold that text into the value it returns -- which then
-# lands inside an arithmetic expansion and turns a word like "Restored" into
-# a variable lookup. Globals keep the two channels separate.
+# The rewriters below report their result through globals
+# (_APT_HTTPS_VERDICT / _APT_HTTPS_CHANGED / _APT_HTTPS_REVERTED /
+# _APT_HTTPS_REFUSED) instead of stdout. They emit progress messages of
+# their own, and a command substitution would fold that text into the value
+# it returns -- which then lands inside an arithmetic expansion and turns a
+# word like "Restored" into a variable lookup. Globals keep the message
+# channel and the value channel separate.
 
 _APT_HTTPS_VERDICT=""
 _APT_HTTPS_CHANGED=0
@@ -601,8 +619,9 @@ _apt_https_source_label() {
 
 # _apt_https_source_files <id> — config files that carry this source's URLs.
 _apt_https_source_files() {
-  local etc f
+  local etc f home
   etc="$(apt_https_etc_dir)"
+  home="${HOME:-}"
   case "$1" in
     apt)     _apt_https_repo_files ;;
     dnf|yum) _apt_https_foreign_repo_files dnf ;;
@@ -618,23 +637,31 @@ _apt_https_source_files() {
       ;;
     # pip: system config plus the two variables that usually win.
     pip)
-      for f in "${etc}/pip.conf" "${etc}/xdg/pip/pip.conf" \
-               "${HOME:-}/.pip/pip.conf" "${HOME:-}/.config/pip/pip.conf"; do
+      for f in "${etc}/pip.conf" "${etc}/xdg/pip/pip.conf"; do
         [ -f "$f" ] && printf '%s\n' "$f"
       done
+      # Per-user config only makes sense with a real HOME. Without this guard
+      # an unset HOME builds "/.config/pip/pip.conf" -- a path at the
+      # filesystem root, which would be probed and could match.
+      if [ -n "$home" ]; then
+        for f in "${home}/.pip/pip.conf" "${home}/.config/pip/pip.conf"; do
+          [ -f "$f" ] && printf '%s\n' "$f"
+        done
+      fi
       ;;
     npm)
-      for f in "${etc}/npmrc" "${HOME:-}/.npmrc"; do
-        [ -f "$f" ] && printf '%s\n' "$f"
-      done
+      [ -f "${etc}/npmrc" ] && printf '%s\n' "${etc}/npmrc"
+      [ -n "$home" ] && [ -f "${home}/.npmrc" ] && printf '%s\n' "${home}/.npmrc"
       ;;
     cargo)
-      [ -f "${HOME:-}/.cargo/config.toml" ] && printf '%s\n' "${HOME:-}/.cargo/config.toml"
+      if [ -n "$home" ] && [ -f "${home}/.cargo/config.toml" ]; then
+        printf '%s\n' "${home}/.cargo/config.toml"
+      fi
       [ -f "${etc}/cargo/config.toml" ] && printf '%s\n' "${etc}/cargo/config.toml"
       ;;
     gem)
       [ -f "${etc}/gemrc" ] && printf '%s\n' "${etc}/gemrc"
-      [ -f "${HOME:-}/.gemrc" ] && printf '%s\n' "${HOME:-}/.gemrc"
+      [ -n "$home" ] && [ -f "${home}/.gemrc" ] && printf '%s\n' "${home}/.gemrc"
       ;;
     nix)
       [ -f "${etc}/nix/nix.conf" ] && printf '%s\n' "${etc}/nix/nix.conf"
@@ -679,14 +706,23 @@ _apt_https_source_env() {
   return 0
 }
 
-# _apt_https_source_applicable <id> — false when this host has no such store.
-# Keeps the report from listing eleven N/A rows on a minimal box.
+# _apt_https_source_applicable <id> [family]
+# False when this host has no such store, so the report does not list eleven
+# N/A rows on a minimal box.
+#
+# The detected family is passed in by callers rather than re-probed here.
+# apt_https_family costs up to five `command -v` PATH scans, and the report
+# loop called it once per RPM/Arch store -- twice over, since the report and
+# the per-source query each ran the loop. That is wasted work and a latent
+# inconsistency: if PATH changed mid-run a store could be "applicable" in one
+# pass and missing from the next, and the same file could be reported twice.
 _apt_https_source_applicable() {
-  local id="$1"
+  local id="$1" fam="${2:-}"
   case "$id" in
     # Only the package manager actually present should be audited as such.
     dnf|yum|zypper|pacman)
-      [ "$(apt_https_family)" = "$id" ] || return 1
+      [ -n "$fam" ] || fam="$(apt_https_family)"
+      [ "$fam" = "$id" ] || return 1
       ;;
     snap)
       command -v snap >/dev/null 2>&1 || return 1
@@ -718,6 +754,33 @@ _apt_https_source_applicable() {
     *) : ;;
   esac
   return 0
+}
+
+# _apt_https_source_hint <id> — one short line on how to fix this store.
+#
+# Printed only for stores that actually have a plaintext endpoint. Without it
+# the report says "repoint at https" and leaves the reader to work out where
+# that setting lives -- and for flatpak and snap there is no config file this
+# library can rewrite at all, so the generic advice is actively misleading.
+_apt_https_source_hint() {
+  case "$1" in
+    apt)     printf 'rewrite automatically:  sudo bash linuxinstall.sh --apt-https' ;;
+    dnf|yum) printf 'edit baseurl=/metalink=/mirrorlist= under /etc/yum.repos.d/*.repo' ;;
+    zypper)  printf 'edit baseurl=/uri= under /etc/zypp/repos.d/*.repo' ;;
+    pacman)  printf 'edit Server= lines in /etc/pacman.d/mirrorlist' ;;
+    apk)     printf 'rewrite with NEOHIRO_APT_HTTPS_REWRITE=1, or edit /etc/apk/repositories' ;;
+    docker)  printf 'set registry-mirrors to https:// in /etc/docker/daemon.json, drop insecure-registries, then restart docker' ;;
+    brew)    printf 'export HOMEBREW_API_DOMAIN / HOMEBREW_BREW_GIT_REMOTE with an https:// URL' ;;
+    pip)     printf 'export PIP_INDEX_URL=https://... (and PIP_EXTRA_INDEX_URL) or fix pip.conf' ;;
+    npm)     printf 'npm config set registry https://registry.npmjs.org/' ;;
+    cargo)   printf 'set the crates-io registry to sparse+https:// in ~/.cargo/config.toml' ;;
+    gem)     printf 'gem sources --remove <url> && gem sources --add https://rubygems.org/' ;;
+    nix)     printf 'use substituters = https://cache.nixos.org in nix.conf' ;;
+    # No operator-editable transport config; a URL rewrite cannot fix these.
+    flatpak) printf 'flatpak remote-modify --url=https://... <remote>   (no config file to rewrite)' ;;
+    snap)    printf 'snapd-managed store; cannot be repointed without a custom snapd build' ;;
+    *)       : ;;
+  esac
 }
 
 # _apt_https_source_plaintext <id> — report this source's plaintext endpoints.
@@ -905,18 +968,19 @@ _apt_https_block_port80() {
 # One line per offending config line, plus "VAR=value" for env-configured
 # transports, so the output is directly actionable.
 apt_https_status_text() {
-  local id
+  local id fam
+  fam="$(apt_https_family)"
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    _apt_https_source_applicable "$id" || continue
+    _apt_https_source_applicable "$id" "$fam" || continue
     _apt_https_source_plaintext "$id"
   done < <(_apt_https_source_ids)
   return 0
 }
 
-# _apt_https_plaintext_for <id> — findings for one source only.
+# _apt_https_plaintext_for <id> [family] — findings for one source only.
 apt_https_plaintext_for() {
-  _apt_https_source_applicable "$1" || return 0
+  _apt_https_source_applicable "$1" "${2:-}" || return 0
   _apt_https_source_plaintext "$1"
 }
 
@@ -924,7 +988,7 @@ apt_https_plaintext_for() {
 # Returns 0 when nothing anywhere uses plaintext, 1 when any source does,
 # 2 when no package manager at all was detected.
 apt_https_report() {
-  local fam conf findings id label n clean applicable
+  local fam conf findings id label n clean
   fam="$(apt_https_family)"
   printf '\n%s\n' "$(_c '1;36m' '━━━ App-store transport security (HTTPS) ━━━')"
   printf '  %-34s %s\n' "Package manager:" "$fam"
@@ -941,15 +1005,16 @@ apt_https_report() {
   clean=1
   while IFS= read -r id; do
     [ -n "$id" ] || continue
-    _apt_https_source_applicable "$id" || continue
+    _apt_https_source_applicable "$id" "$fam" || continue
     label="$(_apt_https_source_label "$id")"
-    findings="$(apt_https_plaintext_for "$id")"
+    findings="$(apt_https_plaintext_for "$id" "$fam")"
     if [ -z "$findings" ]; then
       printf '  %-30s %s\n' "$label" "$(_c '1;32m' 'https only')"
     else
       n="$(printf '%s\n' "$findings" | wc -l | tr -d ' ')"
       printf '  %-30s %s\n' "$label" "$(_c '1;31m' "$n plaintext endpoint(s)")"
       printf '%s\n' "$findings" | sed 's/^/      /'
+      printf '      %s\n' "$(_apt_https_source_hint "$id")"
       clean=0
     fi
   done < <(_apt_https_source_ids)
@@ -961,9 +1026,10 @@ apt_https_report() {
     printf '  %s %s\n' "$(_c '1;32m' '[x]')" "No plaintext endpoints in any configured app store."
   else
     printf '  %s %s\n' "$(_c '1;33m' '[!]')" "Some stores still fetch over plaintext HTTP."
-    printf '  %s\n' "  apt:    sudo bash linuxinstall.sh --apt-https   (automatic, verified)"
-    printf '%s\n' "  others: repoint at an https:// endpoint, or opt in with"
-    printf '%s\n' "          NEOHIRO_APT_HTTPS_REWRITE=1 and re-audit afterwards."
+    printf '  %s\n' "  Use the per-store hint above. apt needs nothing: --apt-https"
+    printf '%s\n' "  rewrites it unattended (and rolls back if a mirror cannot speak"
+    printf '%s\n' "  TLS). For the others, repoint the endpoint, or opt in to a blanket"
+    printf '%s\n' "  rewrite with NEOHIRO_APT_HTTPS_REWRITE=1 and re-audit afterwards."
   fi
   printf '\n'
 
@@ -1059,7 +1125,7 @@ apt_https_enforce() {
     while IFS= read -r id; do
       [ -n "$id" ] || continue
       [ "$id" = "apt" ] && continue
-      _apt_https_source_applicable "$id" || continue
+      _apt_https_source_applicable "$id" "$fam" || continue
       _apt_https_source_prefer_https "$id"
       n="$_APT_HTTPS_CHANGED"
       if [ "${n:-0}" -gt 0 ] 2>/dev/null; then

@@ -213,9 +213,10 @@ else
   fail_t "classic: bracketed options preserved during rewrite" "options mangled"
 fi
 
-BAK_REL="$(printf '%s' "$SANDBOX" | tr '/' '_')"
-BAK_REL="${BAK_REL#/}"
-BAK="$BACKUPS/${BAK_REL}_apt_sources.list.orig"
+# Ask the library where it keeps the backup instead of reimplementing the
+# naming. Reconstructing it here meant every change to the backup-name scheme
+# broke this test for the wrong reason.
+BAK="$(_apt_https_backup_path "$SANDBOX/apt/sources.list")"
 if [ -f "$BAK" ]; then
   ok_t "classic: original file was backed up before editing"
 else
@@ -228,6 +229,19 @@ if [ -f "$BAK" ] && grep -q '^deb http://archive.ubuntu.com' "$BAK"; then
 else
   fail_t "classic: backup holds the PRE-edit (plaintext) contents" \
         "backup does not contain the original http:// line"
+fi
+
+# Distinct paths must get distinct backup names. Flattening "/" to "_" is
+# not injective -- /a/b/c and /a_b/c both flattened to _a_b_c -- and a
+# collision would make --apt-https-off restore one file with another's
+# contents.
+BAK_A="$(_apt_https_backup_path '/a/b/c')"
+BAK_B="$(_apt_https_backup_path '/a_b/c')"
+if [ "$BAK_A" != "$BAK_B" ]; then
+  ok_t "backup names do not collide for paths that flatten alike"
+else
+  fail_t "backup names do not collide for paths that flatten alike" \
+        "both mapped to $BAK_A"
 fi
 
 # Second pass must be a no-op: idempotency is what keeps re-runs cheap and
@@ -1872,6 +1886,73 @@ if [ -z "$CRLF_FILES" ]; then
   ok_t "no CRLF line endings (matches .gitattributes eol=lf)"
 else
   fail_t "no CRLF line endings (matches .gitattributes eol=lf)" "found in:$CRLF_FILES"
+fi
+
+# ============================================================================
+# The detected family must be computed once per pass
+# ============================================================================
+# _apt_https_source_applicable used to call apt_https_family itself, and the
+# report loop hits it once per store. That is up to five `command -v` PATH
+# scans per RPM/Arch store -- wasted on every report -- and a latent
+# correctness hazard: if PATH changed mid-run, a store could be "applicable"
+# in one check and absent from the next, so the same file could be reported
+# once or twice. Callers now pass the family in.
+MARK="$WD/marker"; : > "$MARK"
+cat > "$WD/famcount.sh" <<EOF
+set -u
+. "$LIB" >/dev/null 2>&1
+apt_https_family() { echo x >> "$MARK"; printf 'apt'; }
+_apt_https_source_applicable zypper zypper >/dev/null 2>&1
+printf '%s\n' "\$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+EOF
+HITS="$(bash "$WD/famcount.sh" 2>/dev/null | tr -d ' ' | tail -1)"
+if [ "${HITS:-x}" = "0" ]; then
+  ok_t "applicability check does not re-probe the family when given a hint"
+else
+  fail_t "applicability check does not re-probe the family when given a hint" \
+        "$HITS extra probe(s)"
+fi
+
+: > "$MARK"
+cat > "$WD/famcount2.sh" <<EOF
+set -u
+. "$LIB" >/dev/null 2>&1
+apt_https_family() { echo x >> "$MARK"; printf 'apt'; }
+apt_https_status_text >/dev/null 2>&1
+printf '%s\n' "\$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+EOF
+HITS="$(bash "$WD/famcount2.sh" 2>/dev/null | tr -d ' ' | tail -1)"
+if [ "${HITS:-99}" = "1" ]; then
+  ok_t "apt_https_status_text probes the family exactly once (not once per store)"
+else
+  fail_t "apt_https_status_text probes the family exactly once" \
+        "$HITS probe(s) across 16 stores"
+fi
+
+# ============================================================================
+# Backup names must not collide
+# ============================================================================
+COLL_A="$(_apt_https_backup_path '/a/b/c')"
+COLL_B="$(_apt_https_backup_path '/a_b/c')"
+COLL_C="$(_apt_https_backup_path '/a/b/c.d')"
+if [ "$COLL_A" != "$COLL_B" ] && [ "$COLL_A" != "$COLL_C" ]; then
+  ok_t "flattened backup names stay distinct (checksum suffix)"
+else
+  fail_t "flattened backup names stay distinct (checksum suffix)" \
+        "collision: $COLL_A"
+fi
+# The name must still be a single legal path component.
+BASE="$(basename "$COLL_A")"
+case "$BASE" in
+  */*) fail_t "backup name is a single path component" "contains a slash" ;;
+  *)   ok_t "backup name is a single path component" ;;
+esac
+# And it must be stable across calls, so a re-run finds the existing backup.
+if [ "$(_apt_https_backup_path '/etc/apt/sources.list')" = \
+     "$(_apt_https_backup_path '/etc/apt/sources.list')" ]; then
+  ok_t "backup name is deterministic across calls"
+else
+  fail_t "backup name is deterministic across calls" "name changed between calls"
 fi
 
 # ============================================================================
