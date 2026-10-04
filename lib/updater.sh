@@ -335,6 +335,7 @@ _update_flatpak() {
 
 _update_docker() {
   command -v docker >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_docker" || true
   msg "docker: pulling latest images..."
   local images
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' || true)
@@ -383,6 +384,7 @@ _update_brew() {
 
 _update_firmware() {
   command -v fwupdmgr >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_firmware" || true
   msg "fwupdmgr: refreshing metadata..."
   run sudo fwupdmgr refresh 2>/dev/null || true
   local available
@@ -417,6 +419,7 @@ _update_geoip() {
   #     Export:  GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
   #   (default)             — community-maintained fork (no account needed).
   local _geoip_url="" _key
+  apt_https_guard "_update_geoip" || true
   if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then
     _key=$(printf '%s' "${MAXMIND_LICENSE_KEY}" | tr -d '[:space:]')
     if [ -n "$_key" ]; then
@@ -429,6 +432,24 @@ _update_geoip() {
   if [ -z "$_geoip_url" ]; then
     _geoip_url="https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb"
   fi
+  # GEOIP_URL is operator-supplied, so it is the one download target in this
+  # engine that can be pointed at plaintext. A GeoIP database decides which
+  # country a packet is "in", so a tampered copy is a traffic-tunneling
+  # primitive. Refuse http:// outright rather than silently fetching it.
+  case "$_geoip_url" in
+    https://*) : ;;
+    http://*)
+      err "GEOIP_URL is plaintext (http://). Refusing to download the GeoIP database over HTTP."
+      info "Use an https:// mirror, or unset GEOIP_URL to use the default fork."
+      _track
+      return 1
+      ;;
+    *)
+      err "GEOIP_URL must be an https:// URL; got: ${_geoip_url%%\?*}"
+      _track
+      return 1
+      ;;
+  esac
   # Common locations for GeoIP Country database.
   local _geoip_db geoip_candidates=(
     "/usr/share/GeoIP/GeoLite2-Country.mmdb"
@@ -593,6 +614,7 @@ _update_btrfs_balance() {
 
 _update_pihole() {
   command -v pihole >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_pihole" || true
   if [ "$EUID" -ne 0 ]; then
     _log "pihole: requires root — skipping"
     return 0

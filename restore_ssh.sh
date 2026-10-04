@@ -121,6 +121,12 @@ pkg_install_ssh() {
   # Precaution: never fetch openssh over a plaintext mirror.
   if declare -F apt_https_guard >/dev/null 2>&1; then
     apt_https_guard "restore_ssh:pkg_install_ssh" || true
+  else
+    # Reached when this file is curl|bash'd on its own, with no lib/ next to
+    # it. Say so rather than silently skipping the precaution.
+    echo "[WARN] lib/apt-https.sh not found next to this script; skipping the" >&2
+    echo "[WARN] repository transport guard. Run 'sudo bash restore_ssh.sh" >&2
+    echo "[WARN] --apt-https-audit' from a clone to check your repos." >&2
   fi
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server ;;

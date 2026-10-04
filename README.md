@@ -193,12 +193,37 @@ https-capable mirror, or opt in to the rewrite with
 
 **Where it is wired in:** `pkg_update` / `pkg_install` / `pkg_upgrade` /
 `pkg_autoremove`, `update_system`, `update_kernel`, `updates_only_mode`,
-every `_update_*` in `lib/updater.sh` plus the `_run_all_updates`
-dispatcher, `restore_ssh.sh` (before installing `openssh-server`),
-`DeepClean.sh` (before `apt-get autoremove --purge`), the **Maintenance**
-submenu option 1, the `--step apt_https` mode, and the `--apt-https*`
-flags. `OptimizeLinuxASR.sh` does not download packages, so it needs no
-guard.
+`restore_ssh.sh` (before installing `openssh-server`), `DeepClean.sh`
+(before `apt-get autoremove --purge`), the **Maintenance** submenu option 1,
+the `--step apt_https` mode, and the `--apt-https*` flags.
+
+In `lib/updater.sh` it guards the `_run_all_updates` dispatcher plus every
+sub-step that touches the network: `_update_apt`, `_update_dnf`,
+`_update_yum`, `_update_zypper`, `_update_pacman`, `_update_snap`,
+`_update_flatpak`, `_update_docker`, `_update_brew`, `_update_firmware`,
+`_update_geoip`, `_update_pihole`. (`_update_virsh`, `_update_suse_snapper`
+and `_update_btrfs_balance` only read or write local state, so they are
+deliberately not guarded.) `linuxinstall.sh` carries a mirrored set of
+guards for its own inline `_update_*` copies, which is what runs under
+`curl | sudo bash` — the documented primary install method, where
+`lib/updater.sh` is never on disk.
+
+Two subtleties worth knowing:
+
+- **Fetched subscripts get the guard too.** `run_remote_script` pulls
+  `DeepClean.sh` / `OptimizeLinuxASR.sh` into a temp directory, and a script
+  resolves its helpers relative to its own location — so without help it
+  would find no `lib/`, and its `apt-get autoremove --purge` would run
+  unguarded even though the parent had already enforced. The installer
+  therefore prefetches `lib/apt-https.sh` next to the subscript. If a
+  subscript is `curl | bash`'d entirely on its own and finds no library, it
+  says so out loud rather than skipping the precaution silently.
+- **`GEOIP_URL` must be `https://`.** It is the one operator-supplied
+  download target in the update engine, and a GeoIP database decides which
+  country a packet counts as being in — a tampered copy is a
+  traffic-tunneling primitive. An `http://` value is refused outright.
+
+`OptimizeLinuxASR.sh` does not download packages, so it needs no guard.
 
 | Variable | Effect |
 |---|---|
@@ -209,6 +234,7 @@ guard.
 | `NEOHIRO_APT_HTTPS_NOVERIFY=1` | skip the post-rewrite `apt-get update` check |
 | `NEOHIRO_APT_HTTPS_STRICT=1` | treat leftover plaintext repos as a hard error |
 | `NEOHIRO_APT_BLOCK_PORT80=1` | also `ufw deny out 80/tcp` (opt-in, see below) |
+| `NEOHIRO_APT_FAMILY=apt\|dnf\|yum\|zypper\|pacman\|none` | pin the detected family (CI containers, testing) |
 
 ### Optional: block port 80 entirely
 
@@ -662,7 +688,7 @@ dumps — add to `/etc/security/limits.conf`:
 ```bash
 bash tests/run-all.sh                  # every suite, with a summary
 bash tests/test_linuxinstall.sh        # 66 tests: parse, logic, UX coverage, snapshot
-bash tests/test_apt_https.sh           # 84 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
+bash tests/test_apt_https.sh           # 120 tests: HTTPS guard, hermetic (fake /etc, fake ufw)
 bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```

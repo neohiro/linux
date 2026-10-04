@@ -168,37 +168,47 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
     run sudo apt-get clean -qq; }
   _update_dnf()   { command -v dnf >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_dnf" || true
     run sudo dnf upgrade --refresh -y -q || return 1
     run sudo dnf autoremove -y -q; }
   _update_yum()   { command -v yum >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_yum" || true
     run sudo yum update -y -q || return 1
     run sudo yum autoremove -y -q; }
   _update_zypper(){ command -v zypper >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_zypper" || true
     run sudo zypper --quiet refresh
     run sudo zypper update -y --quiet || return 1
     run sudo zypper --quiet clean; }
   _update_pacman(){ command -v pacman >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_pacman" || true
     run sudo pacman -Syu --noconfirm --quiet || return 1
     run sudo pacman -Scc --noconfirm -q; }
   _update_snap()  { command -v snap >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_snap" || true
     run sudo snap refresh 2>/dev/null || true; }
   _update_flatpak(){ command -v flatpak >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_flatpak" || true
     run flatpak update -y --assumeyes 2>/dev/null || true
     run flatpak uninstall --unused -y --assumeyes 2>/dev/null || true; }
   _update_docker() { command -v docker >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_docker" || true
     while IFS= read -r img; do
       [ -z "$img" ] && continue
       docker pull "$img" >/dev/null 2>&1 || true
     done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>')
     docker image prune -f >/dev/null 2>&1 || true; }
   _update_brew()  { command -v brew >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_brew" || true
     HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null || true
     run brew upgrade 2>/dev/null || true
     run brew cleanup -s -q 2>/dev/null || true; }
   _update_firmware(){ command -v fwupdmgr >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_firmware" || true
     run sudo fwupdmgr refresh 2>/dev/null || true
     run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
   _run_all_updates() {
+    apt_https_guard "_run_all_updates" || true
     msg "=== Comprehensive system update ==="
     _update_apt || true
     _update_dnf || true
@@ -1073,6 +1083,33 @@ run_remote_script() {
     err "Neither curl nor wget available; cannot fetch $name"; return 1
   fi
   chmod +x "$dst"
+
+  # Fetch lib/apt-https.sh alongside the subscript.
+  #
+  # A subscript fetched into $TMP_DIR resolves its helpers relative to its own
+  # location ($TMP_DIR/lib/...), and $TMP_DIR has no lib/ directory. Without
+  # this, DeepClean.sh's `apt-get autoremove --purge` would run with no
+  # transport guard even though the parent process already enforces one -
+  # the child is a separate process with its own once-per-process latch.
+  # Best effort: a failure here must not abort the run, because the parent
+  # has already enforced HTTPS for this operation.
+  _fetch_https_lib_for_subscript() {
+    local libdir="${TMP_DIR}/lib" libdst="${TMP_DIR}/lib/apt-https.sh"
+    local liburl="${REPO_RAW_BASE}/lib/apt-https.sh"
+    mkdir -p "$libdir" 2>/dev/null || return 1
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$liburl" -o "$libdst" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$libdst" "$liburl" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+    [ -s "$libdst" ] || { rm -f "$libdst" 2>/dev/null; return 1; }
+    return 0
+  }
+  if ! _fetch_https_lib_for_subscript; then
+    _log "could not prefetch lib/apt-https.sh; $name will run without the transport guard"
+  fi
 
   # Optional GPG verification. Disabled by default; enable by setting
   #   NEOSIGN_GPG_LEVEL=required  NEOSIGN_GPG_FPR=<40-hex fingerprint>

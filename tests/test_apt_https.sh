@@ -645,14 +645,80 @@ for fn in pkg_update pkg_install pkg_upgrade pkg_autoremove; do
   fi
 done
 
-# lib/updater.sh must guard the dispatcher and every sub-step.
+# lib/updater.sh must guard the dispatcher and every sub-step that touches
+# the network. _update_virsh, _update_suse_snapper and _update_btrfs_balance
+# are deliberately excluded: they only read/write local state.
 UP="$ROOT/lib/updater.sh"
 for fn in _update_apt _update_dnf _update_yum _update_zypper _update_pacman \
-          _update_snap _update_flatpak _update_brew _run_all_updates; do
+          _update_snap _update_flatpak _update_docker _update_brew _update_firmware \
+          _update_geoip _update_pihole _run_all_updates; do
   if grep -q "apt_https_guard \"$fn\"" "$UP"; then
     ok_t "integration: updater $fn() calls apt_https_guard"
   else
     fail_t "integration: updater $fn() calls apt_https_guard" "no guard call"
+  fi
+done
+
+# The curl|bash inline fallback in linuxinstall.sh has its own copies of every
+# _update_*; those must be guarded too, since curl|bash is the documented
+# primary install method and never sees lib/updater.sh.
+for fn in _update_apt _update_dnf _update_yum _update_zypper _update_pacman \
+          _update_snap _update_flatpak _update_docker _update_brew _update_firmware \
+          _run_all_updates; do
+  BODY="$(awk -v fn="$fn" '
+    $0 ~ "^[[:space:]]*"fn"\\(\\)[[:space:]]*\\{" { inside = 1 }
+    inside { print }
+    inside && /^[[:space:]]*}/ { exit }
+  ' "$SRC")"
+  if printf '%s' "$BODY" | grep -q 'apt_https_guard'; then
+    ok_t "integration: inline $fn() calls apt_https_guard"
+  else
+    fail_t "integration: inline $fn() calls apt_https_guard" "no guard call"
+  fi
+done
+
+# GEOIP_URL is operator-supplied and decides which country a packet is "in",
+# so a plaintext mirror is a traffic-tunneling primitive. Must be refused.
+GEOIP_BODY="$(awk '/^_update_geoip\(\) \{/,/^}/' "$UP")"
+if printf '%s' "$GEOIP_BODY" | grep -q 'http://\*' && \
+   printf '%s' "$GEOIP_BODY" | grep -q 'Refusing to download the GeoIP database over HTTP'; then
+  ok_t "integration: _update_geoip refuses a plaintext GEOIP_URL"
+else
+  fail_t "integration: _update_geoip refuses a plaintext GEOIP_URL" "scheme check missing"
+fi
+# The check must come AFTER the URL is fully resolved, otherwise the default
+# fork (which is already https) would be validated against nothing.
+GEOIP_LINE="$(printf '%s' "$GEOIP_BODY" | grep -n 'case "$_geoip_url" in' | cut -d: -f1)"
+DEFAULT_LINE="$(printf '%s' "$GEOIP_BODY" | grep -n 'maccurry/GeoIP-country' | cut -d: -f1)"
+if [ -n "$GEOIP_LINE" ] && [ -n "$DEFAULT_LINE" ] && [ "$GEOIP_LINE" -gt "$DEFAULT_LINE" ]; then
+  ok_t "integration: _update_geoip validates the URL scheme after resolving it"
+else
+  fail_t "integration: _update_geoip validates the URL scheme after resolving it" \
+        "check@${GEOIP_LINE:-none} must come after default@${DEFAULT_LINE:-none}"
+fi
+
+# Subscripts fetched via run_remote_script land in $TMP_DIR with no lib/, so
+# their transport guard would silently not exist. The installer must prefetch
+# lib/apt-https.sh next to them.
+if grep -q '_fetch_https_lib_for_subscript' "$SRC" && \
+   grep -q 'lib/apt-https.sh' "$SRC"; then
+  ok_t "integration: run_remote_script prefetches lib/apt-https.sh for subscripts"
+else
+  fail_t "integration: run_remote_script prefetches lib/apt-https.sh for subscripts" \
+        "lib prefetch missing"
+fi
+if awk '/^run_remote_script\(\) \{/,/^}/' "$SRC" | grep -q '_fetch_https_lib_for_subscript'; then
+  ok_t "integration: the lib prefetch lives inside run_remote_script"
+else
+  fail_t "integration: the lib prefetch lives inside run_remote_script" "not in run_remote_script"
+fi
+
+# A subscript without the lib must say so rather than skip silently.
+for f in restore_ssh.sh DeepClean.sh; do
+  if grep -q 'not found next to this script' "$ROOT/$f"; then
+    ok_t "integration: $f warns when lib/apt-https.sh is unavailable"
+  else
+    fail_t "integration: $f warns when lib/apt-https.sh is unavailable" "no warning"
   fi
 done
 
@@ -772,6 +838,127 @@ else
   fail_t "failed enforcement yields a non-zero status (verified at runtime)" "got 0"
 fi
 rm -f "$BACKUPS"
+
+# ============================================================================
+# Runtime: run_remote_script prefetches lib/apt-https.sh for subscripts
+# ============================================================================
+# A subscript fetched into $TMP_DIR resolves helpers relative to its own
+# location, and $TMP_DIR has no lib/ directory. Extract the function and
+# drive it with a fake curl so the prefetch is actually executed.
+{
+  awk '/^run_remote_script\(\) \{/,/^}/' "$SRC"
+} > "$WD/rrs.sh"
+
+run_rrs_case() {
+  # $1 = fake curl behaviour: "ok" writes a payload, "fail" exits non-zero.
+  local mode="$1" out
+  (
+    set -u
+    TMP_DIR="$WD/rrs_tmp"
+    rm -rf "$TMP_DIR"; mkdir -p "$TMP_DIR"
+    REPO_RAW_BASE="https://raw.githubusercontent.com/neohiro/linux/main"
+    _log() { :; }
+    ok()  { printf 'OK:%s\n' "$*"; }
+    warn(){ printf 'WARN:%s\n' "$*"; }
+    err() { printf 'ERR:%s\n' "$*"; }
+    # Stub curl/wget: record the URL, optionally fail.
+    curl() {
+      case "$1" in
+        -*) : ;;
+      esac
+      # Last two args are the URL and the -o target.
+      local url="" outp=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -o) outp="$2"; shift 2 ;;
+          http*) url="$1"; shift ;;
+          *) shift ;;
+        esac
+      done
+      printf '%s\n' "$url" >> "$WD/curl-urls.log"
+      if [ "$mode" = "fail" ] && [ "$url" != "${REPO_RAW_BASE}/DeepClean.sh" ]; then
+        return 22
+      fi
+      printf '# fetched payload for %s\n' "$url" > "$outp"
+      return 0
+    }
+    # shellcheck disable=SC1090
+    . "$WD/rrs.sh"
+    # Stop before the execution-mode decision; we only care about the fetch.
+    run_remote_script "DeepClean.sh" >/dev/null 2>&1 || true
+    printf 'CURL_URLS=%s\n' "$(cat "$WD/curl-urls.log" 2>/dev/null | tr '\n' ' ')"
+    if [ -s "$TMP_DIR/lib/apt-https.sh" ]; then
+      printf 'LIB_PRESENT=yes\n'
+    else
+      printf 'LIB_PRESENT=no\n'
+    fi
+    printf 'SUB_PRESENT=%s\n' "$([ -s "$TMP_DIR/DeepClean.sh" ] && echo yes || echo no)"
+  ) 2>/dev/null
+}
+
+: > "$WD/curl-urls.log"
+RRS_OK="$(run_rrs_case ok)"
+if printf '%s' "$RRS_OK" | grep -q 'lib/apt-https.sh'; then
+  ok_t "run_remote_script requests lib/apt-https.sh from the repo"
+else
+  fail_t "run_remote_script requests lib/apt-https.sh from the repo" \
+        "URLs seen: $(printf '%s' "$RRS_OK" | grep '^CURL_URLS=')"
+fi
+if printf '%s' "$RRS_OK" | grep -q 'LIB_PRESENT=yes'; then
+  ok_t "run_remote_script places lib/apt-https.sh next to the subscript"
+else
+  fail_t "run_remote_script places lib/apt-https.sh next to the subscript" \
+        "$(printf '%s' "$RRS_OK" | grep LIB_PRESENT=)"
+fi
+if printf '%s' "$RRS_OK" | grep -q 'SUB_PRESENT=yes'; then
+  ok_t "run_remote_script still fetched the subscript itself"
+else
+  fail_t "run_remote_script still fetched the subscript itself" "subscript missing"
+fi
+
+: > "$WD/curl-urls.log"
+RRS_FAIL="$(run_rrs_case fail)"
+if printf '%s' "$RRS_FAIL" | grep -q 'SUB_PRESENT=yes'; then
+  ok_t "a failed lib prefetch is non-fatal (subscript still fetched)"
+else
+  fail_t "a failed lib prefetch is non-fatal (subscript still fetched)" \
+        "a lib fetch failure aborted the run"
+fi
+if printf '%s' "$RRS_FAIL" | grep -q 'LIB_PRESENT=no'; then
+  ok_t "a failed lib prefetch leaves no empty stub file behind"
+else
+  fail_t "a failed lib prefetch leaves no empty stub file behind" "stale file left"
+fi
+
+# ============================================================================
+# Runtime: _update_geoip refuses a plaintext GEOIP_URL
+# ============================================================================
+GEOIP_RT="$(env NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS=0 GEOIP_URL='http://evil.example.com/Geo.mmdb' \
+  bash -c "
+    . '$UP' >/dev/null 2>&1
+    UPDATED=0; FAILED=0
+    _update_geoip 2>&1
+    printf 'RC=%s\n' \$?
+  " 2>&1)"
+if printf '%s' "$GEOIP_RT" | grep -q 'Refusing to download the GeoIP database over HTTP'; then
+  ok_t "_update_geoip refuses an http:// GEOIP_URL at runtime"
+else
+  fail_t "_update_geoip refuses an http:// GEOIP_URL at runtime" \
+        "got: $(printf '%s' "$GEOIP_RT" | tr '\n' ' ')"
+fi
+
+GEOIP_OK="$(env NEOHIRO_APT_FAMILY=apt NEOHIRO_APT_HTTPS=0 GEOIP_URL='https://good.example.com/Geo.mmdb' \
+  bash -c "
+    . '$UP' >/dev/null 2>&1
+    UPDATED=0; FAILED=0
+    _update_geoip 2>&1
+    printf 'RC=%s\n' \$?
+  " 2>&1)"
+if ! printf '%s' "$GEOIP_OK" | grep -q 'Refusing to download'; then
+  ok_t "_update_geoip accepts an https:// GEOIP_URL"
+else
+  fail_t "_update_geoip accepts an https:// GEOIP_URL" "false rejection"
+fi
 
 # ============================================================================
 # Summary

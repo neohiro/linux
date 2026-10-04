@@ -81,6 +81,11 @@ msg "Detected package manager: ${PM:-none}"
 # (curl|bash of DeepClean.sh on its own).
 if declare -F apt_https_guard >/dev/null 2>&1 && [ "$PM" = "apt" ]; then
   apt_https_guard "DeepClean" || true
+elif [ "$PM" = "apt" ]; then
+  # Reached when this file is curl|bash'd on its own, with no lib/ next to
+  # it. Say so rather than silently skipping the precaution.
+  echo "[!] lib/apt-https.sh not found next to this script; skipping the" >&2
+  echo "[!] repository transport guard before 'apt-get autoremove --purge'." >&2
 fi
 
 msg "Starting DeepClean..."
