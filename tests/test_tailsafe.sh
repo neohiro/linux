@@ -91,10 +91,44 @@ run() { printf '%s\n' "$*"; }
 info() { :; }
 warn() { :; }
 err() { :; }
-_service_present() {
-  systemctl list-unit-files "$1.service" 2>/dev/null \
-    | awk 'NR>1{print $1}' | grep -qx "$1.service"
+
+# ── Hermetic Tailscale stub ───────────────────────────────────────────────
+# These tests must not depend on what happens to be installed on the machine
+# running them. An earlier revision leaned on the host having a real
+# /usr/bin/tailscale, which made the suite pass on a Tailscale node and fail on
+# a clean CI runner: the helper correctly no-ops when Tailscale is absent, and
+# the test read that correct no-op as a failure. The helper's guards are
+# [ -x "$(command -v tailscale)" ], so satisfying them needs only an executable
+# on PATH -- which is what this provides.
+#
+# Each condition is driven by a TS_* variable so a case can flip exactly one
+# guard and leave the rest satisfied.
+STUB_DIR="$(mktemp -d)"
+cat > "$STUB_DIR/tailscale" <<'STUBEOF'
+#!/bin/sh
+case "$1" in
+  status)
+    printf '{"BackendState":"%s"}\n' "${TS_BACKEND:-Running}"
+    ;;
+  debug)
+    printf '{"RunSSH":%s}\n' "${TS_RUNSSH:-true}"
+    ;;
+esac
+exit 0
+STUBEOF
+chmod 0755 "$STUB_DIR/tailscale"
+PATH="$STUB_DIR:$PATH"
+hash -r
+
+# systemctl is also consulted directly (is-active --quiet tailscaled), so a
+# function stub is needed alongside the PATH stub.
+systemctl() {
+  case "${TS_DAEMON:-1}" in
+    0) return 1 ;;
+  esac
+  return 0
 }
+_service_present() { [ "${TS_UNIT:-1}" = "1" ]; }
 
 # shellcheck disable=SC1091
 source /tmp/_ts_fw_allow.fn
@@ -156,12 +190,11 @@ else
 fi
 echo
 
-# ── A2/A3/A4: drive FW_CMD directly, no PATH manipulation ────────────────
-# PATH stripping is needed only for A1, to stop a 0644 stub being shadowed by
-# the real binary. For these cases the real /usr/bin/tailscale satisfies the
-# helper's guards perfectly well, so FW_CMD is driven directly against a fully
-# populated environment. That keeps the assertions testing the helper's logic --
-# which is the point -- rather than testing PATH-lookup corner cases.
+# ── A2/A3/A4: drive FW_CMD directly ──────────────────────────────────────
+# PATH manipulation is needed only for A1, to stop a 0644 stub being shadowed by
+# a real binary. For these cases the STUB_DIR executable satisfies the helper's
+# guards, so FW_CMD is driven directly and the assertions test the helper's
+# logic rather than PATH-lookup corner cases.
 #
 # ── A2: ufw -> interface rule + wireguard port ───────────────────────────
 out=$( FW_CMD=ufw; _ts_fw_allow )
@@ -192,22 +225,22 @@ echo
 out=$( FW_CMD=""; _ts_fw_allow; echo "rc=$?" )
 if printf '%s\n' "$out" | grep -q 'rc=0' \
    && ! printf '%s\n' "$out" | grep -q 'sudo '; then
-  ok "A4 is a clean no-op when no firewall is active"
+  ok "A4 is a clean no-op when no active firewall is detected"
 else
   bad "A4 emitted rules with no active firewall"
   echo "        got: $out"
 fi
 echo
 
-# ── A5: live host IS a Tailscale-SSH node -> access path confirmed ───────
+# ── A5: happy path -- every condition satisfied -> access path confirmed ──
 if _ts_ssh_is_access_path; then
-  ok "A5 detects Tailscale SSH on this host as the access path"
+  ok "A5 confirms the access path when all guards hold"
 else
-  bad "A5 failed to detect Tailscale SSH on a live Tailscale node"
+  bad "A5 failed to confirm the access path with all guards satisfied"
 fi
 echo
 
-# ── A6: override forces the OpenSSH path ─────────────────────────────────
+# ── A6: LINUXINSTALL_FORCE_SSHD=1 forces the OpenSSH path ────────────────
 if LINUXINSTALL_FORCE_SSHD=1 _ts_ssh_is_access_path; then
   bad "A6 LINUXINSTALL_FORCE_SSHD=1 did not bypass the guard"
 else
@@ -215,38 +248,66 @@ else
 fi
 echo
 
-# ── A7: drop-zone rebind excludes tailscale0 (the hard-disconnect fix) ───
+# ── A7-A10: one guard broken at a time must each yield a refusal ──────────
+# The guard gates whether openssh-server is installed, so a false positive
+# reopens port 22 on a host the operator locked down. Each case flips exactly
+# one condition and expects a refusal.
+#
+# shellcheck disable=SC2015
+TS_BACKEND=NeedsLogin _ts_ssh_is_access_path \
+  && bad "A7 backend != Running still reported the access path" \
+  || ok "A7 refuses when the backend is not Running"
+
+TS_RUNSSH=false _ts_ssh_is_access_path \
+  && bad "A8 RunSSH=false still reported the access path" \
+  || ok "A8 refuses when Tailscale SSH is disabled"
+
+TS_DAEMON=0 _ts_ssh_is_access_path \
+  && bad "A9 inactive tailscaled still reported the access path" \
+  || ok "A9 refuses when tailscaled is not running"
+
+TS_UNIT=0 _ts_ssh_is_access_path \
+  && bad "A10 missing tailscaled unit still reported the access path" \
+  || ok "A10 refuses when the tailscaled unit is absent"
+echo
+
+# ── A11: drop-zone rebind excludes tailscale0 (the hard-disconnect fix) ──
+# Assert on the `grep -v` filter line itself rather than on "tailscale0"
+# appearing anywhere near get-active-zones. A looser check also passes when
+# only a comment mentions tailscale0, which is exactly the kind of vacuous
+# assertion that survives a regression.
 ln=$(grep -n 'get-active-zones' "$TARGET" | head -1 | cut -d: -f1)
-region=$(sed -n "${ln},$((ln + 3))p" "$TARGET")
-if printf '%s' "$region" | grep -q 'tailscale0'; then
-  ok "A7 drop-zone rebind excludes tailscale0"
+filter=$(sed -n "${ln},$((ln + 4))p" "$TARGET" | grep 'grep -v' | head -1)
+if printf '%s' "$filter" | grep -q 'tailscale0'; then
+  ok "A11 drop-zone rebind excludes tailscale0 from the interface filter"
 else
-  bad "A7 drop-zone rebind still binds tailscale0 to drop"
-  echo "        got: $region"
+  bad "A11 drop-zone rebind still binds tailscale0 to drop"
+  echo "        filter line: $filter"
 fi
 echo
 
-# ── A8: _ts_fw_allow runs before fw_default_incoming_deny ─────────────────
+# ── A12: _ts_fw_allow runs before fw_default_incoming_deny ────────────────
 ts_line=$(grep -n '^  _ts_fw_allow$' "$TARGET" | head -1 | cut -d: -f1)
 deny_line=$(grep -n '^  fw_default_incoming_deny$' "$TARGET" | head -1 | cut -d: -f1)
 if [ -n "$ts_line" ] && [ -n "$deny_line" ] && [ "$ts_line" -lt "$deny_line" ]; then
-  ok "A8 _ts_fw_allow ($ts_line) precedes fw_default_incoming_deny ($deny_line)"
+  ok "A12 _ts_fw_allow ($ts_line) precedes fw_default_incoming_deny ($deny_line)"
 else
-  bad "A8 ordering wrong: ts=$ts_line deny=$deny_line"
+  bad "A12 ordering wrong: ts=$ts_line deny=$deny_line"
 fi
 echo
 
-# ── A9: access-path guard precedes the openssh-server install ─────────────
+# ── A13: access-path guard precedes the openssh-server install ────────────
 guard_line=$(grep -n '^  if _ts_ssh_is_access_path; then$' "$TARGET" | head -1 | cut -d: -f1)
 inst_line=$(grep -n '^  if ! command -v sshd >/dev/null 2>&1; then$' "$TARGET" | head -1 | cut -d: -f1)
 if [ -n "$guard_line" ] && [ -n "$inst_line" ] && [ "$guard_line" -lt "$inst_line" ]; then
-  ok "A9 access-path guard ($guard_line) precedes the sshd install ($inst_line)"
+  ok "A13 access-path guard ($guard_line) precedes the sshd install ($inst_line)"
 else
-  bad "A9 ordering wrong: guard=$guard_line install=$inst_line"
+  bad "A13 ordering wrong: guard=$guard_line install=$inst_line"
 fi
 echo
 
 rm -f /tmp/_ts_fw_allow.fn /tmp/_ts_access.fn
+[ -n "${STUB_DIR:-}" ] && rm -rf "$STUB_DIR"
 
 # tests/run-all.sh parses the pass count out of the final line, expecting
 # "All N test(s) passed." Emitting that format here is what makes this suite's
