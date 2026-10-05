@@ -1,14 +1,30 @@
-#!/bin/bash
-# Functional tests for the Tailscale-safety helpers added to linuxinstall.sh
-# by tailsafe.patch.
+#!/usr/bin/env bash
+# tests/test_tailsafe.sh - functional tests for the Tailscale-safety helpers
+# added to linuxinstall.sh by tailsafe.patch.
 #
-#   bash test-patch-tailsafe.sh /path/to/linuxinstall.sh
+# Usage:
+#   bash tests/test_tailsafe.sh                  # test ../linuxinstall.sh
+#   bash tests/test_tailsafe.sh /path/to/script # test a specific file
 #
-# Exits non-zero if any case fails, so this can gate CI or a pre-commit hook.
+# Run from the repo root (tests/run-all.sh does this). The helpers are
+# extracted with a python brace counter -- an awk range would stop at the first
+# column-0 `}` inside the case/esac and yield a truncated, syntactically
+# invalid function -- then sourced at top level with stubs so the whole file
+# runs in one shell. Subshell isolation uses plain `( ... )` rather than
+# `bash -c '...'`, keeping every construct in this file instead of a nested
+# quoting layer.
+#
+# Follows the suite convention used by tests/run-all.sh: the final line is
+# "All N test(s) passed." on success, which is what the harness parses for its
+# pass count. Exits non-zero on any failure.
 
 set -uo pipefail
 
-TARGET="${1:-linuxinstall.sh}"
+SELF="${BASH_SOURCE[0]:-$0}"
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT="$(cd "$HERE/.." && pwd)"
+TARGET="${1:-$ROOT/linuxinstall.sh}"
+
 pass=0
 fail=0
 
@@ -16,8 +32,6 @@ ok()  { pass=$((pass + 1)); echo "  PASS  $1"; }
 bad() { fail=$((fail + 1)); echo "  FAIL  $1"; }
 
 # ── Extract a top-level function by brace counting ────────────────────────
-# An awk range would stop at the first column-0 `}` inside the case/esac and
-# yield a truncated, syntactically invalid function, so count braces instead.
 extract_fn() {
   python3 - "$1" "$2" <<'PYEOF'
 import sys
@@ -44,17 +58,17 @@ PYEOF
 
 if ! extract_fn "$TARGET" _ts_fw_allow > /tmp/_ts_fw_allow.fn; then
   echo "FATAL: _ts_fw_allow not found in $TARGET"
-  echo "       Apply tailsafe.patch first."
+  echo "       Apply tailsafe.patch first:  git apply tailsafe.patch"
   exit 1
 fi
 if ! extract_fn "$TARGET" _ts_ssh_is_access_path > /tmp/_ts_access.fn; then
   echo "FATAL: _ts_ssh_is_access_path not found in $TARGET"
-  echo "       Apply tailsafe.patch first."
+  echo "       Apply tailsafe.patch first:  git apply tailsafe.patch"
   exit 1
 fi
 
 echo "=============================================================="
-echo " tailsafe.patch -- functional tests"
+echo " tests/test_tailsafe.sh -- functional tests"
 echo "=============================================================="
 echo
 
@@ -67,8 +81,10 @@ else
 fi
 
 # ── Stubs so the helpers run outside the real installer ───────────────────
-# ok/bad above are the result counters and must NOT be shadowed. The helpers
-# only call info/warn/err, so those are stubbed as no-ops.
+# `ok`/`bad` above are the result counters and must NOT be shadowed. The
+# helpers only call `info`/`warn`/`err`, so those are stubbed as no-ops.
+# (An earlier revision also stubbed `ok` here, which silently overrode the
+# counter and made every result after the first report 0.)
 FW_CMD=""
 _fw_detect() { :; }          # leaves FW_CMD as the test set it
 run() { printf '%s\n' "$*"; }
@@ -87,10 +103,10 @@ source /tmp/_ts_access.fn
 
 # Isolate the "tailscale present but not executable" case.
 #
-# bash's PATH lookup *skips non-executable files*, so a 0644 stub does not
-# shadow the real /usr/bin/tailscale -- command -v falls through to the real
-# binary. To make the helper actually see the stub, the PATH elements that
-# provide a tailscale binary are dropped entirely.
+# Only A1 needs this. bash's PATH lookup *skips non-executable files*, so a
+# 0644 stub does not shadow the real /usr/bin/tailscale -- `command -v` falls
+# through to the real binary. To make the helper actually see the stub the
+# PATH elements that provide a tailscale binary are dropped entirely.
 #
 # usage: with_non_exec_stub [helper]  -> prints the helper's output
 # shellcheck disable=SC2120  # helper arg is optional; the default is deliberate
@@ -110,7 +126,7 @@ with_non_exec_stub() {
   (
     PATH="$d:$clean"
     hash -r
-    # Report what the helper's guards will see, so the caller can tell a
+    # Report what the helper's own guards will see, so the caller can tell a
     # genuine no-op apart from "the stub was never visible".
     printf 'CV=%s\n' "$(command -v tailscale 2>/dev/null || echo none)"
     FW_CMD="ufw"
@@ -184,12 +200,10 @@ fi
 echo
 
 # ── A5: live host IS a Tailscale-SSH node -> access path confirmed ───────
-# Meaningful on any Tailscale-connected host; on a host without Tailscale it
-# correctly returns false, which is also the right answer for that host.
 if _ts_ssh_is_access_path; then
-  ok "A5 detects Tailscale SSH as the access path on this host"
+  ok "A5 detects Tailscale SSH on this host as the access path"
 else
-  ok "A5 reports no Tailscale-SSH access path on this host (correct if absent)"
+  bad "A5 failed to detect Tailscale SSH on a live Tailscale node"
 fi
 echo
 
@@ -232,8 +246,15 @@ else
 fi
 echo
 
-echo "--------------------------------------------------------------"
-echo " passed: $pass   failed: $fail"
-echo "--------------------------------------------------------------"
 rm -f /tmp/_ts_fw_allow.fn /tmp/_ts_access.fn
-[ "$fail" -eq 0 ]
+
+# tests/run-all.sh parses the pass count out of the final line, expecting
+# "All N test(s) passed." Emitting that format here is what makes this suite's
+# results visible in the aggregate summary rather than showing as 0 tests.
+if [ "$fail" -eq 0 ]; then
+  echo "All $pass test(s) passed."
+  exit 0
+fi
+
+echo "$fail of $((pass + fail)) test(s) FAILED."
+exit 1
