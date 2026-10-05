@@ -354,14 +354,33 @@ echo
 # returned 1 without repairing anything. It now branches on the same guard.
 #
 # Exercised behaviourally, not by grepping: both branches are driven and the
-# messages and exit codes asserted. The no-sshd condition is not stubbed -- it
-# is the real state of a Tailscale-only host, and the suite is expected to run
-# where sshd is absent. `ok` is shadowed here because the helper under test
-# calls the same name this suite uses for its own pass counter.
+# messages and exit codes asserted.
+#
+# Two host properties are neutralised explicitly rather than assumed, because
+# assuming them made this case pass on one machine and fail on another:
+#   * the EUID root check -- CI runners are not root, dev hosts usually are;
+#     $EUID is readonly, so it is substituted away instead of assigned;
+#   * sshd presence -- GitHub runners ship sshd, Tailscale-only hosts do not,
+#     so the directory holding it is dropped from PATH for this case.
+# `ok` and `err` are shadowed because the helper under test calls the same
+# names this suite uses for its own counters/output.
+_ts_sshd_dir=$(dirname "$(command -v sshd 2>/dev/null || echo /nonexistent/sshd)")
+
+_ts_path_without_sshd() {
+  local drop="$1" out="" e
+  local IFS=':'
+  for e in $PATH; do
+    [ "$e" = "$drop" ] && continue
+    out="${out:+$out:}$e"
+  done
+  printf '%s' "$out"
+}
+
 rsm_body=$(mktemp)
-if extract_fn "$TARGET" restore_ssh_mode > "$rsm_body"; then
+if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; then
   _rsm_run() {   # $1 = value _ts_ssh_is_access_path should return
     (
+      PATH=$(_ts_path_without_sshd "$_ts_sshd_dir")
       _RSM_GUARD_RC=$1
       ok()   { printf '%s\n' "$*"; }
       err()  { printf '%s\n' "$*"; }
@@ -371,6 +390,10 @@ if extract_fn "$TARGET" restore_ssh_mode > "$rsm_body"; then
       _ts_ssh_is_access_path() { return "$_RSM_GUARD_RC"; }
       # shellcheck disable=SC1090
       source "$rsm_body"
+      # Precondition: this case is only meaningful without sshd on PATH.
+      if command -v sshd >/dev/null 2>&1; then
+        printf 'SKIP: sshd still reachable (dir %s not isolated)\n' "$_ts_sshd_dir"
+      fi
       restore_ssh_mode
       printf 'RC=%s\n' "$?"
     )
@@ -379,6 +402,7 @@ if extract_fn "$TARGET" restore_ssh_mode > "$rsm_body"; then
   # Branch 1: Tailscale SSH IS the access path -> helpful, non-error, rc 0.
   out_ts=$(_rsm_run 0)
   if printf '%s' "$out_ts" | grep -q 'RC=0' \
+     && ! printf '%s' "$out_ts" | grep -q 'must be run as root' \
      && ! printf '%s' "$out_ts" | grep -q 'pkg_install openssh-server' \
      && printf '%s' "$out_ts" | grep -qi 'tailscale'; then
     ok "A15 restore_ssh_mode explains the Tailscale-only state instead of erroring"
@@ -390,6 +414,7 @@ if extract_fn "$TARGET" restore_ssh_mode > "$rsm_body"; then
   # Branch 2: no sshd AND no Tailscale SSH -> genuine fault, must say so, rc 1.
   out_none=$(_rsm_run 1)
   if printf '%s' "$out_none" | grep -q 'RC=1' \
+     && ! printf '%s' "$out_none" | grep -q 'must be run as root' \
      && printf '%s' "$out_none" | grep -q 'pkg_install openssh-server'; then
     ok "A15 restore_ssh_mode still reports a real fault when no access path exists"
   else
