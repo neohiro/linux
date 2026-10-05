@@ -1146,8 +1146,11 @@ _ts_fw_allow() {
   # host. `command -v` alone is not enough: bash reports a non-executable
   # file in PATH as found, so a stale/zero-mode leftover would emit rules for
   # a client that is not present. The -x test is what actually matters.
-  command -v tailscale >/dev/null 2>&1 || return 0
-  [ -x "$(command -v tailscale)" ] || return 0
+  # Resolve once: calling command -v twice re-walks PATH and can in principle
+  # disagree with itself if the tree changes between the two lookups.
+  local ts_bin
+  ts_bin=$(command -v tailscale 2>/dev/null) || return 0
+  [ -n "$ts_bin" ] && [ -x "$ts_bin" ] || return 0
   case "$FW_CMD" in
     ufw)
       run sudo ufw allow in on tailscale0 comment 'tailscale0-both-ips'
@@ -1175,8 +1178,9 @@ _ts_ssh_is_access_path() {
   [ "${LINUXINSTALL_FORCE_SSHD:-0}" = "1" ] && return 1
 
   # tailscaled must be present and running.
-  command -v tailscale >/dev/null 2>&1 || return 1
-  [ -x "$(command -v tailscale)" ] || return 1
+  local ts_bin
+  ts_bin=$(command -v tailscale 2>/dev/null) || return 1
+  [ -n "$ts_bin" ] && [ -x "$ts_bin" ] || return 1
   _service_present tailscaled || return 1
   if command -v systemctl >/dev/null 2>&1; then
     systemctl is-active --quiet tailscaled 2>/dev/null || return 1
@@ -2335,6 +2339,19 @@ EOF
 setup_firewall() {
   msg "Firewall (UFW / firewalld)"
   _fw_detect
+  # Keep the Tailscale tunnel reachable on the "firewall already active" path
+  # below. Those two early returns mean fw_default_incoming_deny() never runs
+  # for an already-hardened host, so without this call a re-run silently skips
+  # the Tailscale rules entirely and nothing ever repairs them.
+  #
+  # Safe to run before anything else: allowing is always safe ahead of a
+  # default-deny, and it does not depend on USE_REMOTE_SSH/ENV_TYPE, so a
+  # desktop with Tailscale and no OpenSSH still keeps its tunnel open.
+  #
+  # This call site and the one further down are on mutually exclusive paths --
+  # an already-active firewall returns before reaching the later one -- so the
+  # rules are never emitted twice.
+  _ts_fw_allow
   if [ "$FW_CMD" = "ufw" ] && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ok "UFW is already active -- skipping enable."
     fw_status; return 0
@@ -2362,9 +2379,10 @@ setup_firewall() {
       return 1
     fi
   fi
-  # Keep Tailscale reachable BEFORE default-deny. Must run outside the
-  # server/remote-ssh gate below: a desktop with Tailscale and no SSH still
-  # needs its tunnel kept open.
+  # Keep Tailscale reachable BEFORE default-deny. This is the fresh-install
+  # call site: ufw/firewalld was only just installed above, so the earlier
+  # _ts_fw_allow had no firewall to detect and was a no-op. It has to run after
+  # pkg_install and before fw_default_incoming_deny.
   _ts_fw_allow
   fw_default_incoming_deny
   # Open the Tor relay ports in the active firewall before enabling default-deny.
@@ -3782,7 +3800,25 @@ restore_ssh_mode() {
   fi
 
   if ! command -v sshd >/dev/null 2>&1; then
-    err "sshd is not installed. Install:  sudo pkg_install openssh-server"
+    # No sshd. On a Tailscale-SSH-only host that is deliberate, not a fault --
+    # every check below inspects sshd/sshd_config, so none of them apply, and
+    # telling this user to install openssh-server would undo their decision and
+    # re-open port 22 while they are trying to recover from being locked out.
+    if _ts_ssh_is_access_path; then
+      ok "sshd is not installed and Tailscale SSH is the active access path."
+      info "Nothing to repair: there is no sshd or sshd_config on this host."
+      info "If Tailscale SSH is the thing that is broken, fix it there:"
+      info "  tailscale status              # backend must be Running"
+      info "  tailscale up                  # re-authenticate if needed"
+      info "  tailscale set --ssh=true      # ensure SSH is enabled for this node"
+      info "  tailnet ACL: https://tailscale.com/kb/1018/acls"
+      info "To deliberately go back to OpenSSH instead:"
+      info "  LINUXINSTALL_FORCE_SSHD=1 $0 --restore-ssh"
+      return 0
+    fi
+    err "sshd is not installed and Tailscale SSH is not the active access path."
+    err "This host has no working remote access path. From the console:"
+    err "  Install:  sudo pkg_install openssh-server"
     return 1
   fi
 
