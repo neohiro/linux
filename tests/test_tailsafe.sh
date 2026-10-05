@@ -286,13 +286,27 @@ else
 fi
 echo
 
-# ── A12: _ts_fw_allow runs before fw_default_incoming_deny ────────────────
-ts_line=$(grep -n '^  _ts_fw_allow$' "$TARGET" | head -1 | cut -d: -f1)
+# ── A12: EVERY _ts_fw_allow call precedes fw_default_incoming_deny ─────────
+# Checks all call sites, not just the first. There are two by design: one for
+# the already-active-firewall path and one for the fresh-install path after the
+# firewall package is installed. Comparing only head -1 made this assertion
+# vacuous the moment the second call site was added -- the early site is always
+# before fw_default_incoming_deny, so the assertion passed even with the
+# fresh-install ordering reverted. Mutation testing caught exactly that.
 deny_line=$(grep -n '^  fw_default_incoming_deny$' "$TARGET" | head -1 | cut -d: -f1)
-if [ -n "$ts_line" ] && [ -n "$deny_line" ] && [ "$ts_line" -lt "$deny_line" ]; then
-  ok "A12 _ts_fw_allow ($ts_line) precedes fw_default_incoming_deny ($deny_line)"
+ts_all=$(grep -n '^  _ts_fw_allow$' "$TARGET" | cut -d: -f1 | tr '\n' ' ')
+late=""
+nsites=0
+for l in $ts_all; do
+  nsites=$((nsites + 1))
+  [ "$l" -lt "$deny_line" ] || late="${late:+$late, }$l"
+done
+if [ "$nsites" -ge 1 ] && [ -n "$deny_line" ] && [ -z "$late" ]; then
+  ok "A12 all $nsites _ts_fw_allow site(s) precede fw_default_incoming_deny ($deny_line)"
+elif [ "$nsites" -lt 1 ]; then
+  bad "A12 no _ts_fw_allow call site found"
 else
-  bad "A12 ordering wrong: ts=$ts_line deny=$deny_line"
+  bad "A12 _ts_fw_allow at [$late] runs after fw_default_incoming_deny ($deny_line)"
 fi
 echo
 
@@ -304,6 +318,123 @@ if [ -n "$guard_line" ] && [ -n "$inst_line" ] && [ "$guard_line" -lt "$inst_lin
 else
   bad "A13 ordering wrong: guard=$guard_line install=$inst_line"
 fi
+echo
+
+# ── A14: _ts_fw_allow must precede setup_firewall's FIRST return ──────────
+# Regression test. A12 only proved the call preceded fw_default_incoming_deny,
+# which left the real hole open: setup_firewall returns early when a firewall
+# is already active, and that early return happens *before* any
+# fw_default_incoming_deny call. A single _ts_fw_allow placed at the old
+# position was therefore dead code on every re-run against an already-hardened
+# host -- which is the common case, and the case this fix exists to serve.
+#
+# Compared as relative offsets within the function body, so renumbering the
+# file cannot break it.
+setup_body=$(mktemp)
+if extract_fn "$TARGET" setup_firewall > "$setup_body"; then
+  # "^[[:space:]]+return" cannot match a comment: a comment line starts with #.
+  first_allow=$(grep -nE '^[[:space:]]+_ts_fw_allow$' "$setup_body" | head -1 | cut -d: -f1)
+  first_ret=$(grep -nE '^[[:space:]]+return([[:space:]]|$)' "$setup_body" | head -1 | cut -d: -f1)
+  if [ -n "$first_allow" ] && [ -n "$first_ret" ] && [ "$first_allow" -lt "$first_ret" ]; then
+    ok "A14 _ts_fw_allow (+$first_allow) precedes setup_firewall's first return (+$first_ret)"
+  else
+    bad "A14 _ts_fw_allow (${first_allow:-none}) does not precede first return (${first_ret:-none})"
+    echo "        the already-active-firewall path returns before the rules are applied"
+  fi
+else
+  bad "A14 could not extract setup_firewall"
+fi
+rm -f "$setup_body"
+echo
+
+# ── A15: restore_ssh_mode handles the no-sshd Tailscale case ──────────────
+# harden_ssh() leaves Tailscale-SSH hosts with no sshd, but restore_ssh_mode
+# used to treat that as a fault and tell the user to install openssh-server --
+# advice that re-opens port 22 on exactly the host being recovered, and it
+# returned 1 without repairing anything. It now branches on the same guard.
+#
+# Exercised behaviourally, not by grepping: both branches are driven and the
+# messages and exit codes asserted.
+#
+# Two host properties are neutralised explicitly rather than assumed, because
+# assuming them made this case pass on one machine and fail on another:
+#   * the EUID root check -- CI runners are not root, dev hosts usually are;
+#     $EUID is readonly, so it is substituted away instead of assigned;
+#   * sshd presence -- GitHub runners ship sshd, Tailscale-only hosts do not.
+# `ok` and `err` are shadowed because the helper under test calls the same
+# names this suite uses for its own counters/output.
+
+# Drop every PATH element that provides an executable named sshd.
+#
+# Comparing directory *names* is not enough. On Ubuntu /sbin and /bin are
+# symlinks to /usr/sbin and /usr/bin, and the GitHub runner's PATH lists both
+# spellings, so removing "/usr/sbin" still leaves sshd reachable through
+# "/sbin". Filtering on "does this element actually contain an executable sshd"
+# is immune to that, and to any other symlinked PATH layout.
+_ts_path_hiding_sshd() {
+  local out="" e
+  local IFS=':'
+  for e in $PATH; do
+    [ -n "$e" ] || continue
+    [ -x "$e/sshd" ] && continue
+    out="${out:+$out:}$e"
+  done
+  printf '%s' "$out"
+}
+
+rsm_body=$(mktemp)
+if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; then
+  _rsm_run() {   # $1 = value _ts_ssh_is_access_path should return
+    (
+      PATH=$(_ts_path_hiding_sshd)
+      hash -r
+      _RSM_GUARD_RC=$1
+      ok()   { printf '%s\n' "$*"; }
+      err()  { printf '%s\n' "$*"; }
+      bold() { :; }
+      # The guard is called with no arguments, so the return code has to arrive
+      # via a variable rather than through $1.
+      _ts_ssh_is_access_path() { return "$_RSM_GUARD_RC"; }
+      # shellcheck disable=SC1090
+      source "$rsm_body"
+      # The case is only meaningful without sshd on PATH. Say so loudly rather
+      # than passing on a precondition that did not hold.
+      if command -v sshd >/dev/null 2>&1; then
+        printf 'FAILPRECONDITION: sshd still reachable\n'
+      fi
+      restore_ssh_mode
+      printf 'RC=%s\n' "$?"
+    )
+  }
+
+  # Branch 1: Tailscale SSH IS the access path -> helpful, non-error, rc 0.
+  out_ts=$(_rsm_run 0)
+  if printf '%s' "$out_ts" | grep -q 'RC=0' \
+     && ! printf '%s' "$out_ts" | grep -q 'FAILPRECONDITION' \
+     && ! printf '%s' "$out_ts" | grep -q 'must be run as root' \
+     && ! printf '%s' "$out_ts" | grep -q 'pkg_install openssh-server' \
+     && printf '%s' "$out_ts" | grep -qi 'tailscale'; then
+    ok "A15 restore_ssh_mode explains the Tailscale-only state instead of erroring"
+  else
+    bad "A15 Tailscale-only branch is wrong"
+    printf '%s\n' "$out_ts" | sed 's/^/        /'
+  fi
+
+  # Branch 2: no sshd AND no Tailscale SSH -> genuine fault, must say so, rc 1.
+  out_none=$(_rsm_run 1)
+  if printf '%s' "$out_none" | grep -q 'RC=1' \
+     && ! printf '%s' "$out_none" | grep -q 'FAILPRECONDITION' \
+     && ! printf '%s' "$out_none" | grep -q 'must be run as root' \
+     && printf '%s' "$out_none" | grep -q 'pkg_install openssh-server'; then
+    ok "A15 restore_ssh_mode still reports a real fault when no access path exists"
+  else
+    bad "A15 no-access-path branch is wrong"
+    printf '%s\n' "$out_none" | sed 's/^/        /'
+  fi
+else
+  bad "A15 could not extract restore_ssh_mode"
+fi
+rm -f "$rsm_body"
 echo
 
 rm -f /tmp/_ts_fw_allow.fn /tmp/_ts_access.fn
