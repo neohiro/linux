@@ -28,9 +28,9 @@ if [ -z "${USE_COLOR:-}" ]; then
     USE_COLOR=0
   else
     _tcol=$(tput colors 2>/dev/null) || _tcol=""
-    case "${_tcol}" in
+    case "$_tcol" in
       ''|*[!0-9]*) USE_COLOR=0 ;;
-      *) [ "${_tcol}" -ge 8 ] && USE_COLOR=1 || USE_COLOR=0 ;;
+      *) [ "$_tcol" -ge 8 ] && USE_COLOR=1 || USE_COLOR=0 ;;
     esac
   fi
 fi
@@ -147,23 +147,74 @@ find /home/*/.local/share/Trash/* -delete 2>/dev/null || true
 # ── Auto-Pruning Config ──────────────────────────────────────────────
 
 # 9. journald retention
-msg "Configuring journald for automatic log retention..."
-JOURNALD_CONF="/etc/systemd/journald.conf"
-[ -f "$JOURNALD_CONF" ] || touch "$JOURNALD_CONF"
-# Use subshell with || true to handle grep/sed failures gracefully
-( grep -qE "^#?SystemMaxUse=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*SystemMaxUse=.*/SystemMaxUse=200M/' "$JOURNALD_CONF" ) || \
-    echo "SystemMaxUse=200M" >> "$JOURNALD_CONF"
-( grep -qE "^#?MaxRetentionSec=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*MaxRetentionSec=.*/MaxRetentionSec=7d/' "$JOURNALD_CONF" ) || \
-    echo "MaxRetentionSec=7d" >> "$JOURNALD_CONF"
-systemctl restart systemd-journald 2>/dev/null || true
+#
+# Written as a drop-in rather than by editing /etc/systemd/journald.conf.
+# Two reasons: a drop-in always carries its own [Journal] section header, so
+# the keys cannot land outside a section; and /etc/systemd/journald.conf is a
+# shipped file that a package upgrade may replace, which would silently revert
+# the cap.
+#
+# 100M is the target. The stock Ubuntu 24.04 default reserves 4% of the root
+# filesystem for the journal, which is far too generous for a small VPS and
+# was measured allowing 923.8M on a 9.1 GiB root -- enough to eat a tenth of
+# the disk on its own. Small hosts do not need more than 100M of boot and
+# service history, and this keeps headroom for package and container layers
+# that cannot be pruned.
+msg "Configuring journald size cap (100M)..."
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="$JOURNALD_DROPIN_DIR/10-size-limit.conf"
+mkdir -p "$JOURNALD_DROPIN_DIR"
+cat > "$JOURNALD_DROPIN" <<'JOURNALDEOF'
+# Managed by neohiro/linux DeepClean.sh -- do not edit by hand.
+#
+# SystemMaxUse is a hard ceiling on total on-disk journal size. The distro
+# default is 4% of the filesystem, which is far too generous for a small
+# VPS and was observed allowing ~924M on a 9.1 GiB root.
+[Journal]
+SystemMaxUse=100M
+
+# Keep individual journals small so rotation happens regularly instead of
+# in one large sweep.
+SystemMaxFileSize=20M
+
+# Secondary bound on age, so a quiet period cannot accumulate unbounded
+# history within the size budget above.
+MaxRetentionSec=1month
+JOURNALDEOF
+chmod 0644 "$JOURNALD_DROPIN"
+if systemctl restart systemd-journald 2>/dev/null; then
+    ok "journald restarted; effective limit reported by the journal:"
+    # Report what journald itself parsed rather than assuming the drop-in won.
+    journalctl -u systemd-journald -n 2 --no-pager 2>/dev/null \
+        | grep -oE 'max [0-9.]+[KMG]' | tail -1 | sed 's/^/    /' || true
+else
+    warn "Could not restart systemd-journald (non-systemd host?); drop-in written to $JOURNALD_DROPIN"
+fi
 
 # 10. Package-manager auto-clean config
 case "$PM" in
   apt)
     msg "Configuring apt auto-clean..."
+    # Keep-Downloaded-Packages/AutomaticRemove/Purge control what apt *keeps*,
+    # but on their own they do not reliably reclaim /var/cache/apt/archives.
+    # The Post-Invoke hooks are what actually delete the archives once a
+    # transaction finishes, which is where the bulk of the space goes: a
+    # single full-upgrade was measured leaving 917 MiB across 118 .deb files
+    # on a 9.1 GiB root.
+    #
+    # Both hooks are needed. DPkg::Post-Invoke alone still leaves the cache
+    # repopulated by every timer-driven `apt-get update`, because that
+    # downloads lists without running a dpkg transaction.
     cat > /etc/apt/apt.conf.d/99-auto-clean <<'APTEOF'
+// Managed by neohiro/linux DeepClean.sh -- do not edit by hand.
+//
+// Drop downloaded .deb archives as soon as they stop being useful. Only the
+// archives under /var/cache/apt/archives are removed; installed packages,
+// the dpkg database, and the lists under /var/lib/apt are untouched, so
+// apt-get upgrade and dpkg behaviour are unchanged.
+DPkg::Post-Invoke { "apt-get clean"; };
+APT::Update::Post-Invoke { "apt-get clean"; };
+
 APT::Keep-Downloaded-Packages "false";
 APT::Get::AutomaticRemove "true";
 APT::Get::Purge "true";
@@ -184,10 +235,10 @@ APTEOF
     ;;
   zypper)
     msg "Configuring zypper auto-clean..."
-    sed -i 's/^solver.onlyRequires.*/solver.onlyRequires = true/' /etc/zypp/zypp.conf 2>/dev/null || true
+    sed -i 's/solver.onlyRequires.*/solver.onlyRequires = true/' /etc/zypp/zypp.conf 2>/dev/null || true
     ;;
   pacman)
-    msg "Pacman cache managed by /etc/pacman.d/hooks/clean.hook (create if needed)..."
+    msg "Pacman cache managed at /etc/pacman.d/hooks/clean.hook (create if needed)..."
     ;;
   *)
     ;;
@@ -233,8 +284,16 @@ printf '\n%s\n' "$(_c '1;34m' '=================================================
     else
         printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_MB} MB")"
     fi
- 
-    printf 'Current Disk (%s):\n' "$(_c '1;36m' "${ROOT_FS}")"
-    printf '  Total : %s\n' "$(_c '1;34m' "${ROOT_TOTAL}")"
-    printf '  Used  : %s (%s)\n' "$(_c '1;34m' "${ROOT_USED}")" "${ROOT_PERCENT}"
-    printf '  Free  : %s\n\n' "$(_c '1;32m' "${ROOT_FREE}")"
+
+    printf 'Current Disk (%s):\n' "$(_c '1;36m' "$ROOT_FS")"
+    printf '  Total : %s\n' "$(_c '1;34m' "$ROOT_TOTAL")"
+    printf '  Used  : %s (%s)\n' "$(_c '1;34m' "$ROOT_USED")" "$ROOT_PERCENT"
+    printf '  Free  : %s\n\n' "$(_c '1;32m' "$ROOT_FREE")"
+
+    printf 'Retained limits (these persist across reboots):\n'
+    if [ -f "$JOURNALD_DROPIN" ]; then
+        printf '  journald : %s\n' "$(_c '1;36m' "$JOURNALD_DROPIN")"
+    fi
+    if [ "$PM" = "apt" ] && [ -f /etc/apt/apt.conf.d/99-auto-clean ]; then
+        printf '  apt cache: %s\n' "$(_c '1;36m' "/etc/apt/apt.conf.d/99-auto-clean")"
+    fi
