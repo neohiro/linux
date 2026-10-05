@@ -360,17 +360,23 @@ echo
 # assuming them made this case pass on one machine and fail on another:
 #   * the EUID root check -- CI runners are not root, dev hosts usually are;
 #     $EUID is readonly, so it is substituted away instead of assigned;
-#   * sshd presence -- GitHub runners ship sshd, Tailscale-only hosts do not,
-#     so the directory holding it is dropped from PATH for this case.
+#   * sshd presence -- GitHub runners ship sshd, Tailscale-only hosts do not.
 # `ok` and `err` are shadowed because the helper under test calls the same
 # names this suite uses for its own counters/output.
-_ts_sshd_dir=$(dirname "$(command -v sshd 2>/dev/null || echo /nonexistent/sshd)")
 
-_ts_path_without_sshd() {
-  local drop="$1" out="" e
+# Drop every PATH element that provides an executable named sshd.
+#
+# Comparing directory *names* is not enough. On Ubuntu /sbin and /bin are
+# symlinks to /usr/sbin and /usr/bin, and the GitHub runner's PATH lists both
+# spellings, so removing "/usr/sbin" still leaves sshd reachable through
+# "/sbin". Filtering on "does this element actually contain an executable sshd"
+# is immune to that, and to any other symlinked PATH layout.
+_ts_path_hiding_sshd() {
+  local out="" e
   local IFS=':'
   for e in $PATH; do
-    [ "$e" = "$drop" ] && continue
+    [ -n "$e" ] || continue
+    [ -x "$e/sshd" ] && continue
     out="${out:+$out:}$e"
   done
   printf '%s' "$out"
@@ -380,7 +386,8 @@ rsm_body=$(mktemp)
 if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; then
   _rsm_run() {   # $1 = value _ts_ssh_is_access_path should return
     (
-      PATH=$(_ts_path_without_sshd "$_ts_sshd_dir")
+      PATH=$(_ts_path_hiding_sshd)
+      hash -r
       _RSM_GUARD_RC=$1
       ok()   { printf '%s\n' "$*"; }
       err()  { printf '%s\n' "$*"; }
@@ -390,9 +397,10 @@ if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; the
       _ts_ssh_is_access_path() { return "$_RSM_GUARD_RC"; }
       # shellcheck disable=SC1090
       source "$rsm_body"
-      # Precondition: this case is only meaningful without sshd on PATH.
+      # The case is only meaningful without sshd on PATH. Say so loudly rather
+      # than passing on a precondition that did not hold.
       if command -v sshd >/dev/null 2>&1; then
-        printf 'SKIP: sshd still reachable (dir %s not isolated)\n' "$_ts_sshd_dir"
+        printf 'FAILPRECONDITION: sshd still reachable\n'
       fi
       restore_ssh_mode
       printf 'RC=%s\n' "$?"
@@ -402,6 +410,7 @@ if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; the
   # Branch 1: Tailscale SSH IS the access path -> helpful, non-error, rc 0.
   out_ts=$(_rsm_run 0)
   if printf '%s' "$out_ts" | grep -q 'RC=0' \
+     && ! printf '%s' "$out_ts" | grep -q 'FAILPRECONDITION' \
      && ! printf '%s' "$out_ts" | grep -q 'must be run as root' \
      && ! printf '%s' "$out_ts" | grep -q 'pkg_install openssh-server' \
      && printf '%s' "$out_ts" | grep -qi 'tailscale'; then
@@ -414,6 +423,7 @@ if extract_fn "$TARGET" restore_ssh_mode | sed 's/\$EUID/0/g' > "$rsm_body"; the
   # Branch 2: no sshd AND no Tailscale SSH -> genuine fault, must say so, rc 1.
   out_none=$(_rsm_run 1)
   if printf '%s' "$out_none" | grep -q 'RC=1' \
+     && ! printf '%s' "$out_none" | grep -q 'FAILPRECONDITION' \
      && ! printf '%s' "$out_none" | grep -q 'must be run as root' \
      && printf '%s' "$out_none" | grep -q 'pkg_install openssh-server'; then
     ok "A15 restore_ssh_mode still reports a real fault when no access path exists"
