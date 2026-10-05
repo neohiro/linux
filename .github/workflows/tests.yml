@@ -96,7 +96,12 @@ jobs:
   # Bash-version agnostic — runs on the default GitHub Actions bash (5.2).
   # ---------------------------------------------------------------------------
   shell-suite:
-    name: shell-suite
+    # NOTE: main's branch protection requires a status check context named
+    # exactly "tests". The check name comes from this job's `name:`, NOT from
+    # the workflow or job id -- the job id "shell-suite" does not satisfy a
+    # required context of "tests". Renaming this breaks merging for the whole
+    # repo, not just one PR.
+    name: tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
