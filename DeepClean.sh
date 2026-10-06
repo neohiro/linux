@@ -323,8 +323,7 @@ fi
 mkdir -p /etc/tmpfiles.d
 cat > /etc/tmpfiles.d/99-neohiro-journald-vacuum.conf <<'TMPFILESEOF'
 # Vacuum journald on boot to enforce 1MB limit immediately
-R /var/log/journal 0755 root systemd-journal -
-R /run/log/journal 0755 root systemd-journal -
+w /run/systemd/journald-vacuum-trigger - - - - --vacuum-size=1M --vacuum-time=1d
 TMPFILESEOF
 
 systemctl reload systemd-journald 2>/dev/null || systemctl restart systemd-journald 2>/dev/null
@@ -432,9 +431,7 @@ mkdir -p /etc/logrotate.d
 # Helper: atomic write to logrotate.d
 _write_logrotate() {
     local file="$1" content="$2"
-    cat > "${file}.tmp" <<EOF
-$content
-EOF
+    printf '%s\n' "$content" > "${file}.tmp"
     mv "${file}.tmp" "$file"
 }
 
@@ -537,20 +534,20 @@ if command -v docker >/dev/null 2>&1; then
         else
             # Fallback: use python3 for proper JSON merge (more reliable than sed)
             if command -v python3 >/dev/null 2>&1; then
-                python3 -c '
+                python3 -c "
 import json, sys
 with open(sys.argv[1]) as f:
     try:
         cfg = json.load(f)
     except json.JSONDecodeError:
         cfg = {}
-cfg.setdefault("log-driver", "json-file")
-cfg.setdefault("log-opts", {})
-cfg["log-opts"]["max-size"] = "1m"
-cfg["log-opts"]["max-file"] = "1"
-with open(sys.argv[1] + ".tmp", "w") as f:
+cfg.setdefault('log-driver', 'json-file')
+cfg.setdefault('log-opts', {})
+cfg['log-opts']['max-size'] = '1m'
+cfg['log-opts']['max-file'] = '1'
+with open(sys.argv[1] + '.tmp', 'w') as f:
     json.dump(cfg, f, indent=2)
-' "$DOCKER_CFG" && mv "${DOCKER_CFG}.tmp" "$DOCKER_CFG"
+" "$DOCKER_CFG" && mv "${DOCKER_CFG}.tmp" "$DOCKER_CFG"
             else
                 # Last resort: replace entire file (backup first)
                 cp "$DOCKER_CFG" "${DOCKER_CFG}.bak" 2>/dev/null || true
@@ -719,33 +716,49 @@ analyze_storage_breakdown() {
     # Use single du per category with multiple paths to reduce syscalls
     {
         # System: OS directories (exclude /etc/local, /etc/skel to avoid user data)
-        du -kx "$target_mount"/usr "$target_mount"/lib "$target_mount"/lib64 \
-           "$target_mount"/bin "$target_mount"/sbin "$target_mount"/boot \
-           "$target_mount"/opt "$target_mount"/etc 2>/dev/null \
-           | awk '{sum+=$1} END {print "system " (sum+0)}'
+        local sys_dirs=()
+        for d in "$target_mount"/usr "$target_mount"/lib "$target_mount"/lib64 \
+                   "$target_mount"/bin "$target_mount"/sbin "$target_mount"/boot \
+                   "$target_mount"/opt "$target_mount"/etc; do
+            [ -d "$d" ] && sys_dirs+=("$d")
+        done
+        [ ${#sys_dirs[@]} -gt 0 ] && du -kx "${sys_dirs[@]}" 2>/dev/null \
+            | awk '{sum+=$1} END {print "system " (sum+0)}' || echo "system 0"
         
         # User: home directories
-        du -kx "$target_mount"/home "$target_mount"/root 2>/dev/null \
-           | awk '{sum+=$1} END {print "user " (sum+0)}'
+        local user_dirs=()
+        for d in "$target_mount"/home "$target_mount"/root; do
+            [ -d "$d" ] && user_dirs+=("$d")
+        done
+        [ ${#user_dirs[@]} -gt 0 ] && du -kx "${user_dirs[@]}" 2>/dev/null \
+            | awk '{sum+=$1} END {print "user " (sum+0)}' || echo "user 0"
         
         # Logs: journal + syslog
-        du -kx "$target_mount"/var/log 2>/dev/null \
-           | awk '{sum+=$1} END {print "logs " (sum+0)}'
+        [ -d "$target_mount"/var/log ] && du -kx "$target_mount"/var/log 2>/dev/null \
+            | awk '{sum+=$1} END {print "logs " (sum+0)}' || echo "logs 0"
         
         # Cache: package caches + user caches
         # Note: user caches found via find to avoid traversing all home dirs with du
         {
-            du -kx "$target_mount"/var/cache "$target_mount"/var/lib/apt/lists \
-               "$target_mount"/var/lib/dnf "$target_mount"/var/lib/pacman/pkg \
-               "$target_mount"/var/lib/snapd/cache 2>/dev/null
+            local cache_dirs=()
+            for d in "$target_mount"/var/cache "$target_mount"/var/lib/apt/lists \
+                       "$target_mount"/var/lib/dnf "$target_mount"/var/lib/pacman/pkg \
+                       "$target_mount"/var/lib/snapd/cache; do
+                [ -d "$d" ] && cache_dirs+=("$d")
+            done
+            [ ${#cache_dirs[@]} -gt 0 ] && du -kx "${cache_dirs[@]}" 2>/dev/null
             find "$target_mount"/home -maxdepth 3 -name '.cache' -type d -print0 2>/dev/null \
                 | xargs -0r du -kx 2>/dev/null
-        } | awk '{sum+=$1} END {print "cache " (sum+0)}'
+        } | awk '{sum+=$1} END {print "cache " (sum+0)}' || echo "cache 0"
         
         # Containers: docker, containerd, kubelet
-        du -kx "$target_mount"/var/lib/docker "$target_mount"/var/lib/containerd \
-           "$target_mount"/var/lib/kubelet 2>/dev/null \
-           | awk '{sum+=$1} END {print "containers " (sum+0)}'
+        local container_dirs=()
+        for d in "$target_mount"/var/lib/docker "$target_mount"/var/lib/containerd \
+                   "$target_mount"/var/lib/kubelet; do
+            [ -d "$d" ] && container_dirs+=("$d")
+        done
+        [ ${#container_dirs[@]} -gt 0 ] && du -kx "${container_dirs[@]}" 2>/dev/null \
+            | awk '{sum+=$1} END {print "containers " (sum+0)}' || echo "containers 0"
         
         # Other: computed as residual in caller
     } > "$breakdown_file" 2>/dev/null
@@ -826,7 +839,11 @@ _cat_color() {
 }
 
 _fmt_kb() {
-    local kb="$1"
+    local kb="${1:-0}"
+    # Validate input is a non-negative integer
+    case "$kb" in
+        ''|*[!0-9]*) kb=0 ;;
+    esac
     if [ "$kb" -ge 1048576 ]; then
         # Use bash arithmetic for GB with 2 decimal places
         local gb_int=$((kb / 1048576))
@@ -843,9 +860,13 @@ _fmt_kb() {
 
 # Bar chart for visual breakdown
 _draw_bar() {
-    local used_kb="$1" total_kb="$2" width=30
+    local used_kb="${1:-0}" total_kb="${2:-0}" width=30
+    # Validate inputs
+    case "$used_kb" in ''|*[!0-9]*) used_kb=0 ;; esac
+    case "$total_kb" in ''|*[!0-9]*) total_kb=0 ;; esac
     local pct=0
     [ "$total_kb" -gt 0 ] && pct=$((used_kb * 100 / total_kb))
+    [ "$pct" -gt 100 ] && pct=100
     local filled=$((pct * width / 100))
     local empty=$((width - filled))
     # Build bar using printf repetition (faster than tr)
