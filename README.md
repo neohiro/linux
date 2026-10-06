@@ -820,6 +820,67 @@ sudo aide --check                                       # file integrity
 ss -tulnp                                               # re-check listeners
 ```
 
+## 1MB Log Limit Enforcement (DeepClean.sh)
+
+**New in this release:** `DeepClean.sh` now enforces a consistent **1MB maximum log size** across all logging subsystems, persistently and reboot-proof.
+
+### What gets limited to 1MB
+
+| Subsystem | Configuration | Drop-in file |
+|---|---|---|
+| **systemd-journald** | `SystemMaxUse=1M`, `SystemMaxFileSize=1M`, `MaxRetentionSec=1day` | `/etc/systemd/journald.conf.d/99-neohiro-1mb.conf` |
+| **systemd-coredump** | `MaxUse=1M`, `ExternalSizeMax=1M` | `/etc/systemd/coredump.conf.d/99-neohiro-1mb.conf` |
+| **logrotate (global)** | `size 1M`, `rotate 1`, `daily`, `compress`, `delaycompress` | `/etc/logrotate.conf` (modified in-place) |
+| **logrotate (syslog)** | `/var/log/syslog`, `messages`, `auth.log`, `kern.log`, `daemon.log`, `user.log`, `ufw.log` | `/etc/logrotate.d/99-neohiro-syslog` |
+| **logrotate (package managers)** | `dpkg.log`, `apt/history.log`, `pacman.log`, `zypper.log`, `dnf.log`, `yum.log` | `/etc/logrotate.d/99-neohiro-pkg` |
+| **logrotate (fail2ban)** | `/var/log/fail2ban.log` | `/etc/logrotate.d/99-neohiro-fail2ban` |
+| **logrotate (SSH)** | `/var/log/sshd.log`, `ssh.log` | `/etc/logrotate.d/99-neohiro-ssh` |
+| **Docker** | `json-file` driver, `max-size=1m`, `max-file=1` | `/etc/docker/daemon.json` |
+| **containerd / CRI-O** | `container_max_log_size=1048576`, `container_max_log_files=1` | `/etc/containerd/config.toml` |
+| **kubelet** | `--container-log-max-size=1Mi --container-log-max-files=1` | `/etc/systemd/system/kubelet.service.d/99-neohiro-log-limit.conf` |
+| **auditd** | `max_log_file=1`, `num_logs=2` | `/etc/audit/auditd.conf` (modified in-place) |
+| **rsyslog rate limit** | System: 200/5sec; imuxsock: 500/5sec | `/etc/rsyslog.d/99-neohiro-rate-limit.conf` |
+| **syslog-ng rate limit** | `log-fifo-size(1000)`, `flush-lines(100)` | `/etc/syslog-ng/conf.d/99-neohiro-rate-limit.conf` |
+
+### Why 1MB?
+
+- **Prevents disk exhaustion** from log floods (e.g., misbehaving services, DDoS, kernel oops storms)
+- **Consistent across distros** — same limits on Ubuntu, RHEL, SUSE, Arch
+- **Reboot-proof** — all limits use drop-in configs (`/etc/*/*.d/99-neohiro-*.conf`) that package managers never overwrite
+- **Auditable** — run `DeepClean.sh` anytime to see before/after log footprint and re-apply
+
+### Usage
+
+```bash
+# Full deep clean + 1MB log limit enforcement
+sudo ./DeepClean.sh
+
+# Or via the main installer (option 12 in Maintenance menu)
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash
+# → Select "Maintenance" → "12) DeepClean"
+
+# Verify current log footprint
+sudo journalctl --disk-usage
+du -sh /var/log
+```
+
+### Integration with automation
+
+The 1MB limits are applied automatically when:
+- Running `DeepClean.sh` (standalone or via `linuxinstall.sh` Maintenance menu)
+- Running `linuxinstall.sh` with the **Full** profile (includes DeepClean)
+- Re-running on a live system — idempotent, safe to run daily via cron/timer
+
+```bash
+# Daily cron (recommended for servers)
+0 3 * * * root /path/to/DeepClean.sh >/var/log/deepclean.log 2>&1
+
+# Or systemd timer (included in the repo as an example)
+# See tests/ for validation patterns
+```
+
+---
+
 ## Additional helpers
 
 - **[Corrade.md](Corrade.md)** — Docker-based IR bot gateway (Docker required; works on all distros with `docker` installed).

@@ -43,6 +43,7 @@ SUITES=(
   "linuxinstall|tests/test_linuxinstall.sh|"
   "apt_https|tests/test_apt_https.sh|"
   "updater|tests/test_updater.sh|"
+  "log_limits|tests/test_log_limits.sh|"
   "verify_sync|verify_sync.sh|"
 )
 
