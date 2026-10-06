@@ -765,20 +765,17 @@ else
 fi
 FREED_KB=$((USED_BEFORE_KB - USED_AFTER_KB))
 [ "$FREED_KB" -lt 0 ] && FREED_KB=0
-FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB/1024}")
-FREED_GB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB/1048576}")
+# FREED_MB and FREED_GB computed inline in summary output
+# FREED_MB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB/1024}")
+# FREED_GB=$(awk "BEGIN {printf \"%.2f\", $FREED_KB/1048576}")
 
 ROOT_INFO=$(df -hP / 2>/dev/null | tail -1) || ROOT_INFO=""
 if [ -n "$ROOT_INFO" ]; then
-    ROOT_FS=$(echo "$ROOT_INFO" | awk '{print $1}')
     ROOT_TOTAL=$(echo "$ROOT_INFO" | awk '{print $2}')
-    ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
     ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
     ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 else
-    ROOT_FS="unknown"
     ROOT_TOTAL="unknown"
-    ROOT_USED="unknown"
     ROOT_FREE="unknown"
     ROOT_PERCENT="unknown"
 fi
@@ -866,13 +863,13 @@ printf '%s\n\n' "$(_c '1;34m' '=================================================
 # Overall disk summary
 printf '%s\n' "$(_c '1;36m' '┌─ Disk Overview ──────────────────────────────────────────────┐')"
 printf '  Total Capacity : %s\n' "$(_c '1;34m' "${ROOT_TOTAL}")"
-printf '  Before Clean   : %s\n' "$(_c '1;31m' "$(_fmt_kb ${USED_BEFORE_KB}) (${ROOT_PERCENT})")"
+printf '  Before Clean   : %s\n' "$(_c '1;31m' "$(_fmt_kb "${USED_BEFORE_KB}") (${ROOT_PERCENT})")"
 if [ "$FREED_KB" -gt 0 ]; then
-    printf '  Freed          : %s\n' "$(_c '1;32m' "$(_fmt_kb ${FREED_KB})")"
+    printf '  Freed          : %s\n' "$(_c '1;32m' "$(_fmt_kb "${FREED_KB}")")"
 else
     printf '  Freed          : %s\n' "$(_c '1;33m' '0 KB')"
 fi
-printf '  After Clean    : %s\n' "$(_c '1;32m' "$(_fmt_kb ${USED_AFTER_KB})")"
+printf '  After Clean    : %s\n' "$(_c '1;32m' "$(_fmt_kb "${USED_AFTER_KB}")")"
 printf '  Free Space     : %s\n' "$(_c '1;32m' "${ROOT_FREE}")"
 printf '%s\n\n' "$(_c '1;36m' '└──────────────────────────────────────────────────────────────┘')"
 

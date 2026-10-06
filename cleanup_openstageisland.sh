@@ -38,7 +38,7 @@ SYSTEM_ROLLBACK=0
 UFW_BACKUP_DIR="/var/backups/ufw"
 UFW_GPG_KEY=""
 LOCK_FILE="/var/lock/cleanup-openstageisland.lock"
-LOCK_FD=200
+# LOCK_FD is hardcoded to 200 in acquire_lock/release_lock
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -54,13 +54,7 @@ run() {
         printf '[DRY-RUN] %s\n' "$*"
     else
         vlog "Executing: $*"
-        if [ $# -eq 1 ] && [[ "$1" == *" "* ]]; then
-            # Single string with spaces - likely contains redirections, run via shell
-            eval "$1"
-        else
-            # Multiple arguments or single command without spaces - run directly
-            "$@"
-        fi
+        "$@"
     fi
 }
 
@@ -125,34 +119,39 @@ cleanup_docker() {
         fi
     done
 
-    # Remove all other containers
-    local removed=0
-    echo "$all_containers" | while read -r name id img status; do
+    # Remove all other containers (collect IDs first to avoid subshell counter bug)
+    local container_ids
+    container_ids=$(echo "$all_containers" | while read -r name id _img status; do
         local keep=0
         for p in "${PRESERVE_CONTAINERS[@]}"; do
             [ "$name" = "$p" ] && keep=1 && break
         done
-        if [ "$keep" -eq 0 ] && [ -n "$id" ]; then
-            run docker rm -f "$id" 2>/dev/null && removed=$((removed + 1))
-        fi
-    done
+        [ "$keep" -eq 0 ] && [ -n "$id" ] && printf '%s\n' "$id"
+    done)
+
+    local removed=0
+    if [ -n "$container_ids" ]; then
+        while read -r id; do
+            [ -n "$id" ] && run docker rm -f "$id" 2>/dev/null && removed=$((removed + 1))
+        done <<< "$container_ids"
+    fi
     log "  Removed $removed non-preserved containers"
 
     # Prune images, volumes, networks, build cache (protect images used by preserved containers)
-    # Get image IDs used by preserved containers
-    local protected_images=""
+    # Get image REPOSITORY:TAG used by preserved containers (not IDs - filter=reference expects tags)
+    local protected_refs=""
     for name in "${PRESERVE_CONTAINERS[@]}"; do
-        local img_id
-        img_id=$(docker inspect -f '{{.Image}}' "$name" 2>/dev/null || true)
-        [ -n "$img_id" ] && protected_images="$protected_images $img_id"
+        local img_ref
+        img_ref=$(docker inspect -f '{{.Config.Image}}' "$name" 2>/dev/null || true)
+        [ -n "$img_ref" ] && protected_refs="$protected_refs $img_ref"
     done
 
-    # Use protected images filter if available
-    if [ -n "$protected_images" ]; then
+    # Use protected image references filter if available
+    if [ -n "$protected_refs" ]; then
         # Build filter args for docker image prune
         local filter_args=""
-        for img in $protected_images; do
-            filter_args="$filter_args --filter=reference!=$img"
+        for ref in $protected_refs; do
+            filter_args="$filter_args --filter=reference!=$ref"
         done
         # shellcheck disable=SC2086
         run docker image prune -a -f --filter 'until=24h' $filter_args 2>/dev/null || true
@@ -170,7 +169,11 @@ is_writable() {
     local path="$1"
     local dir
     dir=$(dirname "$path")
-    [ -w "$dir" ] && return 0
+    # If path exists, check it directly; otherwise check parent dir
+    if [ -e "$path" ]; then
+        [ -w "$path" ] && return 0
+    fi
+    [ -d "$dir" ] && [ -w "$dir" ] && return 0
     return 1
 }
 
@@ -595,15 +598,19 @@ system_rollback() {
     local apt_backup_dir="/var/backups/neohiro-apt-https"
     if [ -d "$apt_backup_dir" ]; then
         log "  Checking apt-https rollback..."
-        if [ -f "$(dirname "$0")/lib/apt-https.sh" ]; then
+        local lib_path
+        lib_path="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/apt-https.sh"
+        if [ -f "$lib_path" ]; then
             # Source apt-https lib and call apt_https_revert if available
-            if grep -q 'apt_https_revert' "$(dirname "$0")/lib/apt-https.sh" 2>/dev/null; then
+            if grep -q 'apt_https_revert' "$lib_path" 2>/dev/null; then
                 # shellcheck disable=SC1090
-                source "$(dirname "$0")/lib/apt-https.sh"
+                source "$lib_path"
                 if declare -f apt_https_revert >/dev/null 2>&1; then
                     run apt_https_revert
                 fi
             fi
+        else
+            warn "  apt-https lib not found at $lib_path, skipping apt-https rollback"
         fi
     fi
 
@@ -630,7 +637,7 @@ verify_preserved() {
     if command -v docker >/dev/null 2>&1; then
         docker ps --format '  {{.Names}}: {{.Status}} ({{.Image}})' 2>/dev/null || echo "  (none running)"
         for name in "${PRESERVE_CONTAINERS[@]}"; do
-            if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
+            if docker ps -a --format '{{.Names}}' | grep -q "^$name$"; then
                 local status
                 status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "unknown")
                 log "  ✓ $name ($status)"
@@ -779,15 +786,16 @@ parse_args() {
 }
 
 acquire_lock() {
-    exec {LOCK_FD}>"$LOCK_FILE"
-    if ! flock -n "$LOCK_FD"; then
+    # Use a fixed FD (200) for portability (bash 3.2+ compatible)
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
         die "Another instance is running (lock: $LOCK_FILE). Wait or remove lock manually."
     fi
 }
 
 release_lock() {
-    flock -u "$LOCK_FD" 2>/dev/null || true
-    exec {LOCK_FD}>&-
+    flock -u 200 2>/dev/null || true
+    exec 200>&-
 }
 
 main() {
