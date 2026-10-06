@@ -489,6 +489,11 @@ if grep -q '/etc/tmpfiles.d/99-neohiro-journald-vacuum.conf' "$DEEPCLEAN"; then
 else
     fail_t "tmpfiles.d journald vacuum" "not found"
 fi
+if grep -q 'w /run/systemd/journald-vacuum-trigger' "$DEEPCLEAN"; then
+    ok_t "tmpfiles.d uses 'w' command for journalctl vacuum"
+else
+    fail_t "tmpfiles.d vacuum command" "missing 'w' command for journalctl"
+fi
 
 # Test 14c: volatile storage cleanup
 msg "Testing volatile storage cleanup..."
@@ -501,6 +506,70 @@ if grep -q 'rm -rf /var/log/journal' "$DEEPCLEAN"; then
     ok_t "volatile: /var/log/journal cleanup present"
 else
     fail_t "volatile: /var/log/journal cleanup" "not found"
+fi
+
+# Test 16b: Storage breakdown analysis function
+msg "Testing storage breakdown analysis..."
+if grep -q 'analyze_storage_breakdown' "$DEEPCLEAN"; then
+    ok_t "storage breakdown function present"
+else
+    fail_t "storage breakdown function" "not found"
+fi
+if grep -q 'mktemp -t deepclean_breakdown' "$DEEPCLEAN"; then
+    ok_t "storage breakdown uses mktemp for temp file"
+else
+    fail_t "storage breakdown temp file" "missing mktemp"
+fi
+if grep -q 'case "$target_mount"' "$DEEPCLEAN"; then
+    ok_t "storage breakdown validates target_mount"
+else
+    fail_t "storage breakdown target_mount validation" "missing"
+fi
+if grep -q '\[ -d' "$DEEPCLEAN" && grep -q 'du -kx' "$DEEPCLEAN"; then
+    ok_t "storage breakdown checks dir existence before du"
+else
+    fail_t "storage breakdown dir existence check" "missing"
+fi
+if grep -q 'echo "system 0"' "$DEEPCLEAN" || grep -q 'echo "user 0"' "$DEEPCLEAN"; then
+    ok_t "storage breakdown defaults to 0 on failure"
+else
+    fail_t "storage breakdown default 0 on failure" "missing"
+fi
+
+# Test 16c: _fmt_kb input validation
+msg "Testing _fmt_kb input validation..."
+if grep -q '_fmt_kb' "$DEEPCLEAN"; then
+    ok_t "_fmt_kb function present"
+else
+    fail_t "_fmt_kb function" "not found"
+fi
+if grep -q 'case "$kb"' "$DEEPCLEAN" && grep -q '\*\[!0-9\]' "$DEEPCLEAN"; then
+    ok_t "_fmt_kb validates non-negative integer input"
+else
+    fail_t "_fmt_kb input validation" "missing"
+fi
+if grep -q 'kb=0' "$DEEPCLEAN" && grep -q '_fmt_kb' "$DEEPCLEAN"; then
+    ok_t "_fmt_kb defaults to 0 on invalid input"
+else
+    fail_t "_fmt_kb default 0 on invalid" "missing"
+fi
+
+# Test 16d: _draw_bar input validation
+msg "Testing _draw_bar input validation..."
+if grep -q '_draw_bar' "$DEEPCLEAN"; then
+    ok_t "_draw_bar function present"
+else
+    fail_t "_draw_bar function" "not found"
+fi
+if grep -q 'case "$used_kb"' "$DEEPCLEAN" && grep -q 'case "$total_kb"' "$DEEPCLEAN"; then
+    ok_t "_draw_bar validates both inputs"
+else
+    fail_t "_draw_bar input validation" "missing"
+fi
+if grep -q 'pct=100' "$DEEPCLEAN" && grep -q '_draw_bar' "$DEEPCLEAN"; then
+    ok_t "_draw_bar caps percentage at 100"
+else
+    fail_t "_draw_bar percentage cap" "missing"
 fi
 
 # Test 15: DeepClean.sh syntax validation
