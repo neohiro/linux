@@ -407,11 +407,14 @@ backup_ufw() {
         # Persistent backup directory
         run mkdir -p "$UFW_BACKUP_DIR"
 
-        # Clean old backups (keep last 5)
+        # Clean old backups: delete files older than 30 days, then keep only latest 5
         run find "$UFW_BACKUP_DIR" -name 'ufw-backup-*.tar.gz*' -mtime +30 -delete 2>/dev/null || true
-        local backups
-        backups=$(find "$UFW_BACKUP_DIR" -name 'ufw-backup-*.tar.gz*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2- | tail -n +6)
-        [ -n "$backups" ] && run rm -f "$backups" 2>/dev/null || true
+        # Keep only latest 5 backups (by modification time)
+        find "$UFW_BACKUP_DIR" -name 'ufw-backup-*.tar.gz*' -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | tail -n +6 | cut -d' ' -f2- \
+            | while IFS= read -r old; do
+                [ -n "$old" ] && run rm -f "$old" 2>/dev/null || true
+            done
 
         local persistent_backup="${UFW_BACKUP_DIR}/ufw-backup-${ts}.tar.gz"
         local tmpdir
@@ -498,8 +501,13 @@ settings_rollback() {
             local tmpdir
             tmpdir=$(mktemp -d)
             if [[ "$latest_backup" == *.gpg ]] && command -v gpg >/dev/null 2>&1; then
-                run gpg --batch --yes --decrypt --output "$tmpdir/ufw-backup.tar.gz" "$latest_backup" 2>/dev/null || true
-                run tar -xzf "$tmpdir/ufw-backup.tar.gz" -C "$tmpdir" 2>/dev/null || true
+                # Verify GPG key is available before decrypting
+                if ! gpg --list-keys "$UFW_GPG_KEY" >/dev/null 2>&1; then
+                    warn "  GPG key '$UFW_GPG_KEY' not in keyring, cannot decrypt backup"
+                else
+                    run gpg --batch --yes --decrypt --output "$tmpdir/ufw-backup.tar.gz" "$latest_backup" 2>/dev/null || true
+                    run tar -xzf "$tmpdir/ufw-backup.tar.gz" -C "$tmpdir" 2>/dev/null || true
+                fi
             else
                 run tar -xzf "$latest_backup" -C "$tmpdir" 2>/dev/null || true
             fi
@@ -607,7 +615,11 @@ system_rollback() {
                 source "$lib_path"
                 if declare -f apt_https_revert >/dev/null 2>&1; then
                     run apt_https_revert
+                else
+                    warn "  apt_https_revert function not found in lib"
                 fi
+            else
+                warn "  apt_https_revert not found in lib, skipping"
             fi
         else
             warn "  apt-https lib not found at $lib_path, skipping apt-https rollback"
@@ -636,15 +648,29 @@ verify_preserved() {
     log "Docker containers:"
     if command -v docker >/dev/null 2>&1; then
         docker ps --format '  {{.Names}}: {{.Status}} ({{.Image}})' 2>/dev/null || echo "  (none running)"
+        local all_ok=true
         for name in "${PRESERVE_CONTAINERS[@]}"; do
             if docker ps -a --format '{{.Names}}' | grep -q "^$name$"; then
-                local status
+                local status health
                 status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "unknown")
-                log "  ✓ $name ($status)"
+                health=$(docker inspect -f '{{.State.Health.Status}}' "$name" 2>/dev/null || echo "no-health-check")
+                if [ "$status" = "running" ]; then
+                    if [ "$health" = "healthy" ] || [ "$health" = "no-health-check" ]; then
+                        log "  ✓ $name ($status, health: $health)"
+                    else
+                        warn "  ⚠ $name ($status, health: $health)"
+                        all_ok=false
+                    fi
+                else
+                    warn "  ✗ $name ($status) - not running"
+                    all_ok=false
+                fi
             else
                 warn "  ✗ $name MISSING"
+                all_ok=false
             fi
         done
+        [ "$all_ok" = true ] && log "  All preserved containers healthy"
     else
         log "  docker not installed"
     fi
@@ -683,6 +709,11 @@ install_systemd() {
 
     local service_file="/etc/systemd/system/cleanup-openstageisland.service"
     local timer_file="/etc/systemd/system/cleanup-openstageisland.timer"
+
+    # Check if already installed
+    if systemctl is-enabled cleanup-openstageisland.timer >/dev/null 2>&1; then
+        log "  Timer already enabled, reinstalling..."
+    fi
 
     # Service unit
     cat > "$service_file" <<EOF
