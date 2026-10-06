@@ -163,10 +163,21 @@ _cmd() {
   run "$@"
 }
 
+# ── Repository transport guard ────────────────────────────────────────────────
+# Sourced here (after the print helpers and `run` exist) so the update engine
+# can never fetch a package over plaintext HTTP, whether it is run standalone
+# (`sudo bash lib/updater.sh`) or called from linuxinstall.sh. The guard is a
+# no-op when it has already run in this process.
+# shellcheck disable=SC1091
+if [ -r "$(dirname "${BASH_SOURCE[0]:-$0}")/apt-https.sh" ]; then
+  source "$(dirname "${BASH_SOURCE[0]:-$0}")/apt-https.sh"
+fi
+
 # ── Package managers ─────────────────────────────────────────────────────────
 
 _update_apt() {
   command -v apt >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_apt" || true
   msg "apt: updating package lists..."
   if ! run sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
     err "apt update failed"; _track; return 1
@@ -192,6 +203,7 @@ _update_apt() {
 
 _update_dnf() {
   command -v dnf >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_dnf" || true
   msg "dnf: checking for updates..."
   if ! run sudo dnf upgrade --refresh -y -q; then
     err "dnf upgrade failed"; _track; return 1
@@ -203,6 +215,7 @@ _update_dnf() {
 
 _update_yum() {
   command -v yum >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_yum" || true
   msg "yum: checking for updates..."
   if ! run sudo yum update -y -q; then
     err "yum update failed"; _track; return 1
@@ -214,6 +227,7 @@ _update_yum() {
 
 _update_zypper() {
   command -v zypper >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_zypper" || true
   msg "zypper: refreshing + updating..."
   if ! run sudo zypper --quiet refresh; then
     err "zypper refresh failed"; _track; return 1
@@ -228,6 +242,7 @@ _update_zypper() {
 
 _update_pacman() {
   command -v pacman >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_pacman" || true
   msg "pacman: syncing + upgrading..."
   if ! run sudo pacman -Syu --noconfirm --quiet; then
     err "pacman update failed"; _track; return 1
@@ -242,6 +257,7 @@ _update_pacman() {
 
 _update_snap() {
   command -v snap >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_snap" || true
   msg "snap: refreshing all snaps..."
   # Track snap refresh outcome so the dispatcher summary is accurate.
   if _cmd sudo snap refresh; then
@@ -285,6 +301,7 @@ _update_snap() {
 
 _update_flatpak() {
   command -v flatpak >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_flatpak" || true
   msg "flatpak: updating remote repos + all installations..."
   local rc=0
   # `flatpak remote-ls --updates` exits 0 whether or not there are updates
@@ -318,6 +335,7 @@ _update_flatpak() {
 
 _update_docker() {
   command -v docker >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_docker" || true
   msg "docker: pulling latest images..."
   local images
   images=$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>' || true)
@@ -347,6 +365,7 @@ _update_docker() {
 
 _update_brew() {
   command -v brew >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_brew" || true
   msg "brew: updating..."
   local brew_failed=0
   if ! HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null; then
@@ -365,6 +384,7 @@ _update_brew() {
 
 _update_firmware() {
   command -v fwupdmgr >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_firmware" || true
   msg "fwupdmgr: refreshing metadata..."
   run sudo fwupdmgr refresh 2>/dev/null || true
   local available
@@ -399,6 +419,7 @@ _update_geoip() {
   #     Export:  GEOIP_URL=https://your-mirror.example.com/GeoLite2-Country.mmdb
   #   (default)             — community-maintained fork (no account needed).
   local _geoip_url="" _key
+  apt_https_guard "_update_geoip" || true
   if [ -n "${MAXMIND_LICENSE_KEY:-}" ]; then
     _key=$(printf '%s' "${MAXMIND_LICENSE_KEY}" | tr -d '[:space:]')
     if [ -n "$_key" ]; then
@@ -411,6 +432,24 @@ _update_geoip() {
   if [ -z "$_geoip_url" ]; then
     _geoip_url="https://raw.githubusercontent.com/maccurry/GeoIP-country/main/GeoLite2-Country.mmdb"
   fi
+  # GEOIP_URL is operator-supplied, so it is the one download target in this
+  # engine that can be pointed at plaintext. A GeoIP database decides which
+  # country a packet is "in", so a tampered copy is a traffic-tunneling
+  # primitive. Refuse http:// outright rather than silently fetching it.
+  case "$_geoip_url" in
+    https://*) : ;;
+    http://*)
+      err "GEOIP_URL is plaintext (http://). Refusing to download the GeoIP database over HTTP."
+      info "Use an https:// mirror, or unset GEOIP_URL to use the default fork."
+      _track
+      return 1
+      ;;
+    *)
+      err "GEOIP_URL must be an https:// URL; got: ${_geoip_url%%\?*}"
+      _track
+      return 1
+      ;;
+  esac
   # Common locations for GeoIP Country database.
   local _geoip_db geoip_candidates=(
     "/usr/share/GeoIP/GeoLite2-Country.mmdb"
@@ -575,6 +614,7 @@ _update_btrfs_balance() {
 
 _update_pihole() {
   command -v pihole >/dev/null 2>&1 || return 0
+  apt_https_guard "_update_pihole" || true
   if [ "$EUID" -ne 0 ]; then
     _log "pihole: requires root — skipping"
     return 0
@@ -619,6 +659,10 @@ _update_pihole() {
 #   VERBOSE=2        — trace every command
 #   DRY_RUN=1        — simulate all commands without running them
 #
+# Repository transport: apt_https_guard runs before the first sub-step, so
+# nothing in this dispatcher can pull a package over plaintext HTTP. It is
+# idempotent, so the per-_update_* guards cost nothing.
+#
 # Exit: 0 = all succeeded, 1 = one or more sub-steps had errors.
 
 _run_all_updates() {
@@ -631,6 +675,9 @@ _run_all_updates() {
       --steps=*)      _steps_overrides="${_p#--steps=}" ;;
     esac
   done
+
+  # Precaution before a single byte is downloaded.
+  apt_https_guard "_run_all_updates" || true
 
   msg "=== Comprehensive system update ==="
   local start_sec=$SECONDS
@@ -763,6 +810,32 @@ else
   # Called as a script. Pass all arguments to _run_all_updates.
   set -euo pipefail
   SECONDS=0
+  # Sub-commands handled here rather than by the dispatcher, because they
+  # only touch the repository transport and never run an update.
+  #
+  # `set -euo pipefail` is active in this branch, so a bare call that returns
+  # non-zero would exit before `exit $?` runs and skip the report. Capture
+  # the status explicitly instead of relying on that coincidence.
+  _ap_https_rc=0
+  case "${1:-}" in
+    --apt-https|--enforce-https)
+      if [ "${2:-}" = "--audit" ]; then
+        apt_https_report || _ap_https_rc=$?
+      else
+        apt_https_enforce "updater --apt-https" || _ap_https_rc=$?
+        apt_https_report || true
+      fi
+      exit "$_ap_https_rc"
+      ;;
+    --apt-https-audit)
+      apt_https_report || _ap_https_rc=$?
+      exit "$_ap_https_rc"
+      ;;
+    --apt-https-off|--disable-https)
+      apt_https_revert || _ap_https_rc=$?
+      exit "$_ap_https_rc"
+      ;;
+  esac
   _run_all_updates "$@"
   exit $?
 fi

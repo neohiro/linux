@@ -30,7 +30,14 @@ the package name right per distro. This script:
 - **Rollback log per file.** Every config it edits is backed up to a
   timestamped copy; the index lives at `/var/log/linux-install-rollback.log`
   and is one `cp` away from a full undo.
-- **Three security profiles + a 20-tool maintenance suite.** From
+- **HTTPS-only package transport, enforced before every download.** A
+  plaintext `http://` mirror lets anyone on the path swap a `.deb`/`.rpm`/wheel
+  for their own. The guard audits **every** app store on the box — apt, dnf,
+  yum, zypper, pacman, apk, flatpak, snap, docker, brew, pip, npm, cargo,
+  gem, nix, fwupd — rewrites apt automatically with rollback if a mirror
+  can't speak TLS, and reports the rest. See
+  [Package transport security](#package-transport-security-https).
+- **Three security profiles + a 21-tool maintenance suite.** From
   "Recommended" (firewall + updates, 6 steps, no SSH risk) to "Full"
   (Tor + IPv6 disable + ASR + deep clean, 12 steps). Maintenance menu
   re-runs any step on a live box without re-hardening.
@@ -45,9 +52,11 @@ the package name right per distro. This script:
 | SSH hardening | `PasswordAuthentication no` gated on validated pubkey; port never changed |
 | Fail2ban, sysctl profile, AppArmor/SELinux check | per-distro package names |
 | Tor, dnscrypt-proxy, unattended-upgrades, DeepClean | optional per profile |
+| **HTTPS-only package transport** | enforced before every `apt`/`dnf`/`yum`/`zypper`/`pacman`/`apk`/`pip`/`npm`/… download — `--apt-https` |
+| **Disconnect-safe** | SSH runs auto-wrap in tmux; subscripts get their own session; the reattach command is always printed |
 | **Rollback log** | `/var/log/linux-install-rollback.log` — `original\tbackup` per file |
 | **SSH self-heal** | `--install-self-heal` — systemd timer or cron, every 60s |
-| **20-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
+| **21-tool maintenance suite** | Re-runs any step, lists keys, tails logs, dumps config |
 
 ## Quick start
 
@@ -82,8 +91,6 @@ the in-script `restore_ssh` routine or Tailscale SSH gets you back in.
 > → yum → apt`, so Arch derivatives pick `pacman`, SUSE picks `zypper`,
 > RHEL/Fedora pick `dnf`, Debian/Ubuntu pick `apt`. No manual flag required.
 
-<<<<<<< HEAD
-=======
 ## One-step automated setup
 
 Run the general interactive script directly from the repo — it prompts you
@@ -114,7 +121,218 @@ SSH can get you back in.
 `━━━ PROGRESS ████████████░░░░ 12/17 (70%) ━━━`) before every step, so you
 always see what's already done and what's coming.
 
->>>>>>> origin/main
+### Package transport security (HTTPS)
+
+A plaintext `http://` mirror means anyone who can intercept the route — a
+hostile Wi-Fi, a compromised router, an upstream CDN node — can swap the
+`.deb` / `.rpm` / `.pkgz` / wheel you just downloaded for one of theirs.
+Signature checks catch *forged* packages, but they do not stop a
+*downgrade* to an older, genuinely-signed, vulnerable build. Only TLS on
+the transport closes that gap.
+
+So every entry point in this repo runs a guard **before** anything is
+fetched. It is the first workflow step (on every profile, including
+Custom), it runs once per process, and it is idempotent, so re-runs and
+`--auto` are cheap.
+
+```bash
+# Apply it on its own (normally automatic)
+sudo bash linuxinstall.sh --apt-https
+
+# Report only; never modifies anything. Exit 1 if anything is plaintext.
+sudo bash linuxinstall.sh --apt-https-audit
+
+# Undo: restore every backup and remove the policy drop-in.
+sudo bash linuxinstall.sh --apt-https-off
+
+# Or standalone, no installer needed:
+sudo bash lib/apt-https.sh            # enforce
+sudo bash lib/apt-https.sh --report   # audit
+sudo bash lib/apt-https.sh --revert   # undo
+```
+
+#### What is checked
+
+This is **not** apt-specific. Every distro and language has its own "app
+store", and several ship plaintext HTTP by default. The audit spans all of
+them and only lists the ones actually installed:
+
+| Store | Where the transport is configured |
+|---|---|
+| `apt` | `/etc/apt/sources.list`, `sources.list.d/*.list`, DEB822 `*.sources` |
+| `dnf` / `yum` | `/etc/yum.repos.d/*.repo` (`baseurl`, `metalink`, `mirrorlist`, `gpgkey`) |
+| `zypper` | `/etc/zypp/repos.d/*.repo` |
+| `pacman` | `/etc/pacman.d/*` (`Server=`) |
+| `apk` (Alpine) | `/etc/apk/repositories` — **plaintext `http://` by default on many images** |
+| `flatpak` | `flatpak remotes` |
+| `snap` | store is snapd-managed; no operator-configurable transport |
+| `docker` | `/etc/docker/daemon.json` (`registry-mirrors`, `insecure-registries`) |
+| `brew` | `HOMEBREW_BREW_GIT_REMOTE`, `HOMEBREW_API_DOMAIN`, … |
+| `pip` | `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `pip.conf` |
+| `npm` | `NPM_CONFIG_REGISTRY`, `.npmrc` |
+| `cargo` | `CARGO_REGISTRIES_CRATES_IO_INDEX`, `~/.cargo/config.toml` |
+| `gem` | `GEM_SOURCE`, `.gemrc` |
+| `nix` | `nix.conf` (`substituters`, `channel`) |
+| `fwupd` | `/etc/fwupd/remotes.d/*.conf` (LVFS `UpdateURI`) |
+
+Detection is deliberately format-agnostic: **any non-comment line carrying an
+`http://` URL** is reported. A per-dialect key list would miss `gpgkey=`,
+`metalink=`, and whatever the next release adds — and a miss is exactly the
+failure this is meant to prevent. The one exception is JSON, which has no
+comment syntax: there, `http://` must sit at the start of a JSON string, so a
+`"_comment": "see http://docs.internal"` note is not mistaken for a registry.
+
+`--apt-https-audit` prints a per-store verdict:
+
+```
+━━━ App-store transport security (HTTPS) ━━━
+  Package manager:                   apt
+  [x] apt policy drop-in active: /etc/apt/apt.conf.d/99neohiro-force-https
+
+  Store                           Result
+  apt (Debian/Ubuntu/Mint/Pop!/Kali) https only
+  apk (Alpine)                   2 plaintext endpoint(s)
+      /etc/apk/repositories:1: http://dl-cdn.alpinelinux.org/alpine/v3.19/main
+  pip index                      1 plaintext endpoint(s)
+      /etc/pip.conf:2: index-url = http://pypi.internal/simple
+```
+
+#### What is changed automatically
+
+Only **apt** is rewritten unattended, because it is the one store where the
+result can be *verified*: after rewriting, a real `apt-get update` runs, and if
+a mirror turns out not to serve the same paths over TLS the rewrite is **rolled
+back automatically**. You are never left with a broken package manager.
+
+1. Installs `/etc/apt/apt.conf.d/99neohiro-force-https`:
+
+   ```text
+   Acquire::https::AllowRedirect "true";   // https -> https redirects are fine
+   Acquire::http::AllowRedirect  "false";  // https -> http  is REFUSED, not followed
+   Acquire::https::Verify-Peer  "true";
+   Acquire::https::Verify-Host  "true";
+   Acquire::Retries             "3";
+   ```
+
+   The anti-downgrade line is the important one: without it, an
+   `https://` mirror can silently bounce you down to `http://`.
+
+2. Rewrites `http://` → `https://` on active lines in
+   `/etc/apt/sources.list`, `sources.list.d/*.list` (classic) and
+   `sources.list.d/*.sources` (DEB822 `URIs:` field only).
+   Commented-out lines and DEB822 structural fields (`Suites:`,
+   `Components:`, `Signed-By:`) are left byte-identical.
+
+3. Backs every file up to `/var/backups/neohiro-apt-https/` **before** the
+   first edit and records each in the rollback log, so
+   `bash linuxinstall.sh --rollback --apply` can undo it too.
+
+4. Applies each change with a **staging file in the same directory followed by
+   `rename(2)`**, not `cp` into place. `cp` truncates first, so a crash
+   mid-copy leaves a truncated `sources.list`; a rename is atomic, so a reader
+   sees either the whole old file or the whole new one. Original mode and
+   ownership are preserved.
+
+5. Warns if no CA trust store is present, since HTTPS verification is
+   worthless without one.
+
+#### Changing the others
+
+For every other store the guard **reports but does not rewrite**. Whether
+`https://<same host><same path>` actually exists cannot be known without a
+network round trip, and silently breaking a working mirror is worse than the
+threat it prevents. Two options:
+
+```bash
+# Repoint the endpoint at an https-capable mirror (recommended), or
+NEOHIRO_APT_HTTPS_REWRITE=1 sudo bash linuxinstall.sh --apt-https
+```
+
+The opt-in sweeps **every** installed store (apk, pip, npm, cargo, gem, nix,
+docker, fwupd, and the RPM/Arch/SUSE repo formats) in one pass, backing each
+up and honouring the same atomic replace. Re-audit afterwards, because some
+mirrors genuinely do not serve the same paths over TLS. Stores whose tool is
+not installed are left alone.
+
+`NEOHIRO_APT_HTTPS_STRICT=1` turns any leftover plaintext endpoint into a
+hard error, which is what you want in CI.
+
+#### Where it is wired in
+
+`pkg_update` / `pkg_install` / `pkg_upgrade` / `pkg_autoremove`,
+`update_system`, `update_kernel`, `updates_only_mode`, `restore_ssh.sh`
+(before installing `openssh-server`), `DeepClean.sh` (before
+`apt-get autoremove --purge`), the **Maintenance** submenu option 1, the
+`--step apt_https` mode, and the `--apt-https*` flags.
+
+In `lib/updater.sh` it guards the `_run_all_updates` dispatcher plus every
+sub-step that touches the network: `_update_apt`, `_update_dnf`,
+`_update_yum`, `_update_zypper`, `_update_pacman`, `_update_snap`,
+`_update_flatpak`, `_update_docker`, `_update_brew`, `_update_firmware`,
+`_update_geoip`, `_update_pihole`. (`_update_virsh`, `_update_suse_snapper`
+and `_update_btrfs_balance` only read or write local state, so they are
+deliberately not guarded.)
+
+Two subtleties worth knowing:
+
+- **Fetched subscripts get the guard too.** `run_remote_script` pulls
+  `DeepClean.sh` / `OptimizeLinuxASR.sh` into a temp directory, and a script
+  resolves its helpers relative to its own location — so without help it
+  would find no `lib/`, and its `apt-get autoremove --purge` would run
+  unguarded even though the parent had already enforced. The installer
+  therefore prefetches `lib/apt-https.sh` next to the subscript. If a
+  subscript is `curl | bash`'d entirely on its own and finds no library, it
+  says so out loud rather than skipping the precaution silently.
+- **`GEOIP_URL` must be `https://`.** It is the one operator-supplied
+  download target in the update engine, and a GeoIP database decides which
+  country a packet counts as being in — a tampered copy is a
+  traffic-tunneling primitive. An `http://` value is refused outright.
+
+`OptimizeLinuxASR.sh` does not download packages, so it needs no guard.
+
+#### Under `curl | sudo bash`
+
+`curl ... | sudo bash` has no `lib/` directory next to it. Rather than carry
+a second copy of this logic (which is how fixes silently fail to reach the
+most common install path), the script resolves `lib/apt-https.sh` from disk
+if present, otherwise fetches it from the same raw base it already trusts for
+`DeepClean.sh`, and sources that. If neither is possible it says so loudly
+and runs with the guard inactive — it never pretends to be enforcing.
+
+| Variable | Effect |
+|---|---|
+| `NEOHIRO_APT_HTTPS=1` | enforce (default) |
+| `NEOHIRO_APT_HTTPS=audit` | report only, never modify |
+| `NEOHIRO_APT_HTTPS=0` | disable the guard entirely |
+| `NEOHIRO_APT_HTTPS_REWRITE=1` | also rewrite the non-apt stores |
+| `NEOHIRO_APT_HTTPS_NOVERIFY=1` | skip the post-rewrite `apt-get update` check |
+| `NEOHIRO_APT_HTTPS_STRICT=1` | treat leftover plaintext as a hard error |
+| `NEOHIRO_APT_BLOCK_PORT80=1` | also `ufw deny out 80/tcp` (opt-in, see below) |
+| `NEOHIRO_APT_FAMILY=apt\|dnf\|yum\|zypper\|pacman\|none` | pin the detected family (CI containers, testing) |
+
+### Optional: block port 80 entirely
+
+If you want belt-and-braces so that *no* process can open an unencrypted
+package connection, add an outbound deny rule:
+
+```bash
+sudo bash linuxinstall.sh --apt-https      # make sure every repo is https first
+sudo ufw deny out 80/tcp && sudo ufw reload
+# or: NEOHIRO_APT_BLOCK_PORT80=1 sudo bash linuxinstall.sh --apt-https
+```
+
+This is **opt-in** because a blanket outbound block also breaks unrelated
+plaintext protocols (local registries, metrics endpoints, captive-portal
+checks). The guard refuses to add the rule while any plaintext repo is
+still configured, since that would only break those repos.
+
+Verify:
+
+```bash
+sudo ufw status | grep -E '80/tcp|Status'     # outbound DENY present
+sudo bash linuxinstall.sh --apt-https-audit   # exit 0 = no plaintext repos left
+```
+
 ### Cross-distro kernel update
 
 `linuxinstall.sh` auto-detects the package manager and updates the kernel
@@ -184,6 +402,35 @@ one-liner from a local terminal (not over SSH), the tmux wrap is skipped
 automatically and there's nothing to re-attach to. When the script
 finishes successfully, the tmux session closes itself; if it fails, the
 session is left intact for inspection.
+
+### You can always get back to a running install
+
+This is the property that matters when something scary happens mid-run, so
+it is enforced rather than hoped for:
+
+- **The reattach command is printed before the wrap, not after.** The script
+  `exec`s into tmux, so anything printed afterwards would never be seen. You
+  get the exact command — including a PID-suffixed name if the standard one
+  is taken — on screen at the moment you need it.
+- **A leftover session is never hijacked.** If a `linux-setup` session
+  already exists (a previous run that did not exit cleanly), the script says
+  so and starts `linux-setup-<pid>` instead. You are never silently dropped
+  into an old, differently-flagged run while yours never starts.
+- **Your flags survive the wrap.** The re-exec carries `--auto`, `--step`,
+  `--dry-run` and friends through, shell-quoted, so wrapping cannot change
+  what the run does.
+- **Sessions are reaped on success.** A clean exit tears the session down, so
+  the next run starts clean. A failed run leaves it alive — that is your
+  inspection point.
+- **Script hops get their own session.** `DeepClean.sh` /
+  `OptimizeLinuxASR.sh` run in a dedicated `neohiro-sub-<name>-<pid>` tmux
+  session with the reattach command printed, plus a heartbeat every 30s so a
+  long step does not look frozen (a frozen screen invites a Ctrl-C that
+  orphans the work). If there is no tmux to protect the hop, the script says
+  plainly that the step cannot be recovered.
+
+`tmux ls` lists sessions; `tmux attach -t <name>` reattaches; `Ctrl-b` then
+`d` detaches without stopping anything.
 
 ## Reconnecting after a reboot or lockout
 
@@ -265,14 +512,15 @@ The Maintenance suite itself is expanded to include:
 
 | # | Option | What it does |
 |---|---|---|
-| 1–13 | system / dns / firewall / tor / ssh / fail2ban / unattended / ipv6 / sysctl / apparmor / pam / OptimizeLinuxASR / DeepClean | Re-run any step on demand |
-| 14 | SSH diagnostics & lockout fix | Same routine as `--restore-ssh` |
-| 15 | Authorized keys | List all keys in every user's `authorized_keys` |
-| 16 | SSH config review | Print every key directive from `sshd_config` and drop-ins |
-| 17 | SSH self-heal guard | Install / remove / status of the per-minute watchdog |
-| 18 | Logs | Tail `/var/log/linux-install-rollback.log` and `/var/log/neohiro-ssh-watchdog.log` |
-| 19 | System info | Uptime, load, memory, disk, CPU, listening ports |
-| 20 | Back to main menu | — |
+| 1 | Force HTTPS for package repos | Enforces TLS for every repo before any download; prints the resulting state |
+| 2–14 | system / dns / firewall / tor / ssh / fail2ban / unattended / ipv6 / sysctl / apparmor / pam / OptimizeLinuxASR / DeepClean | Re-run any step on demand |
+| 15 | SSH diagnostics & lockout fix | Same routine as `--restore-ssh` |
+| 16 | Authorized keys | List all keys in every user's `authorized_keys` |
+| 17 | SSH config review | Print every key directive from `sshd_config` and drop-ins |
+| 18 | SSH self-heal guard | Install / remove / status of the per-minute watchdog |
+| 19 | Logs | Tail `/var/log/linux-install-rollback.log` and `/var/log/neohiro-ssh-watchdog.log` |
+| 20 | System info | Uptime, load, memory, disk, CPU, listening ports |
+| 21 | Back to main menu | — |
 
 The self-heal guard runs as root via `systemd` or cron and **never
 modifies `authorized_keys` or any credentials** — it only fixes config
@@ -541,10 +789,19 @@ dumps — add to `/etc/security/limits.conf`:
 ### Testing
 
 ```bash
-bash tests/test_linuxinstall.sh    # 65 tests: parse, logic, UX coverage, snapshot
-bash tests/test_updater.sh         # 43 tests: dispatcher, race safety, version floor
+bash tests/run-all.sh                  # every suite, with a summary
+bash tests/test_linuxinstall.sh        # 67 tests: parse, logic, UX coverage, snapshot
+bash tests/test_apt_https.sh           # 275 tests: transport guard, run continuity, encoding
+bash tests/test_updater.sh             # 45 tests: dispatcher, race safety, version floor
 shellcheck -S warning *.sh lib/*.sh tests/*.sh   # lint
 ```
+
+`test_apt_https.sh` is hermetic: it relocates the whole `/etc` tree into a
+temp sandbox, stubs `sudo`/`ufw`/`apk` on `PATH`, and never makes a network
+call. It also enforces repository encoding hygiene (valid UTF-8, no
+double-encoding artifacts, LF endings), because these scripts are full of
+box-drawing characters and a silent re-encode is otherwise invisible until a
+snapshot diff catches it.
 
 To regenerate snapshot fixtures after a deliberate UX change:
 ```bash
@@ -562,6 +819,67 @@ sudo rkhunter --check                                   # rootkit sweep
 sudo aide --check                                       # file integrity
 ss -tulnp                                               # re-check listeners
 ```
+
+## 1MB Log Limit Enforcement (DeepClean.sh)
+
+**New in this release:** `DeepClean.sh` now enforces a consistent **1MB maximum log size** across all logging subsystems, persistently and reboot-proof.
+
+### What gets limited to 1MB
+
+| Subsystem | Configuration | Drop-in file |
+|---|---|---|
+| **systemd-journald** | `SystemMaxUse=1M`, `SystemMaxFileSize=1M`, `MaxRetentionSec=1day` | `/etc/systemd/journald.conf.d/99-neohiro-1mb.conf` |
+| **systemd-coredump** | `MaxUse=1M`, `ExternalSizeMax=1M` | `/etc/systemd/coredump.conf.d/99-neohiro-1mb.conf` |
+| **logrotate (global)** | `size 1M`, `rotate 1`, `daily`, `compress`, `delaycompress` | `/etc/logrotate.conf` (modified in-place) |
+| **logrotate (syslog)** | `/var/log/syslog`, `messages`, `auth.log`, `kern.log`, `daemon.log`, `user.log`, `ufw.log` | `/etc/logrotate.d/99-neohiro-syslog` |
+| **logrotate (package managers)** | `dpkg.log`, `apt/history.log`, `pacman.log`, `zypper.log`, `dnf.log`, `yum.log` | `/etc/logrotate.d/99-neohiro-pkg` |
+| **logrotate (fail2ban)** | `/var/log/fail2ban.log` | `/etc/logrotate.d/99-neohiro-fail2ban` |
+| **logrotate (SSH)** | `/var/log/sshd.log`, `ssh.log` | `/etc/logrotate.d/99-neohiro-ssh` |
+| **Docker** | `json-file` driver, `max-size=1m`, `max-file=1` | `/etc/docker/daemon.json` |
+| **containerd / CRI-O** | `container_max_log_size=1048576`, `container_max_log_files=1` | `/etc/containerd/config.toml` |
+| **kubelet** | `--container-log-max-size=1Mi --container-log-max-files=1` | `/etc/systemd/system/kubelet.service.d/99-neohiro-log-limit.conf` |
+| **auditd** | `max_log_file=1`, `num_logs=2` | `/etc/audit/auditd.conf` (modified in-place) |
+| **rsyslog rate limit** | System: 200/5sec; imuxsock: 500/5sec | `/etc/rsyslog.d/99-neohiro-rate-limit.conf` |
+| **syslog-ng rate limit** | `log-fifo-size(1000)`, `flush-lines(100)` | `/etc/syslog-ng/conf.d/99-neohiro-rate-limit.conf` |
+
+### Why 1MB?
+
+- **Prevents disk exhaustion** from log floods (e.g., misbehaving services, DDoS, kernel oops storms)
+- **Consistent across distros** — same limits on Ubuntu, RHEL, SUSE, Arch
+- **Reboot-proof** — all limits use drop-in configs (`/etc/*/*.d/99-neohiro-*.conf`) that package managers never overwrite
+- **Auditable** — run `DeepClean.sh` anytime to see before/after log footprint and re-apply
+
+### Usage
+
+```bash
+# Full deep clean + 1MB log limit enforcement
+sudo ./DeepClean.sh
+
+# Or via the main installer (option 12 in Maintenance menu)
+curl -fsSL https://raw.githubusercontent.com/neohiro/linux/main/linuxinstall.sh | sudo bash
+# → Select "Maintenance" → "12) DeepClean"
+
+# Verify current log footprint
+sudo journalctl --disk-usage
+du -sh /var/log
+```
+
+### Integration with automation
+
+The 1MB limits are applied automatically when:
+- Running `DeepClean.sh` (standalone or via `linuxinstall.sh` Maintenance menu)
+- Running `linuxinstall.sh` with the **Full** profile (includes DeepClean)
+- Re-running on a live system — idempotent, safe to run daily via cron/timer
+
+```bash
+# Daily cron (recommended for servers)
+0 3 * * * root /path/to/DeepClean.sh >/var/log/deepclean.log 2>&1
+
+# Or systemd timer (included in the repo as an example)
+# See tests/ for validation patterns
+```
+
+---
 
 ## Additional helpers
 
