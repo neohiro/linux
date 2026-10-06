@@ -520,6 +520,7 @@ if grep -q 'mktemp -t deepclean_breakdown' "$DEEPCLEAN"; then
 else
     fail_t "storage breakdown temp file" "missing mktemp"
 fi
+# shellcheck disable=SC2016
 if grep -q 'case "$target_mount"' "$DEEPCLEAN"; then
     ok_t "storage breakdown validates target_mount"
 else
@@ -543,6 +544,7 @@ if grep -q '_fmt_kb' "$DEEPCLEAN"; then
 else
     fail_t "_fmt_kb function" "not found"
 fi
+# shellcheck disable=SC2016
 if grep -q 'case "$kb"' "$DEEPCLEAN" && grep -q '\*\[!0-9\]' "$DEEPCLEAN"; then
     ok_t "_fmt_kb validates non-negative integer input"
 else
@@ -561,6 +563,7 @@ if grep -q '_draw_bar' "$DEEPCLEAN"; then
 else
     fail_t "_draw_bar function" "not found"
 fi
+# shellcheck disable=SC2016
 if grep -q 'case "$used_kb"' "$DEEPCLEAN" && grep -q 'case "$total_kb"' "$DEEPCLEAN"; then
     ok_t "_draw_bar validates both inputs"
 else
