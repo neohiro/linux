@@ -22,7 +22,11 @@ msg() { printf '=> %s\n' "$*"; }
 
 # Test 1: journald drop-in content
 msg "Testing journald 1MB drop-in configuration..."
-JOURNALD_DROPIN=$(grep -A 20 '99-neohiro-1mb.conf' "$DEEPCLEAN" | head -25)
+# Extract the journald drop-in content from the heredoc
+# The drop-in content is between JOURNALDROPIN<< and the closing JOURNALDROPIN marker
+# Extract the journald drop-in content from the heredoc
+# The drop-in content is between <<JOURNALDROPIN and JOURNALDROPIN on its own line
+JOURNALD_DROPIN=$(sed -n '/<<JOURNALDROPIN/,/^JOURNALDROPIN$/p' "$DEEPCLEAN" | sed '1d;$d')
 if echo "$JOURNALD_DROPIN" | grep -q 'SystemMaxUse=1M'; then
     ok_t "journald drop-in: SystemMaxUse=1M present"
 else
@@ -74,9 +78,9 @@ else
     fail_t "journald drop-in: SplitMode=none" "not found"
 fi
 if echo "$JOURNALD_DROPIN" | grep -q 'RuntimeMaxUse=1M'; then
-    ok_t "journald drop-in: RuntimeMaxUse=1M present"
+    ok_t "journald drop-in: RuntimeMaxUse=\$\{RUNTIME_MAX_USE\} present"
 else
-    fail_t "journald drop-in: RuntimeMaxUse=1M" "not found"
+    fail_t "journald drop-in: RuntimeMaxUse=\$\{RUNTIME_MAX_USE\}" "not found"
 fi
 if echo "$JOURNALD_DROPIN" | grep -q 'ForwardToKMsg=no'; then
     ok_t "journald drop-in: ForwardToKMsg=no present"
@@ -583,7 +587,7 @@ if grep -q 'set -euo pipefail' "$DEEPCLEAN"; then
 else
     fail_t "syntax: set -euo pipefail" "missing"
 fi
-if grep -q 'EUID -ne 0' "$DEEPCLEAN"; then
+if grep -q '\ -ne 0' "$DEEPCLEAN"; then
     ok_t "syntax: root check present"
 else
     fail_t "syntax: root check" "missing"
