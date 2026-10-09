@@ -3688,9 +3688,15 @@ harden_attack_surface() {
     "jffs2"      # Journalling Flash FS, rarely needed
     "hfs"        # macOS HFS, rarely needed on Linux
     "hfsplus"    # macOS HFS+, rarely needed on Linux
-    "squashfs"   # read-only compressed FS, may be needed for snaps/snapshots
     "udf"        # Universal Disk Format, rarely needed
   )
+  # Server/desktop triage: squashfs backs snaps/live media. Only blacklist it
+  # when no snap runtime is present; otherwise leave it loadable.
+  if command -v snap >/dev/null 2>&1 || _service_present snapd 2>/dev/null; then
+    info "Keeping squashfs loadable (snap runtime detected)."
+  else
+    fs_blacklist+=("squashfs")
+  fi
   local modprobe_dir="/etc/modprobe.d"
   run sudo mkdir -p "$modprobe_dir"
   local f="${modprobe_dir}/blacklist-filesystems.conf"
@@ -3709,7 +3715,7 @@ harden_attack_surface() {
   ok "Filesystem blacklist written to $f"
 
   # 2) SSH cryptographic hardening — modern ciphers, MACs, KEX
-  if [ -f /etc/ssh/sshd_config ] && systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+  if [ -f /etc/ssh/sshd_config ] && { systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; }; then
     local sshcfg="/etc/ssh/sshd_config"
     local backup
     backup="${sshcfg}.bak.$(date +%s%N)"
@@ -3721,7 +3727,7 @@ harden_attack_surface() {
       "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
     )
     for d in "${crypto_directives[@]}"; do
-      _set_or_append_sshd_config "${d%%=*}" "${d#*=}" "$sshcfg"
+      _set_or_append_sshd_config "${d%% *}" "${d#* }" "$sshcfg"
     done
     if sudo sshd -t 2>&1; then
       _ssh_safe_restart "$sshcfg" || warn "SSH config valid but reload failed; changes apply on next restart."
