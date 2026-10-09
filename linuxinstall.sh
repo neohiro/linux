@@ -3681,12 +3681,12 @@ EOF
 TMOUT=900; readonly TMOUT; export TMOUT
 EOF
   run sudo chmod 644 /etc/profile.d/99-tmout.sh
-  ok "Password/lockout policy set. Note: 'core 0' in /etc/security/limits.conf is recommended."
+  ok "Password/lockout policy set. Core dumps are disabled by the attack-surface step."
 }
 
 harden_attack_surface() {
-  msg "Attack surface reduction (built-in: filesystems, SSH crypto, login policy)"
-  if ! prompt_yn "Apply additional built-in ASR hardening (filesystem blacklist, SSH crypto, login.defs)?" "y"; then
+  msg "Attack surface reduction (built-in: filesystems, SSH crypto, login policy, core dumps)"
+  if ! prompt_yn "Apply additional built-in ASR hardening (filesystem blacklist, SSH crypto, login.defs, core dumps)?" "y"; then
     return 0
   fi
 
@@ -3777,8 +3777,13 @@ harden_attack_surface() {
   )
   for k in "${!login_vals[@]}"; do
     local v="${login_vals[$k]}"
-    if grep -qE "^${k}[[:space:]]" "$login_defs" 2>/dev/null; then
-      run sudo sed -i -E "s/^${k}[[:space:]]+.*/${k} ${v}/" "$login_defs"
+    # Never downgrade an existing password hash method (e.g. yescrypt/bcrypt).
+    if [ "$k" = "ENCRYPT_METHOD" ] && grep -qE "^[[:space:]]*ENCRYPT_METHOD[[:space:]]+" "$login_defs" 2>/dev/null; then
+      info "Keeping existing ENCRYPT_METHOD (no downgrade to ${v})."
+      continue
+    fi
+    if grep -qE "^[[:space:]]*${k}[[:space:]]+" "$login_defs" 2>/dev/null; then
+      run sudo sed -i -E "s/^[[:space:]]*${k}[[:space:]]+.*/${k} ${v}/" "$login_defs"
     else
       printf '%s %s\n' "$k" "$v" | run sudo tee -a "$login_defs" >/dev/null
     fi
