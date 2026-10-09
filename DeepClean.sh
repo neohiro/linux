@@ -11,15 +11,14 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Color constants and helpers sourced from lib/color.sh (falls back inline).
+# Color helpers from lib/color.sh (falls back inline).
 # shellcheck disable=SC1091
 if [ -r "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh" ]; then
   source "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/lib/color.sh"
 fi
 
-# If lib/color.sh was sourced, USE_COLOR is already set. If not
-# (run standalone from /tmp), apply the same gate inline so we never
-# emit stray "m" bytes to terminals that strip CSI sequences.
+# If lib/color.sh was not sourced or did not set USE_COLOR, run the canonical
+# gate inline so _c is safe to call in all execution paths.
 if [ -z "${USE_COLOR:-}" ]; then
   if [ "${NEOHIRO_COLOR:-}" = "1" ]; then
     USE_COLOR=1
@@ -29,25 +28,21 @@ if [ -z "${USE_COLOR:-}" ]; then
     USE_COLOR=0
   else
     _tcol=$(tput colors 2>/dev/null) || _tcol=""
-    case "${_tcol}" in
+    case "$_tcol" in
       ''|*[!0-9]*) USE_COLOR=0 ;;
-      *) [ "${_tcol}" -ge 8 ] || USE_COLOR=0 ;;
+      *) [ "$_tcol" -ge 8 ] && USE_COLOR=1 || USE_COLOR=0 ;;
     esac
   fi
 fi
-# Emit color constants from the validated gate. Single-quoted strings
-# so the backslashes survive verbatim into the terminal.
-if [ "${USE_COLOR}" = "1" ]; then
-  GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-else
-  GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""
-fi
 
-USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
+# _c <ansi-code> <text> -- wrap text in CSI escapes iff USE_COLOR=1.
+_c() { if [ "$USE_COLOR" = "1" ]; then printf '\033[%s%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 
-msg()  { echo "${CYAN}[*]${NC} $*"; }
-ok()   { echo "${GREEN}[+]${NC} $*"; }
-warn() { echo "${YELLOW}[!]${NC} $*"; }
+# Print helpers. All accept a single message string. warn/err go to stderr.
+msg()  { printf '%s\n' "$(_c '1;36m' '[*]' "$*")"; }
+ok()   { printf '%s\n' "$(_c '1;32m' '[+]' "$*")"; }
+warn() { printf '%s\n' "$(_c '1;33m' '[!]' "$*")"; }
+err()  { printf '%s\n' "$(_c '1;31m' '[!]' "$*")" >&2; }
 
 pkg_mgr() {
   if command -v pacman >/dev/null 2>&1 && [ -f /etc/pacman.conf ]; then
@@ -66,6 +61,9 @@ pkg_mgr() {
 }
 
 PM=$(pkg_mgr)
+
+# Capture disk usage before cleaning
+USED_BEFORE_KB=$(df -kP / | tail -1 | awk '{print $3}')
 
 msg "Detected package manager: ${PM:-none}"
 msg "Starting DeepClean..."
@@ -120,10 +118,10 @@ esac
 # 5. Snap Revisions (not Ubuntu-only; snap exists on other distros too)
 if command -v snap >/dev/null 2>&1; then
     msg "Removing disabled snap revisions..."
-    LANG=C snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' |
+    { LANG=C snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' |
         while read -r snapname revision; do
             snap remove "$snapname" --revision="$revision" 2>/dev/null || true
-        done
+        done; } || true
     rm -rf /var/lib/snapd/cache/* 2>/dev/null || true
 fi
 
@@ -149,22 +147,74 @@ find /home/*/.local/share/Trash/* -delete 2>/dev/null || true
 # ── Auto-Pruning Config ──────────────────────────────────────────────
 
 # 9. journald retention
-msg "Configuring journald for automatic log retention..."
-JOURNALD_CONF="/etc/systemd/journald.conf"
-[ -f "$JOURNALD_CONF" ] || touch "$JOURNALD_CONF"
-grep -qE "^#?SystemMaxUse=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*SystemMaxUse=.*/SystemMaxUse=200M/' "$JOURNALD_CONF" || \
-    echo "SystemMaxUse=200M" >> "$JOURNALD_CONF"
-grep -qE "^#?MaxRetentionSec=" "$JOURNALD_CONF" && \
-    sed -i 's/^#*MaxRetentionSec=.*/MaxRetentionSec=7d/' "$JOURNALD_CONF" || \
-    echo "MaxRetentionSec=7d" >> "$JOURNALD_CONF"
-systemctl restart systemd-journald 2>/dev/null || true
+#
+# Written as a drop-in rather than by editing /etc/systemd/journald.conf.
+# Two reasons: a drop-in always carries its own [Journal] section header, so
+# the keys cannot land outside a section; and /etc/systemd/journald.conf is a
+# shipped file that a package upgrade may replace, which would silently revert
+# the cap.
+#
+# 100M is the target. The stock Ubuntu 24.04 default reserves 4% of the root
+# filesystem for the journal, which is far too generous for a small VPS and
+# was measured allowing 923.8M on a 9.1 GiB root -- enough to eat a tenth of
+# the disk on its own. Small hosts do not need more than 100M of boot and
+# service history, and this keeps headroom for package and container layers
+# that cannot be pruned.
+msg "Configuring journald size cap (100M)..."
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN="$JOURNALD_DROPIN_DIR/10-size-limit.conf"
+mkdir -p "$JOURNALD_DROPIN_DIR"
+cat > "$JOURNALD_DROPIN" <<'JOURNALDEOF'
+# Managed by neohiro/linux DeepClean.sh -- do not edit by hand.
+#
+# SystemMaxUse is a hard ceiling on total on-disk journal size. The distro
+# default is 4% of the filesystem, which is far too generous for a small
+# VPS and was observed allowing ~924M on a 9.1 GiB root.
+[Journal]
+SystemMaxUse=100M
+
+# Keep individual journals small so rotation happens regularly instead of
+# in one large sweep.
+SystemMaxFileSize=20M
+
+# Secondary bound on age, so a quiet period cannot accumulate unbounded
+# history within the size budget above.
+MaxRetentionSec=1month
+JOURNALDEOF
+chmod 0644 "$JOURNALD_DROPIN"
+if systemctl restart systemd-journald 2>/dev/null; then
+    ok "journald restarted; effective limit reported by the journal:"
+    # Report what journald itself parsed rather than assuming the drop-in won.
+    journalctl -u systemd-journald -n 2 --no-pager 2>/dev/null \
+        | grep -oE 'max [0-9.]+[KMG]' | tail -1 | sed 's/^/    /' || true
+else
+    warn "Could not restart systemd-journald (non-systemd host?); drop-in written to $JOURNALD_DROPIN"
+fi
 
 # 10. Package-manager auto-clean config
 case "$PM" in
   apt)
     msg "Configuring apt auto-clean..."
+    # Keep-Downloaded-Packages/AutomaticRemove/Purge control what apt *keeps*,
+    # but on their own they do not reliably reclaim /var/cache/apt/archives.
+    # The Post-Invoke hooks are what actually delete the archives once a
+    # transaction finishes, which is where the bulk of the space goes: a
+    # single full-upgrade was measured leaving 917 MiB across 118 .deb files
+    # on a 9.1 GiB root.
+    #
+    # Both hooks are needed. DPkg::Post-Invoke alone still leaves the cache
+    # repopulated by every timer-driven `apt-get update`, because that
+    # downloads lists without running a dpkg transaction.
     cat > /etc/apt/apt.conf.d/99-auto-clean <<'APTEOF'
+// Managed by neohiro/linux DeepClean.sh -- do not edit by hand.
+//
+// Drop downloaded .deb archives as soon as they stop being useful. Only the
+// archives under /var/cache/apt/archives are removed; installed packages,
+// the dpkg database, and the lists under /var/lib/apt are untouched, so
+// apt-get upgrade and dpkg behaviour are unchanged.
+DPkg::Post-Invoke { "apt-get clean"; };
+APT::Update::Post-Invoke { "apt-get clean"; };
+
 APT::Keep-Downloaded-Packages "false";
 APT::Get::AutomaticRemove "true";
 APT::Get::Purge "true";
@@ -185,10 +235,10 @@ APTEOF
     ;;
   zypper)
     msg "Configuring zypper auto-clean..."
-    sed -i 's/^solver.onlyRequires.*/solver.onlyRequires = true/' /etc/zypp/zypp.conf 2>/dev/null || true
+    sed -i 's/solver.onlyRequires.*/solver.onlyRequires = true/' /etc/zypp/zypp.conf 2>/dev/null || true
     ;;
   pacman)
-    msg "Pacman cache managed by /etc/pacman.d/hooks/clean.hook (create if needed)..."
+    msg "Pacman cache managed at /etc/pacman.d/hooks/clean.hook (create if needed)..."
     ;;
   *)
     ;;
@@ -198,8 +248,8 @@ esac
 msg "Configuring systemd-coredump limits..."
 COREDUMP_CONF="/etc/systemd/coredump.conf"
 [ -f "$COREDUMP_CONF" ] || { echo "[Coredump]" > "$COREDUMP_CONF"; }
-grep -qE "^#?MaxUse=" "$COREDUMP_CONF" && \
-    sed -i 's/^#*MaxUse=.*/MaxUse=100M/' "$COREDUMP_CONF" || \
+( grep -qE "^#?MaxUse=" "$COREDUMP_CONF" && \
+    sed -i 's/^#*MaxUse=.*/MaxUse=100M/' "$COREDUMP_CONF" ) || \
     echo "MaxUse=100M" >> "$COREDUMP_CONF"
 systemctl restart systemd-coredump.socket 2>/dev/null || true
 
@@ -207,7 +257,7 @@ systemctl restart systemd-coredump.socket 2>/dev/null || true
 msg "Configuring global logrotate for shorter retention and compression..."
 if [ -f /etc/logrotate.conf ]; then
     sed -i 's/^#compress/compress/' /etc/logrotate.conf
-    grep -q "^compress" /etc/logrotate.conf || echo "compress" >> /etc/logrotate.conf
+    ( grep -q "^compress" /etc/logrotate.conf ) || echo "compress" >> /etc/logrotate.conf
     sed -i 's/^rotate 4/rotate 2/' /etc/logrotate.conf
 fi
 
@@ -225,18 +275,25 @@ ROOT_USED=$(echo "$ROOT_INFO" | awk '{print $3}')
 ROOT_FREE=$(echo "$ROOT_INFO" | awk '{print $4}')
 ROOT_PERCENT=$(echo "$ROOT_INFO" | awk '{print $5}')
 
-printf '\n%s\n' "${BLUE}=================================================================${NC}"
-printf '%s\n' "${GREEN}             DEEPCLEAN AND AUTO-PRUNE COMPLETE!${NC}"
-printf '%s\n\n' "${BLUE}=================================================================${NC}"
+printf '\n%s\n' "$(_c '1;34m' '=================================================================')"
+    printf '%s\n' "$(_c '1;32m' '             DEEPCLEAN AND AUTO-PRUNE COMPLETE!')"
+    printf '%s\n\n' "$(_c '1;34m' '=================================================================')"
+ 
+    if [ "$FREED_KB" -gt 1024000 ]; then
+        printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_GB} GB (${FREED_MB} MB)")"
+    else
+        printf 'Total Space Freed: %s\n\n' "$(_c '1;32m' "${FREED_MB} MB")"
+    fi
 
-if [ "$FREED_KB" -gt 1024000 ]; then
-    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_GB} GB${NC} (${FREED_MB} MB)"
-else
-    printf 'Total Space Freed: %s\n\n' "${GREEN}${FREED_MB} MB${NC}"
-fi
+    printf 'Current Disk (%s):\n' "$(_c '1;36m' "$ROOT_FS")"
+    printf '  Total : %s\n' "$(_c '1;34m' "$ROOT_TOTAL")"
+    printf '  Used  : %s (%s)\n' "$(_c '1;34m' "$ROOT_USED")" "$ROOT_PERCENT"
+    printf '  Free  : %s\n\n' "$(_c '1;32m' "$ROOT_FREE")"
 
-printf 'Current Disk (%s):\n' "${CYAN}${ROOT_FS}${NC}"
-printf '  Total : %s\n' "${BLUE}${ROOT_TOTAL}${NC}"
-printf '  Used  : %s (%s)\n' "${BLUE}${ROOT_USED}${NC}" "$ROOT_PERCENT"
-printf '  Free  : %s\n\n' "${GREEN}${ROOT_FREE}${NC}"
-exit 0
+    printf 'Retained limits (these persist across reboots):\n'
+    if [ -f "$JOURNALD_DROPIN" ]; then
+        printf '  journald : %s\n' "$(_c '1;36m' "$JOURNALD_DROPIN")"
+    fi
+    if [ "$PM" = "apt" ] && [ -f /etc/apt/apt.conf.d/99-auto-clean ]; then
+        printf '  apt cache: %s\n' "$(_c '1;36m' "/etc/apt/apt.conf.d/99-auto-clean")"
+    fi

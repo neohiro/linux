@@ -32,7 +32,7 @@ trap 'rm -rf "$WD"' EXIT
 make_tput() {
   local mode="$1"
   cat > "$WD/tput" <<EOF
-#!/usr/bin/env bash
+#!/bin/bash
 case "\$1" in
   colors) echo "$mode"; exit 0 ;;
   *) echo "" 1>&2; exit 1 ;;
@@ -45,27 +45,37 @@ EOF
 #   natural   - tests what the gate decides based on actual -t 1
 #   force-tty - sets FORCE_TTY=1 to bypass the TTY check (for CI/non-TTY)
 # Both modes emit: USE_COLOR=<n>\nOUT=<bytes>
+# The host TERM (GitHub runners export TERM=dumb for non-interactive steps).
+HOST_TERM="${TERM:-dumb}"
+
 run_gate() {
   local mode="natural"
   for arg in "$@"; do
     [ "$arg" = "force-tty" ] && mode="force-tty"
   done
   (
+    # Each case starts from the host TERM unless it overrides it, so an
+    # explicit term= in one case does not bleed into the next.
+    export TERM="${HOST_TERM:-dumb}"
     for kv in "$@"; do
       case "$kv" in
         force-tty) ;;
+        term=*)      export TERM="${kv#term=}" ;;
         tput=missing) rm -f "$WD/tput" ;;
         tput=*)       make_tput "${kv#tput=}" ;;
         unset=*)      unset "${kv#unset=}" ;;
         *)            eval "export $kv" ;;  # SC2163: must use eval to set the named var
       esac
     done
+    # Must be exported: _apply_color_gate runs inside $( ), a subshell, and a
+    # subshell only inherits exported variables. A bare assignment here left the
+    # stub invisible to the gate, so it fell through to the host tput.
     if [ -x "$WD/tput" ]; then
-      PATH="$WD:/usr/bin:/bin"
+      export PATH="$WD:/usr/bin:/bin"
     else
       # Use only the test scratch dir; exclude all system tput paths.
       # On Git-Bash/Cygwin, /bin and /usr/bin both contain tput.
-      PATH="$WD"
+      export PATH="$WD"
     fi
     if [ "$mode" = "force-tty" ]; then
       export FORCE_TTY=1
@@ -119,7 +129,7 @@ out="$(run_gate NO_COLOR=1)"
 assert_use_color "NO_COLOR=1 disables color" 0 "$out"
 assert_out     "NO_COLOR=1 emits plain text" "sample" "$out"
 
-out="$(run_gate NO_COLOR=0 tput=256 force-tty)"
+out="$(run_gate NO_COLOR=0 tput=256 force-tty term=xterm-256color)"
 assert_use_color "NO_COLOR=0 does NOT disable (XDG: empty non-zero means 'do not disable')" 1 "$out"
 assert_out     "NO_COLOR=0 allows gate to proceed" "$ANSI_GREEN_SAMPLE" "$out"
 
@@ -127,30 +137,30 @@ out="$(run_gate "TERM=dumb")"
 assert_use_color "TERM=dumb disables color" 0 "$out"
 assert_out     "TERM=dumb emits plain text" "sample" "$out"
 
-out="$(run_gate tput=0 force-tty)"
+out="$(run_gate tput=0 force-tty term=xterm-256color)"
 assert_use_color "tput=0 (broken terminfo) disables color" 0 "$out"
 assert_out     "tput=0 emits plain text" "sample" "$out"
 
-out="$(run_gate tput=7 force-tty)"
+out="$(run_gate tput=7 force-tty term=xterm-256color)"
 assert_use_color "tput=7 (monochrome) disables color" 0 "$out"
 assert_out     "tput=7 emits plain text" "sample" "$out"
 
-out="$(run_gate tput=missing force-tty)"
+out="$(run_gate tput=missing force-tty term=xterm-256color)"
 assert_use_color "tput missing disables color" 0 "$out"
 assert_out     "tput-missing emits plain text" "sample" "$out"
 
 # --- Open-gate tests (USE_COLOR=1) ---
 # These require FORCE_TTY=1 on non-TTY platforms.
 
-out="$(run_gate tput=8 force-tty)"
+out="$(run_gate tput=8 force-tty term=xterm-256color)"
 assert_use_color "tput=8 (8-color) enables color" 1 "$out"
 assert_out     "tput=8 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
-out="$(run_gate tput=256 force-tty)"
+out="$(run_gate tput=256 force-tty term=xterm-256color)"
 assert_use_color "tput=256 enables color" 1 "$out"
 assert_out     "tput=256 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
-out="$(run_gate tput=16777216 force-tty)"  # truecolor
+out="$(run_gate tput=16777216 force-tty term=xterm-256color)"  # truecolor
 assert_use_color "tput=truecolor (16M) enables color" 1 "$out"
 assert_out     "tput=truecolor emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
@@ -160,7 +170,7 @@ out="$(run_gate NEOHIRO_COLOR=1 NO_COLOR=1 "TERM=dumb")"
 assert_use_color "NEOHIRO_COLOR=1 overrides NO_COLOR+TERM=dumb" 1 "$out"
 assert_out     "NEOHIRO_COLOR=1 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
-out="$(run_gate NEOHIRO_COLOR=0 tput=256 force-tty)"
+out="$(run_gate NEOHIRO_COLOR=0 tput=256 force-tty term=xterm-256color)"
 assert_use_color "NEOHIRO_COLOR=0 overrides tput=256" 0 "$out"
 assert_out     "NEOHIRO_COLOR=0 emits plain text" "sample" "$out"
 
@@ -172,13 +182,23 @@ out="$(run_gate NEOHIRO_COLOR=0)"
 assert_use_color "NEOHIRO_COLOR=0 forces off (redundant with non-TTY)" 0 "$out"
 assert_out     "NEOHIRO_COLOR=0 emits plain text" "sample" "$out"
 
+# NEOHIRO_COLOR=garbage (any value other than "0" or "1") must fall through
+# to the other gates — not silently treat as "on".  A bug that interprets
+# "2" or "garbage" as truthy would cause colors to leak in unexpected places.
+out="$(run_gate NEOHIRO_COLOR=garbage tput=256 force-tty term=xterm-256color)"
+assert_use_color "NEOHIRO_COLOR=garbage (not 0/1) falls through" 1 "$out"
+assert_out     "NEOHIRO_COLOR=garbage emits CSI when tput supports" "$ANSI_GREEN_SAMPLE" "$out"
+
+out="$(run_gate NEOHIRO_COLOR=garbage "TERM=dumb")"
+assert_use_color "NEOHIRO_COLOR=garbage + TERM=dumb -> gate closed" 0 "$out"
+
 # FORCE_TTY=1: -t 1 is bypassed
-out="$(run_gate tput=256 force-tty)"
+out="$(run_gate tput=256 force-tty term=xterm-256color)"
 assert_use_color "FORCE_TTY=1 bypasses -t 1 check" 1 "$out"
 assert_out     "FORCE_TTY=1 + tput=256 emits CSI" "$ANSI_GREEN_SAMPLE" "$out"
 
 # FORCE_TTY=1 but NO_COLOR still wins
-out="$(run_gate tput=256 force-tty NO_COLOR=1)"
+out="$(run_gate tput=256 force-tty term=xterm-256color NO_COLOR=1)"
 assert_use_color "FORCE_TTY=1 + NO_COLOR=1 -> NO_COLOR wins" 0 "$out"
 assert_out     "FORCE_TTY=1 + NO_COLOR=1 emits plain" "sample" "$out"
 
@@ -210,8 +230,11 @@ fi
 
 res="$(
   make_tput 256
-  PATH="$WD:/usr/bin:/bin"
+  export PATH="$WD:/usr/bin:/bin"
   export FORCE_TTY=1
+  # The runner exports TERM=dumb; this case asserts the gate opens, so pin a
+  # real TERM or it closes before reaching the tput probe.
+  export TERM=xterm-256color
   # shellcheck disable=SC1090
   . "$LIB"; first=$USE_COLOR
   # shellcheck disable=SC1090
@@ -247,7 +270,7 @@ fi
 
 # --- Defensive: tput emits garbage (non-numeric) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "garbage-output-not-a-number"
 exit 0
 EOF
@@ -258,7 +281,7 @@ assert_out     "tput-garbage emits plain text" "sample" "$out"
 
 # --- Defensive: tput emits negative number (broken terminfo) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "-1"
 exit 0
 EOF
@@ -269,7 +292,7 @@ assert_out     "tput=-1 emits plain text" "sample" "$out"
 
 # --- Defensive: tput reports +9 (leading-plus; some terminfo has this) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "+9"
 exit 0
 EOF
@@ -282,18 +305,18 @@ assert_use_color "tput=+9 (leading plus) -> USE_COLOR=0 (case guard)" 0 "$out"
 
 # --- Defensive: tput reports exactly 8 (threshold boundary) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "8"
 exit 0
 EOF
 chmod +x "$WD/tput"
-out="$(PATH="$WD:/usr/bin:/bin" FORCE_TTY=1 . "$LIB" && printf 'USE_COLOR=%s\nOUT=' "$USE_COLOR" && _c '1;32m' 'sample' && printf '\n')"
+out="$(PATH="$WD:/usr/bin:/bin" FORCE_TTY=1 TERM=xterm-256color . "$LIB" && printf 'USE_COLOR=%s\nOUT=' "$USE_COLOR" && _c '1;32m' 'sample' && printf '\n')"
 assert_use_color "tput=8 (threshold boundary) -> USE_COLOR=1" 1 "$out"
 assert_out     "tput=8 emits CSI escapes" "$ANSI_GREEN_SAMPLE" "$out"
 
 # --- Defensive: tput reports exactly 7 (just below threshold) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "7"
 exit 0
 EOF
@@ -303,7 +326,7 @@ assert_use_color "tput=7 (just below threshold) -> USE_COLOR=0" 0 "$out"
 
 # --- Defensive: tput reports 0x10 (hex, bash arithmetic would 0 it) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "0x10"
 exit 0
 EOF
@@ -313,7 +336,7 @@ assert_use_color "tput=0x10 (hex notation) -> USE_COLOR=0 (case guard)" 0 "$out"
 
 # --- Defensive: tput reports very large number (bash arithmetic overflow) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "99999999999999999999"
 exit 0
 EOF
@@ -327,7 +350,7 @@ assert_use_color "tput=overflowing (huge number) -> USE_COLOR=0 (bash parse erro
 
 # --- Defensive: tput reports trailing whitespace (some terminfo does this) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo "  256  "
 exit 0
 EOF
@@ -381,7 +404,7 @@ fi
 
 # --- Defensive: tput exits nonzero with empty output ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo ""
 exit 1
 EOF
@@ -392,7 +415,7 @@ assert_out     "tput-fail emits plain text" "sample" "$out"
 
 # --- Defensive: tput prints just a newline (whitespace only) ---
 cat > "$WD/tput" <<'EOF'
-#!/usr/bin/env bash
+#!/bin/bash
 echo ""
 exit 0
 EOF

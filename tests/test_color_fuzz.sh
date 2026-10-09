@@ -30,32 +30,50 @@ N="${1:-500}"
 WD="$(mktemp -d)"
 trap 'rm -rf "$WD"' EXIT
 
-# The tput shim is recreated (and chmodded) on every iteration below;
-# the version here serves as a valid default so the file exists before
-# the first iteration's cat-overwrite.
-cat > "$WD/tput" <<'TPUT'
-#!/usr/bin/env bash
-printf '%s\n' "${1:?}"
-TPUT
-chmod +x "$WD/tput"
+# Validate N is a non-negative integer.  Without this check, `seq 1 abc`
+# would error out and the user gets a confusing bash traceback instead of
+# a clear "usage" message.
+if ! [[ "$N" =~ ^[0-9]+$ ]]; then
+  echo "usage: bash $0 [N]  (N must be a non-negative integer; got '$N')" >&2
+  exit 2
+fi
 
-# Sample "interesting" tput output values including pathological cases.
-TPUT_VALUES=(
-  "0"        # monochrome / broken terminfo
-  "1"        # 1-color
-  "7"        # 7-color (just below threshold)
-  "8"        # exactly at threshold
-  "16"
-  "256"
-  "16777216" # truecolor
-  ""         # empty
-  "-1"       # negative
-  "garbage"  # non-numeric
-  "0x10"     # hex (pathological)
-  "8.5"      # float (pathological)
-  "99999999999999999999" # overflow
-  "  256  "  # whitespace padded
-)
+# NEOCOLOR_TURBO=1 uses a minimal 8-value tput space for fast smoke runs.
+# Matches the HEARTBEAT_TURBO convention in AGENTS.md.
+if [ "${NEOCOLOR_TURBO:-0}" = "1" ]; then
+  TPUT_VALUES=(
+    "0"       # monochrome
+    "8"       # threshold boundary
+    "256"     # 256-color
+    "-1"      # negative
+    "garbage" # non-numeric
+    "0x10"   # hex
+    "  256  " # whitespace
+    "99999999999999999999" # overflow
+  )
+  TURBO_MODE=1
+  echo "Running $N fuzz iterations (TURBO mode, 8-value tput space)"
+else
+  # Full pathological tput space — 13 values covering every edge case.
+  TPUT_VALUES=(
+    "0"        # monochrome / broken terminfo
+    "1"        # 1-color
+    "7"        # 7-color (just below threshold)
+    "8"        # exactly at threshold
+    "16"
+    "256"
+    "16777216" # truecolor
+    ""         # empty
+    "-1"       # negative
+    "garbage"  # non-numeric
+    "0x10"    # hex (pathological)
+    "8.5"     # float (pathological)
+    "99999999999999999999" # overflow (bash parse error -> safe)
+    "  256  " # whitespace padded
+  )
+  TURBO_MODE=0
+  echo "Running $N fuzz iterations against $GATE_LIB"
+fi
 
 # Sample TERM values.
 TERM_VALUES=(
@@ -78,8 +96,6 @@ random_choice() {
   local -a arr=("$@")
   echo "${arr[$((RANDOM % ${#arr[@]}))]}"
 }
-
-echo "Running $N fuzz iterations against $GATE_LIB"
 
 for i in $(seq 1 "$N"); do
   TERM_CHOICE="$(random_choice "${TERM_VALUES[@]}")"
@@ -144,8 +160,13 @@ done
 
 echo
 if [ "$FAIL" -eq 0 ]; then
-  printf '%sAll %d fuzz iteration(s) passed (%d invariant checks).%s\n' \
-    "$C_GRN" "$N" "$PASS" "$C_RST"; exit 0
+  if [ "${TURBO_MODE:-0}" -eq 1 ]; then
+    tag=" [TURBO]"
+  else
+    tag=""
+  fi
+  printf '%sAll %d fuzz iteration(s) passed (%d invariant checks).%s%s\n' \
+    "$C_GRN" "$N" "$PASS" "$C_RST" "$tag"; exit 0
 else
   printf '%s%d of %d fuzz iterations failed.%s\n' \
     "$C_RED" "$FAIL" "$N" "$C_RST"; exit 1

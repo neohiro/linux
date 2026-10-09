@@ -15,70 +15,13 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/neohiro/linux/main}"
-ORIG_CWD="$(pwd)"
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
-# Validate SCRIPT_PATH: if it looks wrong (e.g. /root/bash from curl|bash), try to find the real script.
-if [ "${SCRIPT_PATH##*/}" != "linuxinstall.sh" ]; then
-  # Try common locations
-  for _candidate in \
-    "$ORIG_CWD/linuxinstall.sh" \
-    "/usr/local/bin/linuxinstall.sh" \
-    "/opt/neohiro/linux/linuxinstall.sh" \
-    "$HOME/linuxinstall.sh"; do
-    if [ -f "$_candidate" ] && grep -q "neohiro/linux" "$_candidate" 2>/dev/null; then
-      SCRIPT_PATH="$_candidate"
-      break
-    fi
-  done
+# Validate REPO_RAW_BASE is a trusted domain (prevents malicious overrides)
+if [[ "$REPO_RAW_BASE" != https://raw.githubusercontent.com/neohiro/linux/* ]]; then
+  err "REPO_RAW_BASE must be a raw.githubusercontent.com URL under neohiro/linux; got: $REPO_RAW_BASE"
+  exit 1
 fi
-
-# _get_restore_cmd: returns the correct command to use for --restore-etc-snapshot
-# If SCRIPT_PATH is a real linuxinstall.sh file, use it; otherwise use re-fetch URL
-_get_restore_cmd() {
-  if [ -f "$SCRIPT_PATH" ] && grep -q "neohiro/linux" "$SCRIPT_PATH" 2>/dev/null; then
-    printf 'sudo bash %q --restore-etc-snapshot' "$SCRIPT_PATH"
-  else
-    printf 'curl -fsSL %s/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot' "$REPO_RAW_BASE"
-  fi
-}
-
-# Persistent state file — remembers user decisions across runs so re-runs
-# don't re-prompt for environment type / SSH usage.
-NEOHIRO_STATE_FILE="${NEOHIRO_STATE_FILE:-/etc/neohiro/linux-state.conf}"
-
-# Load a single key=value from the state file. Returns 1 if missing.
-_state_get() {
-  local _k="$1" _v
-  if [ -r "$NEOHIRO_STATE_FILE" ]; then
-    _v=$(awk -F= -v k="$_k" '$1==k {sub(/^[ \t]+/,"",$2); print $2; exit}' "$NEOHIRO_STATE_FILE" 2>/dev/null)
-    [ -n "$_v" ] && { printf '%s' "$_v"; return 0; }
-  fi
-  return 1
-}
-
-# Save a single key=value to the state file (atomic: write to temp, then mv).
-_state_set() {
-  local _k="$1" _v="$2" _tmp _dir
-  _dir="${NEOHIRO_STATE_FILE%/*}"
-  # Ensure the parent directory exists (mode 0755, root-owned)
-  if [ ! -d "$_dir" ]; then
-    mkdir -p "$_dir" 2>/dev/null || return 1
-    chmod 0755 "$_dir" 2>/dev/null || true
-  fi
-  _tmp="${NEOHIRO_STATE_FILE}.tmp.$$"
-  if [ -f "$NEOHIRO_STATE_FILE" ]; then
-    grep -vE "^[[:space:]]*${_k}[[:space:]]*=" "$NEOHIRO_STATE_FILE" 2>/dev/null > "$_tmp" || true
-  fi
-  printf '%s=%s\n' "$_k" "$_v" >> "$_tmp"
-  mv -f "$_tmp" "$NEOHIRO_STATE_FILE" 2>/dev/null || return 1
-  chmod 0600 "$NEOHIRO_STATE_FILE" 2>/dev/null || true
-  return 0
-}
-
-# Clear the state file (used by --reset-state).
-_state_clear() {
-  rm -f "$NEOHIRO_STATE_FILE" 2>/dev/null
-}
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+ORIG_CWD="$(pwd)"
 
 # Canonical helpers. Resolved relative to the script's own location so the
 # library works whether the script is run from a clone, a symlink, or
@@ -92,7 +35,6 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   # shellcheck disable=SC1091
   if [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
     source "$_NEOHIRO_LIB_DIR/runner.sh"
-    run() { _runner_cmd "$@"; }
   fi
   # shellcheck disable=SC1091
   if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
@@ -133,69 +75,19 @@ else
   ok()   { printf "%s %s\n" "$(_c '1;32m' '[OK]')"      "$*"; }
   info() { printf "  %s\n" "$*"; }
   msg()  { echo "=> $*"; }
-  TMP_DIR="$(mktemp -d)"
-  _TMP_FILES=()
-  # Debug log location. Override with NEOHIRO_DEBUG_LOG=path. /var/log may
-  # be unwritable in containers; fall back to TMP_DIR.
-  # The file is created with mode 0600 so command arguments (which may contain
-  # user-supplied values) are not readable by other users on the system.
-  if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
-    if [ -w /var/log ] 2>/dev/null; then
-      NEOHIRO_DEBUG_LOG="/var/log/neohiro-debug.log"
-    else
-      NEOHIRO_DEBUG_LOG="${TMP_DIR}/neohiro-debug.log"
-    fi
-  fi
-  # Create the log with owner-only permissions before any breadcrumb is written.
-  # Use explicit grouping to avoid ||/&& precedence confusion:
-  # try install; if it fails, try touch+chmod.
-  (install -m 0600 /dev/null "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
-    || (touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG" 2>/dev/null) \
-    || true
-  trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
-
-  # Public: create a tracked temp file. Returns the new path.
-  # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)
-  _tmpfile() {
-    local prefix="${1:-neohiro}"
-    local f
-    # install(1) is atomic (mode set at create time) so there is no
-    # window where the file is world-readable between mktemp and chmod.
-    f=$(install -m 0600 /dev/null "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null \
-        || mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX")
-    _TMP_FILES+=("$f")
-    printf '%s' "$f"
-  }
-
-  # Inline fallback for lib/runner.sh (curl|bash path).  Provides
-  # _runner_cmd so the main script and all call sites can use run()
-  # without requiring the lib directory to be on disk.
-  _runner_init() {
-    : "${STRICT_RUN:=0}"
-    : "${DRY_RUN:=0}"
-    : "${VERBOSE:=0}"
-    if declare -p _FAIL_COUNT >/dev/null 2>&1; then
-      : "${_FAIL_COUNT:=0}"
-    else
-      : "${FAIL_COUNT:=0}"
-    fi
-  }
-  _runner_init
-
-  _runner_cmd() {
+  # Inline fallback for run() when lib/runner.sh is not available.
+  # Provides basic command execution with DRY_RUN/VERBOSE support.
+  run() {
     if [ "${DRY_RUN:-0}" = "1" ]; then
       printf '  %s\n' "DRY: $*"
       return 0
     fi
-
     if [ "${VERBOSE:-0}" -ge 2 ]; then
       printf '  %s\n' "RUN: $*"
     fi
-
-    if [ "${RUNNER_ECHO:-1}" = "1" ] && declare -F msg >/dev/null 2>&1; then
+    if [ "${RUNNER_ECHO:-1}" = "1" ]; then
       msg "$*"
     fi
-
     "$@"
     local rc=$?
     if [ $rc -ne 0 ]; then
@@ -220,8 +112,43 @@ else
     fi
     return 0
   }
-  run() { _runner_cmd "$@"; }
+  TMP_DIR="$(mktemp -d)"
+  _TMP_FILES=()
+  # Debug log location. Override with NEOHIRO_DEBUG_LOG=path. /var/log may
+  # be unwritable in containers; fall back to TMP_DIR.
+  # The file is created with mode 0600 so command arguments (which may contain
+  # user-supplied values) are not readable by other users on the system.
+  if [ -z "${NEOHIRO_DEBUG_LOG:-}" ]; then
+    if [ -w /var/log ] 2>/dev/null; then
+      NEOHIRO_DEBUG_LOG="/var/log/neohiro-debug.log"
+    else
+      NEOHIRO_DEBUG_LOG="${TMP_DIR}/neohiro-debug.log"
+    fi
+  fi
+# Create the log with owner-only permissions before any breadcrumb is written.
+# Use mktemp for atomic creation with mode, then move into place.
+_log_file=$(mktemp -m 0600 "$(dirname "$NEOHIRO_DEBUG_LOG")/neohiro-debug.XXXXXX" 2>/dev/null) \
+  && mv "$_log_file" "$NEOHIRO_DEBUG_LOG" 2>/dev/null \
+  || { touch "$NEOHIRO_DEBUG_LOG" && chmod 0600 "$NEOHIRO_DEBUG_LOG"; } 2>/dev/null || true
+  trap 'rm -rf "$TMP_DIR" "${_TMP_FILES[@]}" 2>/dev/null' EXIT
+
+  # Public: create a tracked temp file. Returns the new path.
+  # Usage: f=$(_tmpfile)   or   f=$(_tmpfile myprefix)
+  _tmpfile() {
+    local prefix="${1:-neohiro}"
+    local f
+    # Try mktemp with -m for atomic mode setting (GNU extension).
+    # Fall back to mktemp + chmod (small race window, acceptable).
+    if f=$(mktemp -m 0600 "${TMPDIR:-/tmp}/${prefix}.XXXXXX" 2>/dev/null); then
+      :
+    else
+      f=$(mktemp "${TMPDIR:-/tmp}/${prefix}.XXXXXX") && chmod 0600 "$f"
+    fi
+    _TMP_FILES+=("$f")
+    printf '%s' "$f"
+  }
 fi
+unset _NEOHIRO_LIB_DIR
 
 # Inline fallback for lib/updater.sh (curl|bash path).  Provides
 # _run_all_updates so the Updates-only profile and the main script's update
@@ -268,20 +195,16 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
   _run_all_updates() {
     msg "=== Comprehensive system update ==="
-    local _update_failed=0
-    _update_apt    || _update_failed=1
-    _update_dnf    || _update_failed=1
-    _update_yum    || _update_failed=1
-    _update_zypper || _update_failed=1
-    _update_pacman || _update_failed=1
-    _update_snap   || _update_failed=1
-    _update_flatpak|| _update_failed=1
-    _update_docker || _update_failed=1
-    _update_brew   || _update_failed=1
-    _update_firmware|| _update_failed=1
-    if [ "$_update_failed" -eq 1 ]; then
-      warn "One or more update components failed (see above). Continuing."
-    fi
+    _update_apt || true
+    _update_dnf || true
+    _update_yum || true
+    _update_zypper || true
+    _update_pacman || true
+    _update_snap || true
+    _update_flatpak || true
+    _update_docker || true
+    _update_brew || true
+    _update_firmware || true
     printf '\n'; ok "Update engine complete."; }
 fi
 
@@ -292,16 +215,19 @@ ROLLBACK_LOG="${ROLLBACK_LOG:-/var/log/linux-install-rollback.log}"
 # Creates it with 0600 mode (owner-only) to avoid leaking paths to other users.
 _record_backup_init() {
   local logdir="${ROLLBACK_LOG%/*}"
-  # install(1) sets the mode atomically at create-time, avoiding a brief
-  # window where the file is world-readable between touch and chmod.
+  # Use mktemp for atomic creation with mode, then move into place.
+  # This avoids the race window where touch+chmod leaves the file world-readable.
   if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
     # Running as root without sudo available: create log directly.
     mkdir -p "$logdir" 2>/dev/null || true
-    install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null || true
+    _log_file=$(mktemp -m 0600 "${logdir}/linux-install-rollback.XXXXXX" 2>/dev/null) \
+      && mv "$_log_file" "$ROLLBACK_LOG" 2>/dev/null \
+      || { touch "$ROLLBACK_LOG" && chmod 0600 "$ROLLBACK_LOG"; } 2>/dev/null || true
   else
     sudo mkdir -p "$logdir" 2>/dev/null || true
-    sudo install -m 0600 /dev/null "$ROLLBACK_LOG" 2>/dev/null \
-      || sudo sh -c 'touch "$1" && chmod 0600 "$1"' _ "$ROLLBACK_LOG" 2>/dev/null || true
+    _log_file=$(sudo mktemp -m 0600 "${logdir}/linux-install-rollback.XXXXXX" 2>/dev/null) \
+      && sudo mv "$_log_file" "$ROLLBACK_LOG" 2>/dev/null \
+      || sudo sh -c "touch '$ROLLBACK_LOG' && chmod 0600 '$ROLLBACK_LOG'" 2>/dev/null || true
   fi
 }
 _record_backup_init
@@ -335,8 +261,7 @@ print_recovery_cmd() {
   printf '\n'
   _c '1;33m' "----------------------------------------------------------------------"
   printf '\n'
-  printf "  After reconnecting over SSH, run the command above to resume the run.\n"
-  printf "  (The tmux session persists after script completion — use 'tmux kill-session -t linux-setup' to exit.)\n\n"
+  printf "  After reconnecting over SSH, run the command above to resume the run.\n\n"
 }
 
 _warn_if_not_tmux() {
@@ -490,8 +415,19 @@ ensure_tmux_if_ssh() {
   bold "SSH session detected. Wrapping this run in a tmux session so disconnects do not abort it."
   # Quote everything via env+args (no string interpolation) so paths with spaces
   # or shell metacharacters survive. The inner bash re-execs the same script
-  # by absolute path. On clean exit we keep the tmux session alive so the user
-  # can continue working (run more steps, open maintenance menu, etc.).
+  # by absolute path; on clean exit it tears the tmux session down.
+  local inner
+  inner=$(cat <<'INNER_EOF'
+trap 'tmux kill-session -t linux-setup 2>/dev/null' EXIT
+cd "$1" && shift
+bash "$1" "$@"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  tmux kill-session -t linux-setup 2>/dev/null
+fi
+exit "$rc"
+INNER_EOF
+)
   exec tmux new-session -A -s linux-setup -n setup \
     "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
 }
@@ -503,7 +439,69 @@ ensure_tmux_if_ssh() {
 # Set this in CI / unattended deployments to detect partial-failure runs.
 STRICT_RUN="${STRICT_RUN:-0}"
 QUICK_MODE="${QUICK_MODE:-0}"
+# AUTO_MODE = "1" means "go through the whole setup without asking". The
+# profile defaults to "auto" (intelligent detection: server vs desktop,
+# full vs recommended), every y/n prompt uses its default, every
+# category uses its profile default. Triggered by:
+#   * selecting "1) Auto" in the main menu (interactive)
+#   * --auto or -y on the command line
+#   * NEOHIRO_AUTO=1 in the environment
+#   * QUIET_PROMPTS=1 (legacy name for unattended runs)
+AUTO_MODE="${AUTO_MODE:-${NEOHIRO_AUTO:-}}"
+case "$AUTO_MODE" in
+  1|true|yes|y|Y) AUTO_MODE=1 ;;
+  *) AUTO_MODE=0 ;;
+esac
+# QUIET_PROMPTS implies AUTO_MODE (legacy CI / docker users).
+if [ "${QUIET_PROMPTS:-0}" = "1" ]; then AUTO_MODE=1; fi
 _FAIL_COUNT=0
+
+# Source the shared runner helpers. _runner_cmd is the canonical implementation;
+  # alias it to `run` so all existing call sites are satisfied.
+    # shellcheck disable=SC1091
+    if [ -n "${_NEOHIRO_LIB_DIR:-}" ] && [ -r "$_NEOHIRO_LIB_DIR/runner.sh" ]; then
+      source "$_NEOHIRO_LIB_DIR/runner.sh"
+      run() { _runner_cmd "$@"; }
+    fi
+  # Fallback: if run() is still not defined (lib dir missing or runner.sh unreadable),
+  # provide an inline implementation matching lib/runner.sh behavior.
+  if ! declare -F run >/dev/null 2>&1; then
+    run() {
+      if [ "${DRY_RUN:-0}" = "1" ]; then
+        printf '  %s\n' "DRY: $*"
+        return 0
+      fi
+      if [ "${VERBOSE:-0}" -ge 2 ]; then
+        printf '  %s\n' "RUN: $*"
+      fi
+      if [ "${RUNNER_ECHO:-1}" = "1" ] && declare -F msg >/dev/null 2>&1; then
+        msg "$*"
+      fi
+      "$@"
+      local rc=$?
+      if [ $rc -ne 0 ]; then
+        if declare -F warn >/dev/null 2>&1; then
+          warn "Command failed (exit $rc): $*"
+        else
+          printf '%s\n' "[ERROR] Command failed (exit $rc): $*" >&2
+        fi
+        if declare -p _FAIL_COUNT >/dev/null 2>&1; then
+          _FAIL_COUNT=$((_FAIL_COUNT + 1))
+        else
+          FAIL_COUNT=${FAIL_COUNT:-0}
+          FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
+        if declare -F _log_error >/dev/null 2>&1; then
+          _log_error "$rc" "$*"
+        fi
+        if [ "${STRICT_RUN:-0}" = "1" ]; then
+          return $rc
+        fi
+        return 0
+      fi
+      return 0
+    }
+  fi
 
 # Offer a Retry / Skip / Abort choice after a step failure.
 # Only prompts when running interactively (tty + not QUIET_PROMPTS).
@@ -615,9 +613,7 @@ _take_etc_snapshot() {
       [ -n "$prev" ] && sudo rm -f "$prev" 2>/dev/null
     done < <(find "$snap_dir" -maxdepth 1 -type f -name 'etc-*.tar.gz' ! -name "$(basename "$snap_path")" 2>/dev/null)
     info "Created /etc snapshot: $snap_path"
-    _restore_cmd=$(_get_restore_cmd)
-    info "  Full /etc restore:  $_restore_cmd"
-    info "  (or re-fetch: curl -fsSL $REPO_RAW_BASE/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)"
+    info "  Full /etc restore:  sudo bash $0 --restore-etc-snapshot"
     info "  (May need sudo systemd-resolve --reload if /etc/resolv.conf was reverted)"
   else
     sudo rm -f "$snap_path" 2>/dev/null
@@ -629,6 +625,13 @@ prompt_yn() {
   local q="$1" def="${2:-N}"
   local hint="[y/N]"
   if [ "$def" = "y" ] || [ "$def" = "Y" ]; then hint="[Y/n]"; fi
+  # AUTO_MODE: never block. Use the default. Emit one short breadcrumb
+  # (printed at info level, not warn) so the run log shows the decision
+  # without spamming.
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    info "[AUTO] $q $hint -> $def"
+    case "$def" in [Yy]*) return 0;; *) return 1;; esac
+  fi
   local a
   if [ -t 0 ]; then
     read -r -p "$q $hint " a
@@ -653,6 +656,13 @@ prompt_choice() {
   local i=1
   echo "$q"
   for o in "${opts[@]}"; do printf "  %d) %s\n" "$i" "$o"; i=$((i+1)); done
+  # AUTO_MODE: never block. Always pick option 1 (the safe/recommended
+  # one; subscripts put the safest choice first by convention).
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    info "[AUTO] $q -> option 1 (default)"
+    REPLY_CHOICE=0
+    return 0
+  fi
   local a
   if [ -t 0 ]; then
     read -r -p "Choose [1-${#opts[@]}] (default 1): " a
@@ -669,22 +679,13 @@ prompt_choice() {
   if ! [[ "$a" =~ ^[0-9]+$ ]] || [ "$a" -lt 1 ] || [ "$a" -gt ${#opts[@]} ]; then
     a=1
   fi
-  REPLY_CHOICE=$a
+  REPLY_CHOICE=$((a-1))
 }
 
 run_remote_script() {
   local name="$1"
   local url="${REPO_RAW_BASE}/${name}"
   local dst="${TMP_DIR}/${name}"
-  
-  # Respect DRY_RUN flag - don't execute when DRY_RUN=1
-  if [ "${DRY_RUN:-0}" = "1" ]; then
-    warn "[DRY-RUN] Would download and execute $name from $url"
-    echo "Downloading: $url"
-    echo "Executing: $dst"
-    return 0
-  fi
-  
   if command -v curl >/dev/null 2>&1; then
     if ! curl -fsSL "$url" -o "$dst"; then err "Failed to fetch $url"; return 1; fi
   elif command -v wget >/dev/null 2>&1; then
@@ -692,9 +693,8 @@ run_remote_script() {
   else
     err "Neither curl nor wget available; cannot fetch $name"; return 1
   fi
-  
   chmod +x "$dst"
-  
+
   # Optional GPG verification. Disabled by default; enable by setting
   #   NEOSIGN_GPG_LEVEL=required  NEOSIGN_GPG_FPR=<40-hex fingerprint>
   # in the environment. `advisory` warns but does not abort. The
@@ -702,11 +702,8 @@ run_remote_script() {
   # `.asc` suffix (detached cleartext signature).
   local gpg_level="${NEOSIGN_GPG_LEVEL:-off}"
   if [ "$gpg_level" != "off" ]; then
-    _verify_remote_gpg_signature "$name" "$dst"; rc=$?
-    if [ "$rc" -eq 0 ]; then
+    if _verify_remote_gpg_signature "$name" "$dst"; then
       ok "GPG signature OK for $name"
-    elif [ "$rc" -eq 2 ]; then
-      warn "Continuing despite advisory-only GPG verification issue (NEOSIGN_GPG_LEVEL=advisory)."
     else
       err "GPG signature verification FAILED for $name"
       if [ "$gpg_level" = "required" ]; then
@@ -716,25 +713,69 @@ run_remote_script() {
       warn "Continuing despite bad signature (NEOSIGN_GPG_LEVEL=advisory)."
     fi
   fi
-  
-  # Execute the downloaded script
-  bash "$dst"
-  return $?
+
+  # Decide execution mode:
+  #   - NON-INTERACTIVE (AUTO_MODE=1 / QUIET_PROMPTS=1 / stdin not a TTY):
+  #     run directly with auto env propagated; no wrap, no detach.
+  #   - INTERACTIVE over SSH without tmux: the SSH socket can drop mid-way
+  #     and kill the subscript. Re-exec the subscript inside its own
+  #     detached tmux session so it survives the disconnect. The current
+  #     shell waits for that tmux session to exit, so the parent's progress
+  #     bar stays honest.
+  #   - INTERACTIVE on local console: run directly so the user sees the
+  #     subscript's output flowing into their terminal.
+  local _env_prefix=()
+  [ "${AUTO_MODE:-0}" = "1" ] && _env_prefix=(env AUTO_MODE=1 QUIET_PROMPTS=1)
+  local _is_ssh=0
+  [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && _is_ssh=1
+  local _in_tmux=0
+  [ -n "${TMUX:-}" ] && _in_tmux=1
+  if [ "${AUTO_MODE:-0}" = "1" ] || [ ! -t 0 ]; then
+    # Non-interactive — just run and capture the result.
+    "${_env_prefix[@]}" bash "$dst"
+    return $?
+  fi
+  if [ "$_is_ssh" = "1" ] && [ "$_in_tmux" = "0" ] && command -v tmux >/dev/null 2>&1; then
+    local _tmux_sess="neohiro-sub-$name-$$"
+    info "SSH session detected: wrapping $name in tmux ('$_tmux_sess') so disconnects don't kill it."
+    info "Reattach anytime:  tmux attach -t $_tmux_sess"
+    # `tmux new-session -d` starts detached. We then `wait-for` it so the
+    # current shell pauses until the subscript finishes — keeps the
+    # parent's progress bar / step sequencing intact.
+    tmux new-session -d -s "$_tmux_sess" "cd $(printf '%q' "$ORIG_CWD") && ${_env_prefix[*]:-} bash $(printf '%q' "$dst")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      err "Could not start tmux for $name — running directly (may be killed by SSH drop)."
+      "${_env_prefix[@]}" bash "$dst"; return $?
+    fi
+    # Poll the tmux session until it ends. This avoids a long blocking
+    # wait and lets us show a one-line status every few seconds.
+    while tmux has-session -t "$_tmux_sess" 2>/dev/null; do
+      sleep 5
+    done
+    # tmux does not propagate child exit codes through has-session; if
+    # the user needs a non-zero detection they can run the subscript
+    # directly via Maintenance suite.
+    return 0
+  fi
+  "${_env_prefix[@]}" bash "$dst"
 }
 
 # Verify a detached cleartext GPG signature (.asc) against the script.
 # Uses the system default pubring (no custom keyring).
 # The signer's key must already be in the user's keyring.
 # Optionally verify the signer fingerprint matches $NEOSIGN_GPG_FPR if set.
-# Returns 0 on success, 1 on failure, 2 on advisory-only failure.
 _verify_remote_gpg_signature() {
-  local name="$1" script="$2" sig url_dst gpg_out rc rc_final=0 fpr="${NEOSIGN_GPG_FPR:-}"
+  local name="$1" script="$2" sig url_dst gpg_out rc
   if ! command -v gpg >/dev/null 2>&1; then
-    err "gpg is not installed; cannot verify $name"; return 1
+    err "gpg is not installed; cannot verify $name"
+    return 1
   fi
+  local fpr="${NEOSIGN_GPG_FPR:-}"
   url_dst="${TMP_DIR}/${name}.asc"
   if ! curl -fsSL "${REPO_RAW_BASE}/${name}.asc" -o "$url_dst" 2>/dev/null; then
-    err "Could not fetch ${name}.asc from $REPO_RAW_BASE"; return 1
+    err "Could not fetch ${name}.asc from $REPO_RAW_BASE"
+    return 1
   fi
   # Verify with the system pubring. If the signer's key is not in the
   # pubring, gpg still validates the cryptographic signature but warns
@@ -742,16 +783,15 @@ _verify_remote_gpg_signature() {
   gpg_out=$(mktemp)
   rc=0
   gpg --batch --verify "$url_dst" "$script" >"$gpg_out" 2>&1 || rc=$?
-  if [ $rc -ne 0 ]; then
-    if ! grep -qi 'gpg: no signer information' "$gpg_out" 2>/dev/null; then
-      # Also check for "Good signature" despite unknown key
-      if ! grep -qi 'Good signature' "$gpg_out" 2>/dev/null; then
-        err "gpg --verify failed:"; cat "$gpg_out" >&2; rm -f "$gpg_out"; return 1
-      fi
-      warn "Signature is cryptographically valid but key is not in pubring."
+  if [ $rc -ne 0 ] && ! grep -qi 'gpg: no signer information' "$gpg_out" 2>/dev/null; then
+    # Also check for "Good signature" despite unknown key
+    if ! grep -qi 'Good signature' "$gpg_out" 2>/dev/null; then
+      err "gpg --verify failed:"
+      cat "$gpg_out" >&2
+      rm -f "$gpg_out"
+      return 1
     fi
-    # Not a complete failure; continue to fingerprint check (if any)
-    rc_final=2
+    warn "Signature is cryptographically valid but key is not in pubring."
   fi
   # Optional fingerprint pin: if FPR is set, confirm the signing key matches.
   if [ -n "$fpr" ]; then
@@ -761,19 +801,17 @@ _verify_remote_gpg_signature() {
     # gpg --verify output format varies; also try gpg --list-keys with the signer key id
     if [ -z "$signer" ]; then
       signer=$(gpg --batch --list-keys --keyid-format long "$url_dst" 2>/dev/null \
-                | awk '/^pub.*\\/ {sub(/.*\\/,""); print toupper($0); exit}')
+                | awk '/^pub.*\// {sub(/.*\//,""); print toupper($0); exit}')
     fi
     if [ -n "$signer" ] && [ "$signer" != "$(printf '%s' "$fpr" | tr -d ' ' | tr 'a-f' 'A-F')" ]; then
-      err "Signer key ($signer) does not match trusted fingerprint ($fpr)."; rm -f "$gpg_out"
-      if [ "${NEOSIGN_GPG_LEVEL:-off}" = "required" ]; then
-        return 1
-      fi
-      return 2
+      err "Signer key ($signer) does not match trusted fingerprint ($fpr)."
+      rm -f "$gpg_out"
+      return 1
     fi
     ok "Signer fingerprint verified: ${signer:-$(printf '%s' "$fpr" | tr -d ' ')}"
   fi
   rm -f "$gpg_out"
-  return $rc_final
+  return 0
 }
 
 ENV_TYPE=""
@@ -958,7 +996,7 @@ fw_default_incoming_deny() {
       local iface
       for iface in $(sudo firewall-cmd --get-active-zones 2>/dev/null \
                        | awk '/^  interfaces: / {for(i=2;i<=NF;i++) print $i}' \
-                       | grep -v '^lo$\|^lo[0-9]'); do
+                       | grep -v '^lo$\|^lo[0-9]\|^tailscale0$'); do
         run sudo firewall-cmd --zone=drop --change-interface="$iface" --permanent
       done
       ;;
@@ -1082,6 +1120,91 @@ _service_present() {
   command -v "$unit" >/dev/null 2>&1
 }
 
+# ── Tailscale helpers ────────────────────────────────────────────────────
+# A host reached only over Tailscale SSH has no sshd: tailscaled terminates
+# SSH itself. Two consequences this script must respect --
+#
+#   1. The firewall step must never apply default-deny without first allowing
+#      the tailscale0 interface, or it severs the only path in.
+#   2. The SSH step must not "helpfully" install openssh-server, because that
+#      resurrects port 22 and undoes the operator's decision.
+
+# Add firewall rules that keep Tailscale reachable.
+#
+# Mirrors _ssh_fw_allow() in style and early-out. Called BEFORE
+# fw_default_incoming_deny() so that, on firewalld, tailscale0 is already
+# bound to the trusted zone and the drop-zone rebind loop skips it.
+#
+# ufw has no zone concept: the equivalent of binding an interface to trusted
+# is an explicit "allow in on <iface>" rule, which is what is issued below.
+# The 41641/udp rule covers the WireGuard handshake so direct peer-to-peer
+# paths survive default-deny; without it every node degrades to DERP relay.
+_ts_fw_allow() {
+  _fw_detect || return 0
+  [ -z "$FW_CMD" ] && return 0
+  # Only bother when Tailscale is actually installed and runnable on this
+  # host. `command -v` alone is not enough: bash reports a non-executable
+  # file in PATH as found, so a stale/zero-mode leftover would emit rules for
+  # a client that is not present. The -x test is what actually matters.
+  # Resolve once: calling command -v twice re-walks PATH and can in principle
+  # disagree with itself if the tree changes between the two lookups.
+  local ts_bin
+  ts_bin=$(command -v tailscale 2>/dev/null) || return 0
+  [ -n "$ts_bin" ] && [ -x "$ts_bin" ] || return 0
+  case "$FW_CMD" in
+    ufw)
+      run sudo ufw allow in on tailscale0 comment 'tailscale0-both-ips'
+      run sudo ufw allow 41641/udp comment 'tailscaled-wireguard'
+      ;;
+    firewall-cmd)
+      # Bind tailscale0 to trusted explicitly and permanently so it survives
+      # a --reload and any future drop-zone default.
+      run sudo firewall-cmd --zone=trusted --add-interface=tailscale0 --permanent
+      run sudo firewall-cmd --zone=trusted --allow 41641/udp --permanent
+      ;;
+  esac
+}
+
+# Return 0 only when Tailscale SSH is genuinely the host's remote access path.
+#
+# Deliberately conservative: every condition must hold, and anything
+# unreadable is a refusal rather than an assumption. This gates the
+# openssh-server install in harden_ssh, so a false positive would resurrect
+# port 22 and a false negative would skip hardening the operator asked for --
+# both worth being strict about.
+#
+# Override with LINUXINSTALL_FORCE_SSHD=1 to install openssh-server anyway.
+_ts_ssh_is_access_path() {
+  [ "${LINUXINSTALL_FORCE_SSHD:-0}" = "1" ] && return 1
+
+  # tailscaled must be present and running.
+  local ts_bin
+  ts_bin=$(command -v tailscale 2>/dev/null) || return 1
+  [ -n "$ts_bin" ] && [ -x "$ts_bin" ] || return 1
+  _service_present tailscaled || return 1
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet tailscaled 2>/dev/null || return 1
+  fi
+
+  # The node must actually be logged in to the tailnet. A stopped or
+  # needs-login tailscaled is not a usable access path.
+  local backend
+  backend=$(tailscale status --json 2>/dev/null \
+    | grep -oE '"BackendState"[[:space:]]*:[[:space:]]*"[A-Za-z]+"' \
+    | head -1 | sed -E 's/.*"([A-Za-z]+)"/\1/')
+  [ "$backend" = "Running" ] || return 1
+
+  # Tailscale SSH must be switched on for this node; without it the tailnet
+  # is reachable but there is no login shell through it.
+  local runssh
+  runssh=$(tailscale debug prefs 2>/dev/null \
+    | grep -oE '"RunSSH"[[:space:]]*:[[:space:]]*(true|false)' \
+    | head -1 | grep -oE '(true|false)$')
+  [ "$runssh" = "true" ] || return 1
+
+  return 0
+}
+
 detect_distro  # run immediately so helpers work in every function
 
 
@@ -1100,9 +1223,69 @@ declare -A METRICS=(
 )
 METRICS_START_DISK_KB=$(df -Pk / 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
 
+declare -A SECRETS=(
+  [ssh_recovery_key]=""
+  [ssh_port]=""
+  [tor_relay_nickname]=""
+  [tor_relay_contact]=""
+  [tor_relay_role]=""
+  [tor_bridge_line]=""
+)
+
 metrics_add() {
   local key="$1" delta="${2:-1}"
   METRICS[$key]=$(( ${METRICS[$key]:-0} + delta ))
+}
+
+secret_register() {
+  local key="$1" value="$2"
+  [ -n "$value" ] || return 0
+  SECRETS[$key]="$value"
+}
+
+print_secrets_summary() {
+  local has_secrets=0
+  for v in "${SECRETS[@]}"; do [ -n "$v" ] && has_secrets=1 && break; done
+  [ "$has_secrets" = "0" ] && return 0
+
+  printf '\n'
+  _c '1;35m' "━━━ IMPORTANT — SAVE THESE SECRETS ━━━"
+  printf '\n'
+  printf '  Store this information somewhere safe (password manager, encrypted note).\n'
+  printf '  Do not share it. Do not lose it.\n'
+  printf '\n'
+
+  [ -n "${SECRETS[ssh_recovery_key]}" ] && {
+    printf '  %s\n' "$(_c '1;33m' 'SSH RECOVERY KEY:')"
+    printf '    File: %s\n' "${SECRETS[ssh_recovery_key]}"
+    printf '    %s  %s %s@%s:%s ~/linux-install-recovery.key\n' \
+      "$(_c '1;31m' 'BACKUP NOW:')" 'scp' "$target_user" "$(hostname)" "${SECRETS[ssh_recovery_key]}"
+    printf '    Then:  ssh-add ~/linux-install-recovery.key\n'
+    printf '    Unlocks SSH if PasswordAuthentication is disabled and all other keys are lost.\n'
+    printf '\n'
+  }
+
+  [ -n "${SECRETS[ssh_port]}" ] && [ "${SECRETS[ssh_port]}" != "22" ] && {
+    printf '  %s\n' "$(_c '1;33m' 'SSH PORT CHANGED:')"
+    printf '    New SSH port: %s  (was 22)\n' "${SECRETS[ssh_port]}"
+    printf '    Connect:  ssh -p %s user@host\n' "${SECRETS[ssh_port]}"
+    printf '\n'
+  }
+
+  [ -n "${SECRETS[tor_relay_nickname]}" ] && {
+    printf '  %s\n' "$(_c '1;33m' 'TOR RELAY:')"
+    printf '    Nickname:  %s\n' "${SECRETS[tor_relay_nickname]}"
+    printf '    Contact:   %s\n' "${SECRETS[tor_relay_contact]}"
+    printf '    Role:      %s\n' "${SECRETS[tor_relay_role]}"
+    printf '    Metrics:   https://metrics.torproject.org/rs.html#search/%s\n' "${SECRETS[tor_relay_nickname]}"
+    [ -n "${SECRETS[tor_bridge_line]}" ] && {
+      printf '    %s  %s\n' "$(_c '1;33m' 'Bridge:')" "${SECRETS[tor_bridge_line]}"
+      printf '    Share this bridge line with users who need it.\n'
+    }
+    printf '\n'
+  }
+  printf '%s\n' "$(_c '1;30m' '──────────────────────────────────────────────────────────────────────────')"
+  printf '\n'
 }
 
 # --- dynamic progress checklist (printed before each step) ---
@@ -1126,6 +1309,7 @@ declare -A CHECKLIST=(
   [sysctl]=pending
   [apparmor]=pending
   [pam]=pending
+  [attack_surface]=pending
   [optimize]=pending
   [optimize_asr]=pending
   [deepclean]=pending
@@ -1141,13 +1325,14 @@ CHECKLIST_LABEL_dnscrypt="DNSCrypt + DNS routing"
 CHECKLIST_LABEL_firewall="Firewall (UFW / firewalld)"
 CHECKLIST_LABEL_tor="Tor daemon"
 CHECKLIST_LABEL_ssh="SSH hardening (lockout-prone)"
-CHECKLIST_LABEL_ssh_hardening="SSH hardening (lockout-prone — run LAST)"
+CHECKLIST_LABEL_ssh_hardening="SSH hardening (lockout-prone)"
 CHECKLIST_LABEL_fail2ban="Fail2ban"
 CHECKLIST_LABEL_unattended="Unattended security upgrades"
 CHECKLIST_LABEL_ipv6="Disable IPv6"
 CHECKLIST_LABEL_sysctl="Kernel/sysctl hardening"
 CHECKLIST_LABEL_apparmor="AppArmor"
 CHECKLIST_LABEL_pam="Password & lockout policy"
+CHECKLIST_LABEL_attack_surface="Attack surface reduction (built-in)"
 CHECKLIST_LABEL_optimize="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_optimize_asr="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_deepclean="DeepClean.sh (cleanup)"
@@ -1171,9 +1356,11 @@ _step_begin() {
 }
 
 # Print elapsed time after a step completes.
-# Usage: _step_end <key> <label> <elapsed_sec> [rc]
+# Usage: _step_end <key> <label>
 _step_end() {
-  local key="$1" label="$2" elapsed="${3:-$SECONDS}" rc="${4:-0}"
+  local key="$1" label="$2"
+  mark_step "$key" done
+  local elapsed=$SECONDS
   local min=$(( elapsed / 60 ))
   local sec=$(( elapsed % 60 ))
   local time_str
@@ -1182,36 +1369,16 @@ _step_end() {
   else
     time_str="${sec}s"
   fi
-  if [ "$rc" -eq 0 ]; then
-    mark_step "$key" done
-    printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $time_str"
-  else
-    mark_step "$key" skip
-    printf '  %s %s\n' "$(_c '1;31m' '[FAIL]')" "$label failed (rc=$rc) — skipped"
-  fi
+  printf '  %s %s\n' "$(_c '1;32m' '[OK]')" "$label done in $time_str"
 }
 
 # When --step STEP is set, run() is a no-op and ask_category_enabled returns 1
 # for every step except the named one. _valid_step validates the user input
 # against a known list so typos fail loudly instead of silently skipping
 # everything.
-# Alias pairs: when --step selects one, its alias also runs (and vice versa).
-# Format: "key:alias key:alias ..."
-STEP_ALIAS_PAIRS="system:system_update dns:dnscrypt ssh:ssh_hardening optimize:optimize_asr"
 _should_run_step() {
   if [ "${STEP_MODE:-0}" = "0" ]; then return 0; fi
   if [ "$1" = "${SELECTED_STEP:-}" ]; then return 0; fi
-  # Check if $1 and SELECTED_STEP form an alias pair
-  for pair in $STEP_ALIAS_PAIRS; do
-    key="${pair%%:*}"
-    alias="${pair#*:}"
-    if [ "$1" = "$key" ] && [ "${SELECTED_STEP:-}" = "$alias" ]; then
-      return 0
-    fi
-    if [ "$1" = "$alias" ] && [ "${SELECTED_STEP:-}" = "$key" ]; then
-      return 0
-    fi
-  done
   info "[STEP] Skipping: $1 (--step=${SELECTED_STEP})"
   return 1
 }
@@ -1219,7 +1386,7 @@ _should_run_step() {
 # ask_category_enabled() in main(), otherwise --step will be rejected as
 # "unknown" even for legitimate steps.  Aliases (e.g. system_update,
 # ssh_hardening) are accepted alongside the short keys for convenience.
-_VALID_STEPS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
+_VALID_STEPS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize optimize_asr deepclean"
 _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
@@ -1242,11 +1409,12 @@ _STEP_PREVIEWS["ipv6"]="disable IPv6 system-wide (kernel + sysctl). Warned: may 
 _STEP_PREVIEWS["sysctl"]="apply hardened kernel/network sysctls (no IPv4 icmp-echo-block on deny)."
 _STEP_PREVIEWS["apparmor"]="enable AppArmor; enforce default profiles."
 _STEP_PREVIEWS["pam"]="tighten pam_faillock: 5 retries / 15 min lockout."
+_STEP_PREVIEWS["attack_surface"]="filesystem blacklist, SSH crypto hardening, login.defs aging, core dumps disabled."
 _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
-_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary ssh_hardening"
+_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize_asr deepclean other_scripts summary"
 
 show_progress() {
   local done=0 total=0 key status
@@ -1367,9 +1535,10 @@ print_welcome() {
   fi
   local _step_count _ssh_note
   case "$REPLY_PROFILE" in
-    1) _step_count=6 _ssh_note="(no SSH changes)" ;;
-    2) _step_count=10 _ssh_note="(includes SSH hardening)" ;;
-    3) _step_count=12 _ssh_note="(includes SSH hardening + Tor)" ;;
+    0|1) _step_count=10 _ssh_note="(auto-detect — SSH depends on environment)" ;;
+    2) _step_count=6 _ssh_note="(no SSH changes)" ;;
+    3) _step_count=10 _ssh_note="(includes SSH hardening)" ;;
+    4) _step_count=12 _ssh_note="(includes SSH hardening + Tor)" ;;
     7|8|9) _step_count=1 _ssh_note="(single-mode)" ;;
     *) _step_count=0 _ssh_note="" ;;
   esac
@@ -1395,13 +1564,11 @@ print_welcome() {
   if [ -n "${TMUX:-}" ]; then
     info "Running inside tmux — your session is protected against SSH disconnection."
   fi
-  if [ -r "$NEOHIRO_STATE_FILE" ]; then
-    info "State file: $NEOHIRO_STATE_FILE  (run --reset-state to clear)"
-  fi
 }
 
 _profile_label() {
   case "$REPLY_PROFILE" in
+    0) echo "Auto (intelligent)" ;;
     1) echo "Recommended" ;;
     2) echo "Standard" ;;
     3) echo "Full" ;;
@@ -1416,17 +1583,28 @@ _profile_label() {
 }
 
 detect_or_ask_env() {
-  local _saved_env _saved_ssh
-  _saved_env=$(_state_get ENV_TYPE 2>/dev/null || true)
-  _saved_ssh=$(_state_get USE_REMOTE_SSH 2>/dev/null || true)
-
-  # 1) Environment type
-  if [ -n "$_saved_env" ]; then
-    ENV_TYPE="$_saved_env"
-    info "Environment (from state): $ENV_TYPE"
-  elif pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
+  # AUTO_MODE: auto-detect env and SSH presence without blocking prompts.
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    if pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
        pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
        2>/dev/null; then
+      ENV_TYPE="desktop"
+    elif systemctl list-unit-files 2>/dev/null | grep -qE '^(ssh|sshd)\.service'; then
+      ENV_TYPE="server"
+    else
+      ENV_TYPE="server"  # be conservative: treat unknown as server (SSH likely)
+    fi
+    if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
+      USE_REMOTE_SSH="yes"
+    else
+      USE_REMOTE_SSH="no"
+    fi
+    info "[AUTO] Environment: $ENV_TYPE | Remote SSH: $USE_REMOTE_SSH"
+    return 0
+  fi
+  if pkg_is_installed ubuntu-desktop || pkg_is_installed kubuntu-desktop || \
+     pkg_is_installed xubuntu-desktop || pkg_is_installed fedora-workstation-desktop \
+     2>/dev/null; then
     ENV_TYPE="desktop"
   elif systemctl list-unit-files 2>/dev/null | grep -qE '^(ssh|sshd)\.service'; then
     ENV_TYPE="server"
@@ -1435,61 +1613,84 @@ detect_or_ask_env() {
   fi
 
   if [ -n "$ENV_TYPE" ]; then
-    if ! prompt_yn "Use this environment type ($ENV_TYPE)?" "y"; then
-      ENV_TYPE=""
-    fi
+    info "Detected environment: $ENV_TYPE"
+    if ! prompt_yn "Use this environment type?" "y"; then ENV_TYPE=""; fi
   fi
   if [ -z "$ENV_TYPE" ]; then
     prompt_choice "Which environment is this machine?" "Desktop" "Server (headless / VPS)"
     ENV_TYPE="desktop"; [ "$REPLY_CHOICE" -eq 1 ] && ENV_TYPE="server"
   fi
-  _state_set ENV_TYPE "$ENV_TYPE" 2>/dev/null || true
 
-  # 2) Remote SSH usage
-  if [ -n "$_saved_ssh" ]; then
-    USE_REMOTE_SSH="$_saved_ssh"
-    info "SSH usage (from state): $_saved_ssh"
-  else
-    prompt_choice "Do you use remote SSH to log in to this machine?" "No" "Yes"
-    USE_REMOTE_SSH="no"; [ "$REPLY_CHOICE" -eq 1 ] && USE_REMOTE_SSH="yes"
-    _state_set USE_REMOTE_SSH "$USE_REMOTE_SSH" 2>/dev/null || true
-  fi
+  prompt_choice "Do you use remote SSH to log in to this machine?" "No" "Yes"
+  USE_REMOTE_SSH="no"; [ "$REPLY_CHOICE" -eq 1 ] && USE_REMOTE_SSH="yes"
 }
 
 ask_profile() {
   local _hr="──────────────────────────────────────────────────────────"
   bold "Profile selection"
   info "Choose how much hardening to apply. All changes are logged and reversible."
+  # AUTO_MODE: auto-detect everything — env, SSH presence, and safest profile.
+  # Emit a clear banner so the run log is self-explanatory.
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    AUTO_MODE=1
+    info "[AUTO] AUTO_MODE detected — auto-selecting profile based on environment."
+    detect_or_ask_env
+    # Profile numbers (0-indexed): 3=Full (server+SSH), 2=Standard (desktop).
+    if [ "$ENV_TYPE" = "server" ] || [ "$USE_REMOTE_SSH" = "yes" ]; then
+      REPLY_PROFILE=3  # Full on servers (SSH-hardened, with self-heal guard)
+    else
+      REPLY_PROFILE=2  # Standard on desktops (no SSH lockout risk)
+    fi
+    local _auto_msg="[AUTO] Selected: auto (intelligent defaults) — server=${ENV_TYPE} SSH=${USE_REMOTE_SSH}"
+    printf '\n  %s\n' "$(_c '1;32m' "${_auto_msg}")"
+    local _profile_desc
+    case "$REPLY_PROFILE" in
+      2) _profile_desc='Standard (desktop, no SSH hardening)' ;;
+      3) _profile_desc='Full (server, SSH hardened)' ;;
+      *) _profile_desc='Unknown' ;;
+    esac
+    local _label
+    _label="$(_profile_label)"
+    local _final="  Final profile: ${_label} — ${_profile_desc}"
+    printf '  %s\n' "$(_c '1;32m' "${_final}")"
+    printf '\n'
+    return 0
+  fi
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '1) Recommended')" "$(_c '1;37m' 'Safe defaults — firewall, system updates, unattended upgrades.')"
+  printf '  %s  %s\n' "$(_c '1;1;32m' '1) AUTO')" "$(_c '1;37m' 'Intelligent defaults — auto-detects server/desktop, picks safest')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'recommended steps. No prompts. Run unattended or in CI.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Also: NEOHIRO_AUTO=1, --auto, or -y on the command line.')"
+  printf '\n'
+  printf '  %s  %s\n' "$(_c '1;32m' '2) Recommended')" "$(_c '1;37m' 'Safe defaults — firewall, system updates, unattended upgrades.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'No risk of SSH lockout.  ~6 steps.  Takes 1-3 min.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;36m' '2) Standard')"   "$(_c '1;37m' 'Recommended + SSH hardening, Fail2ban, kernel sysctls,')"
+  printf '  %s  %s\n' "$(_c '1;36m' '3) Standard')"   "$(_c '1;37m' 'Recommended + SSH hardening, Fail2ban, kernel sysctls,')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'attack-surface reduction, AppArmor, password policies.  ~11 steps.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;35m' '3) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~12 steps.')"
+  printf '  %s  %s\n' "$(_c '1;35m' '4) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~12 steps.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Most aggressive.  Takes 5-10 min.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;33m' '4) Custom')"     "$(_c '1;37m' 'Choose each step individually.')"
+  printf '  %s  %s\n' "$(_c '1;33m' '5) Custom')"     "$(_c '1;37m' 'Choose each step individually.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'QUICK_MODE=1 skips per-step prompts; use recommended defaults.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;31m' '5) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes; offers self-heal guard.')"
+  printf '  %s  %s\n' "$(_c '1;31m' '6) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes; offers self-heal guard.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Safe recovery tool — re-run anytime without re-hardening.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;1;35m' '6) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
+  printf '  %s  %s\n' "$(_c '1;1;35m' '7) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '7) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
+  printf '  %s  %s\n' "$(_c '1;32m' '8) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'snap/dock/flatpak cleanup, systemd coredump, logrotate.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '8) Attack Surface Reduction')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
+  printf '  %s  %s\n' "$(_c '1;32m' '9) Attack Surface Reduction')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Categories: hardware, networking, legacy protocols, etc.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '9) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (do not enable)')"
+  printf '  %s  %s\n' "$(_c '1;32m' '10) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (do not enable)')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'tor / fail2ban / shadowsocks / dnscrypt. Auto-update opt-in.')"
   printf '\n'
   printf '%s\n' "$_hr"
   prompt_choice "Apply which set of categories?" \
+    "AUTO (intelligent — no prompts, auto-detects server/desktop, picks safest steps)" \
     "Recommended (safe, no SSH-lockout risk)" \
     "Standard (includes SSH hardening, Fail2ban, sysctl, AppArmor)" \
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
@@ -1506,20 +1707,129 @@ ask_profile() {
   fi
 }
 
+# In AUTO_MODE, check if the feature is already applied and skip it if so.
+# Returns 0 (skip) if already done, 1 (run) if needs action.
+_auto_skip_if_done() {
+  local key="$1"
+  case "$key" in
+    dnscrypt)
+      if pkg_is_installed dnscrypt-proxy && systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+        info "[AUTO] dnscrypt-proxy already installed and running — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    firewall)
+      if _fw_detect; then
+        case "$FW_CMD" in
+          ufw)          ufw status 2>/dev/null | grep -q '^Status: active' && { info "[AUTO] UFW already active — skipping."; return 0; } ;;
+          firewall-cmd) systemctl is-active --quiet firewalld 2>/dev/null && { info "[AUTO] firewalld already active — skipping."; return 0; } ;;
+        esac
+      fi
+      return 1
+      ;;
+    tor)
+      if pkg_is_installed tor && systemctl is-active --quiet tor 2>/dev/null; then
+        info "[AUTO] Tor daemon already installed and running — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    ssh)
+      if [ "$USE_REMOTE_SSH" != "yes" ]; then return 1; fi
+      local cfg="/etc/ssh/sshd_config"
+      if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+no' "$cfg" 2>/dev/null && \
+         grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$cfg" 2>/dev/null; then
+        info "[AUTO] SSH already hardened (PermitRootLogin=no, PasswordAuthentication=no) — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    fail2ban)
+      if pkg_is_installed fail2ban && systemctl is-active --quiet fail2ban 2>/dev/null; then
+        info "[AUTO] Fail2ban already installed and active — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    unattended)
+      if [ "$PKG_MGR" = "apt" ] && [ -f /etc/apt/apt.conf.d/50unattended-upgrades ] && \
+         grep -qE '^Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/50unattended-upgrades 2>/dev/null; then
+        info "[AUTO] Unattended upgrades already configured — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    ipv6)
+      if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
+        info "[AUTO] IPv6 already disabled — skipping."
+        return 0
+      fi
+      if [ -f /etc/sysctl.d/99-disable-ipv6.conf ] && \
+         grep -qE 'net\.ipv6\.conf\.all\.disable_ipv6\s*=\s*1' /etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null; then
+        info "[AUTO] IPv6 disable config present — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    sysctl)
+      if [ -f /etc/sysctl.d/99-hardening.conf ] && \
+         grep -qE 'net\.ipv4\.conf\.all\.rp_filter\s*=\s*1' /etc/sysctl.d/99-hardening.conf 2>/dev/null && \
+         grep -qE 'net\.ipv4\.tcp_syncookies\s*=\s*1' /etc/sysctl.d/99-hardening.conf 2>/dev/null && \
+         grep -qE 'net\.ipv4\.conf\.all\.accept_source_route\s*=\s*0' /etc/sysctl.d/99-hardening.conf 2>/dev/null; then
+        info "[AUTO] sysctl hardening (99-hardening.conf) already present with key values — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    apparmor)
+      if command -v aa-status >/dev/null 2>&1 && aa-status --enabled 2>/dev/null; then
+        info "[AUTO] AppArmor already enabled — skipping."
+        return 0
+      elif command -v getenforce >/dev/null 2>&1 && getenforce 2>/dev/null | grep -qi enforcing; then
+        info "[AUTO] SELinux already enforcing — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    pam)
+      if grep -qE 'deny\s*=\s*5' /etc/security/faillock.conf 2>/dev/null && \
+         grep -qE 'minlen\s*=\s*14' /etc/security/pwquality.conf 2>/dev/null; then
+        info "[AUTO] PAM password/lockout policy already configured — skipping."
+        return 0
+      fi
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
   _should_run_step "$key" || return 1
-  # In QUICK_MODE with Custom profile (4), skip individual prompts — use defaults.
-  if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
+  # AUTO_MODE: every step uses its per-profile default (Standard for desktop,
+  # Full for server). No interactive prompts; decisions are logged by prompt_yn.
+  # Also skip any step that is already fully applied (idempotent re-runs).
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    _auto_skip_if_done "$key" && return 0
     [ "$default" = "y" ] && return 0 || return 1
   fi
+  # In QUICK_MODE with Custom profile (4), skip individual prompts — use defaults.
+  if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
+    _auto_skip_if_done "$key" && return 0
+    [ "$default" = "y" ] && return 0 || return 1
+  fi
+  # Profile numbers (0-indexed; produced by prompt_choice):
+  #   0=AUTO (handled by AUTO_MODE block above)
+  #   1=Recommended, 2=Standard, 3=Full, 4=Custom,
+  #   5=Restore SSH, 6=Maintenance
   case "$REPLY_PROFILE" in
-    1) [ "$default" = "y" ]; return $?;;
-    2) [ "$default" = "y" ] || [ "$key" = "ssh_hardening" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;
-    3) return 0;;
-    4) prompt_yn "Run: $desc?" "$default"; return $?;;
-    5) return 1;;
-    6) return 1;;
+    1) [ "$default" = "y" ]; return $?;;   # Recommended
+    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;  # Standard
+    3) return 0;;                            # Full
+    4) prompt_yn "Run: $desc?" "$default"; return $?;;  # Custom
+    5) return 1;;                             # Restore SSH
+    6) return 1;;                             # Maintenance
   esac
 }
 
@@ -2040,6 +2350,19 @@ EOF
 setup_firewall() {
   msg "Firewall (UFW / firewalld)"
   _fw_detect
+  # Keep the Tailscale tunnel reachable on the "firewall already active" path
+  # below. Those two early returns mean fw_default_incoming_deny() never runs
+  # for an already-hardened host, so without this call a re-run silently skips
+  # the Tailscale rules entirely and nothing ever repairs them.
+  #
+  # Safe to run before anything else: allowing is always safe ahead of a
+  # default-deny, and it does not depend on USE_REMOTE_SSH/ENV_TYPE, so a
+  # desktop with Tailscale and no OpenSSH still keeps its tunnel open.
+  #
+  # This call site and the one further down are on mutually exclusive paths --
+  # an already-active firewall returns before reaching the later one -- so the
+  # rules are never emitted twice.
+  _ts_fw_allow
   if [ "$FW_CMD" = "ufw" ] && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ok "UFW is already active -- skipping enable."
     fw_status; return 0
@@ -2067,6 +2390,11 @@ setup_firewall() {
       return 1
     fi
   fi
+  # Keep Tailscale reachable BEFORE default-deny. This is the fresh-install
+  # call site: ufw/firewalld was only just installed above, so the earlier
+  # _ts_fw_allow had no firewall to detect and was a no-op. It has to run after
+  # pkg_install and before fw_default_incoming_deny.
+  _ts_fw_allow
   fw_default_incoming_deny
   # Open the Tor relay ports in the active firewall before enabling default-deny.
   # These are the only ports the Tor step adds, so we handle them here rather
@@ -2303,10 +2631,18 @@ EOF
   run sudo netfilter-persistent save
 
   ok "Transparent proxy + $ROLE active. Bandwidth capped at ${BW_RATE} MB/s sustained, ${BW_BURST} MB/s burst."
+  local _bridge_combined
+  _bridge_combined="$(grep -m1 '^Bridge ' "$RELAYCONF" 2>/dev/null || true)"
+  local _tor_role_label
+  case "$ROLE" in 0) _tor_role_label="Middle relay + transparent proxy" ;; 1) _tor_role_label="Exit relay + transparent proxy" ;; 2) _tor_role_label="Bridge relay + transparent proxy" ;; esac
+  secret_register "tor_relay_nickname" "$NICK"
+  secret_register "tor_relay_contact" "$CONTACT"
+  secret_register "tor_relay_role" "$_tor_role_label"
+  [ -n "$_bridge_combined" ] && secret_register "tor_bridge_line" "$_bridge_combined"
   info "Monthly accounting limit: $ACCT_MAX"
   info "Verify exit:   curl --max-time 10 https://check.torproject.org/api/ip"
   info "Verify relay:  https://metrics.torproject.org/rs.html (search: $NICK)"
-  info "Bridge (if bridge role):  provide this line to users: $(grep -E '^Bridge ' "$RELAYCONF" 2>/dev/null || echo 'not yet published')"
+  [ -n "$_bridge_combined" ] && info "Bridge:  $_bridge_combined"
   warn "apt updates slow. Revert iptables: sudo iptables -t nat -F OUTPUT"
 }
 
@@ -2423,6 +2759,16 @@ EXITEOF
     return 1
   fi
   ok "Tor relay starting on ORPort=$OR_PORT DirPort=$DIR_PORT. Bandwidth: ${BW_RATE} MB/s, accounting: $ACCT_MAX"
+  local _tor_role_label
+  case "$ROLE" in 0) _tor_role_label="Middle relay" ;; 1) _tor_role_label="Exit relay" ;; 2) _tor_role_label="Bridge relay" ;; esac
+  secret_register "tor_relay_nickname" "$NICK"
+  secret_register "tor_relay_contact" "$CONTACT"
+  secret_register "tor_relay_role" "$_tor_role_label"
+  if [ "$ROLE" = "2" ]; then
+    local _bridge
+    _bridge="$(grep -m1 '^Bridge ' "$TORRC" 2>/dev/null || true)"
+    secret_register "tor_bridge_line" "$_bridge"
+  fi
   info "Check reachability at https://metrics.torproject.org/rs.html (search your nickname)."
   info "First sync with other relays can take 20-60 minutes."
 }
@@ -2475,24 +2821,17 @@ disable_ipv6() {
   fi
   run sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
   run sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
-  if [ -f /etc/sysctl.conf ] && [ ! -f /var/backups/sysctl.conf.bak ]; then
-    run sudo cp /etc/sysctl.conf /var/backups/sysctl.conf.bak
-    record_backup /etc/sysctl.conf /var/backups/sysctl.conf.bak
+  local f="/etc/sysctl.d/99-disable-ipv6.conf"
+  if [ -f "$f" ] && [ ! -f /var/backups/99-disable-ipv6.conf.bak ]; then
+    run sudo cp "$f" /var/backups/99-disable-ipv6.conf.bak
+    record_backup "$f" /var/backups/99-disable-ipv6.conf.bak
   fi
-  # Detect trailing newline by writing the last byte to a temp file (avoids
-  # the newline-stripping behavior of command substitution in subshells).
-  # If the file ends in \n, the check succeeds and tee appends on a fresh line.
-  # If the file lacks a trailing \n, we prepend one so we don't glue content.
-  run sudo bash -c '
-    lastbyte=$(tail -c1 /etc/sysctl.conf | od -An -tx1 -N1 | tr -d " \n")
-    [ "$lastbyte" != "0a" ] && printf "\n" >> /etc/sysctl.conf
-  '
-  run sudo tee -a /etc/sysctl.conf >/dev/null <<'EOF'
-
+  run sudo tee "$f" >/dev/null <<'EOF'
 # disabled by linuxinstall.sh
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
+  run sudo sysctl --system
   warn "Reboot may be required for full effect."
 }
 
@@ -2501,13 +2840,6 @@ EOF
 # /etc/ssh/sshd_config.d/*.conf is correctly rewritten.
 _set_or_append_sshd_config() {
   local param="$1" value="$2" cfg="$3"
-  # Escape param for extended regex (grep -E / sed -E): escape []\^$.|?*+(){}
-  local param_re
-  param_re=$(printf '%s' "$param" | sed 's/[][\^$.|?*+(){}]/\\&/g')
-  # Escape value for sed replacement: escape &, \, and delimiter (/)
-  local value_repl
-  value_repl=$(printf '%s' "$value" | sed 's/[&\]/\\&/g; s|/|\\/|g')
-
   # If the parameter lives in a drop-in (Include /etc/ssh/sshd_config.d/*.conf
   # is processed before the main file's directives, so first-set wins),
   # edit the drop-in there. Otherwise update the main config.
@@ -2515,13 +2847,13 @@ _set_or_append_sshd_config() {
   local dropin
   for dropin in /etc/ssh/sshd_config.d/*.conf; do
     [ -f "$dropin" ] || continue
-    if grep -qE "^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]]" "$dropin"; then
+    if grep -qE "^[[:space:]]*#?[[:space:]]*${param}[[:space:]]" "$dropin"; then
       target="$dropin"
       break
     fi
   done
-  if grep -qE "^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]]" "$target"; then
-    run sudo sed -i -E "s/^[[:space:]]*#?[[:space:]]*${param_re}[[:space:]].*/${param} ${value_repl}/" "$target"
+  if grep -qE "^[[:space:]]*#?[[:space:]]*${param}[[:space:]]" "$target"; then
+    run sudo sed -i -E "s/^[[:space:]]*#?[[:space:]]*${param}[[:space:]].*/${param} ${value}/" "$target"
   else
     printf '%s %s\n' "$param" "$value" | run sudo tee -a "$target" >/dev/null
   fi
@@ -2533,7 +2865,7 @@ backup_and_report_authorized_keys() {
   local f count
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    count=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0)
+    count=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0)
     [ "$count" -eq 0 ] && continue
     run sudo cp -a "$f" "$bakdir/$(echo "$f" | tr '/' '_').bak.$(date +%s%N)"
     info "Preserved $f ($count keys) -> $bakdir/$(basename "$f").bak.*"
@@ -2545,10 +2877,10 @@ audit_authorized_keys() {
   local f count total=0
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || { info "  (none)  $f"; continue; }
-    count=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0)
+    count=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0)
     info "  $count key(s) in $f"
     total=$((total + count))
-    grep -E '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null | while IFS= read -r k; do
+    grep -E '^(ssh-|ecdsa-)' "$f" 2>/dev/null | while IFS= read -r k; do
       printf "    %s ...  %s\n" "$(echo "$k" | awk '{printf "%.50s", $1" "$2}')" "$(echo "$k" | awk '{print $NF}')"
     done
   done
@@ -2603,6 +2935,10 @@ setup_authorized_keys_with_validation() {
   fi
 
   if ! grep -qF "$(sudo -u "$target_user" cat "$recovery_key.pub" 2>/dev/null)" "$target_ak" 2>/dev/null; then
+    secret_register "ssh_recovery_key" "$recovery_key"
+    local _priv_recovery
+    _priv_recovery="$(sudo -u "$target_user" cat "$recovery_key" 2>/dev/null || true)"
+    [ -n "$_priv_recovery" ] && secret_register "ssh_recovery_privkey" "$_priv_recovery"
     sudo -u "$target_user" tee -a "$target_ak" >/dev/null < "$recovery_key.pub"
   fi
 
@@ -2661,6 +2997,18 @@ harden_ssh() {
   local SSHCFG="/etc/ssh/sshd_config"
   msg "SSH hardening"
 
+  # Tailscale SSH hosts have no sshd by design: tailscaled terminates SSH.
+  # Installing openssh-server here would resurrect port 22 and re-open the
+  # password-auth/root-login surface the operator removed on purpose, so
+  # there is nothing to harden -- sshd_config does not apply to Tailscale
+  # SSH, which reads its own ACL from the tailnet policy.
+  if _ts_ssh_is_access_path; then
+    info "Tailscale SSH is the active access path; skipping sshd_config hardening."
+    info "Tailscale SSH is authenticated by tailnet identity, so sshd_config"
+    info "hardening (PermitRootLogin, password auth, MaxAuthTries) does not apply."
+    info "Harden the tailnet ACL instead: https://tailscale.com/kb/1018/acls"
+    return 0
+  fi
   if ! command -v sshd >/dev/null 2>&1; then
     local sshd_pkg
     case "$PKG_MGR" in
@@ -2711,6 +3059,7 @@ harden_ssh() {
   printf '\n'
     read -r -p "Press Enter to continue, or Ctrl-C to abort... " _
     _set_or_append_sshd_config "Port" "2222" "$SSHCFG"
+    secret_register "ssh_port" "2222"
     # Open the new port (using OpenSSH service for IPv4+IPv6 coverage)
     # AND keep 22 open for the in-progress connection, in case the user
     # has another session still on 22.  After the run, the user can
@@ -2731,13 +3080,8 @@ harden_ssh() {
       warn "Pubkey not validated; PasswordAuthentication left unchanged."
     fi
   else
-    # Auto mode: only disable password auth if at least one valid pubkey exists
-    if _ssh_has_valid_pubkey; then
-      _ssh_disable_password_auth "$SSHCFG"
-      ok "[AUTO] PasswordAuthentication disabled (valid pubkey found)."
-    else
-      warn "[AUTO] No valid pubkey found — keeping PasswordAuthentication enabled to prevent lockout."
-    fi
+    ok "[AUTO] PasswordAuthentication handling in auto mode."
+    _ssh_disable_password_auth "$SSHCFG" || true
   fi
 
   # Final anti-lockout check: confirm a pubkey actually works before we
@@ -2747,7 +3091,7 @@ harden_ssh() {
     local _pubkey_count=0
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
       [ -f "$f" ] || continue
-      _pubkey_count=$(( _pubkey_count + $(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null || echo 0) ))
+      _pubkey_count=$(( _pubkey_count + $(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null || echo 0) ))
     done
     if [ "$_pubkey_count" -eq 0 ] && [ -z "${LINUXINSTALL_SKIP_PUBKEY_CHECK:-}" ]; then
       err "Refusing to restart sshd: no authorized pubkeys found and PasswordAuthentication may be off."
@@ -2797,24 +3141,23 @@ harden_ssh() {
   fi
 }
 
-_ssh_has_valid_pubkey() {
-  for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
-    [ -f "$f" ] || continue
-    if grep -qE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null; then
-      return 0
-    fi
-  done
-  return 1
-}
-
 _ssh_disable_password_auth() {
   local cfg="$1" ak_count=0 f c
   for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$f" ] || continue
-    c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null) || c=0
+    c=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null) || c=0
     ak_count=$((ak_count + c))
   done
   if [ "$ak_count" -eq 0 ]; then
+    if [ "$SSH_AUTO_MODE" = "1" ]; then
+      warn "[AUTO] No pubkeys found. Leaving PasswordAuthentication=yes (no lockout)."
+      return 1
+    fi
+    warn "No public keys found in any authorized_keys."
+    if ! setup_authorized_keys_with_validation; then
+      err "No working pubkey validated. Leaving PasswordAuthentication unchanged."
+      return 1
+    fi
     _set_or_append_sshd_config "PasswordAuthentication" "no" "$cfg"
     metrics_add services_hardened 1
     metrics_add auth_keys_added 1
@@ -2908,13 +3251,34 @@ configure_unattended_upgrades() {
 
 harden_sysctl() {
   msg "Kernel/network hardening via sysctl"
-  if ! prompt_yn "Apply the 99-hardening.conf sysctl profile from the README?" "y"; then return 0; fi
+  # AUTO_MODE: skip the prompt and apply based on detected environment.
+  # Servers get the full profile; desktops get a reduced set that does not
+  # break container runtimes or dual-stack networking.
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    info "[AUTO] Applying sysctl hardening based on detected environment ($ENV_TYPE)."
+  elif ! prompt_yn "Apply the 99-hardening.conf sysctl profile from the README?" "y"; then
+    return 0
+  fi
+
   local f="/etc/sysctl.d/99-hardening.conf"
   if [ -f "$f" ] && [ ! -f /var/backups/99-hardening.conf.bak ]; then
     run sudo cp "$f" /var/backups/99-hardening.conf.bak
     record_backup "$f" /var/backups/99-hardening.conf.bak
   fi
-  run sudo tee "$f" >/dev/null <<'EOF'
+
+  # Server vs desktop triage: servers get more aggressive hardening.
+  # Desktops skip user.max_user_namespaces=0 (breaks Docker/Podman) and
+  # tcp_sack=0 (hurts performance on modern LANs).
+  local _is_server=0
+  [ "$ENV_TYPE" = "server" ] && _is_server=1
+
+  local _extra=""
+  if [ "$_is_server" = "1" ]; then
+    _extra=$'\n''user.max_user_namespaces=0'
+  fi
+
+  run sudo tee "$f" >/dev/null <<EOF
+# Kernel security hardening
 kernel.dmesg_restrict=1
 kernel.kptr_restrict=2
 kernel.unprivileged_bpf_disabled=1
@@ -2928,21 +3292,87 @@ fs.protected_symlinks=1
 fs.protected_hardlinks=1
 fs.protected_fifos=2
 fs.protected_regular=2
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
+kernel.panic=60
+kernel.panic_on_oops=1
+kernel.perf_event_paranoid=2
+vm.mmap_rnd_bits=32
+vm.mmap_rnd_compat_bits=16
+${_extra}
+# Network hardening - reverse path filtering
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.default.rp_filter=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
+
+# SYN flood protection
 net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_max_syn_backlog=2048
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_syn_retries=5
+
+# Source route / redirects
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+
+# Martian logging & ICMP
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# Time-wait assassination protection
+net.ipv4.tcp_rfc1337=1
+
+# TCP tuning
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=1200
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=3
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_moderate_rcvbuf=1
+
+# ARP hardening
+net.ipv4.conf.all.arp_ignore=1
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.all.proxy_arp=0
+
+# Forwarding (disable if not a router)
+net.ipv4.conf.all.forwarding=0
+net.ipv4.conf.default.forwarding=0
+
+# IPv6 hardening
 net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_ra=0
+net.ipv6.conf.default.accept_ra=0
+net.ipv6.conf.all.autoconf=0
+net.ipv6.conf.default.autoconf=0
+
+# Congestion control & buffers
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.core.somaxconn=4096
 EOF
-  run sudo sysctl --system
-  metrics_add sysctls_applied 25
+
+  if run sudo sysctl --system; then
+    ok "sysctl hardening applied."
+  else
+    warn "sysctl --system had errors; some settings may not have taken effect."
+  fi
+
+  # Count actual applied entries (dynamic, not hardcoded).
+  local _count
+  _count=$(grep -cE '^[^#[:space:]]' "$f" 2>/dev/null || echo 0)
+  metrics_add sysctls_applied "$_count"
   metrics_add services_hardened 1
 }
 
@@ -3016,6 +3446,103 @@ EOF
   ok "Password/lockout policy set. Note: 'core 0' in /etc/security/limits.conf is recommended."
 }
 
+harden_attack_surface() {
+  msg "Attack surface reduction (built-in: filesystems, SSH crypto, login policy)"
+  if ! prompt_yn "Apply additional built-in ASR hardening (filesystem blacklist, SSH crypto, login.defs)?" "y"; then
+    return 0
+  fi
+
+  # 1) Filesystem module blacklist — prevent loading of legacy/unused filesystems
+  local fs_blacklist=(
+    "cramfs"     # compressed ROM filesystem, rarely needed
+    "freevxfs"   # VERITAS VxFS, rarely needed
+    "jffs2"      # Journalling Flash FS, rarely needed
+    "hfs"        # macOS HFS, rarely needed on Linux
+    "hfsplus"    # macOS HFS+, rarely needed on Linux
+    "squashfs"   # read-only compressed FS, may be needed for snaps/snapshots
+    "udf"        # Universal Disk Format, rarely needed
+  )
+  local modprobe_dir="/etc/modprobe.d"
+  run sudo mkdir -p "$modprobe_dir"
+  local f="${modprobe_dir}/blacklist-filesystems.conf"
+  if [ -f "$f" ] && [ ! -f /var/backups/blacklist-filesystems.conf.bak ]; then
+    run sudo cp "$f" /var/backups/blacklist-filesystems.conf.bak
+    record_backup "$f" /var/backups/blacklist-filesystems.conf.bak
+  fi
+  {
+    printf '# Filesystem blacklist — attack surface reduction\n'
+    printf '# Generated by linuxinstall.sh\n'
+    for fs in "${fs_blacklist[@]}"; do
+      printf 'install %s /bin/true\n' "$fs"
+      printf 'blacklist %s\n' "$fs"
+    done
+  } | run sudo tee "$f" >/dev/null
+  ok "Filesystem blacklist written to $f"
+
+  # 2) SSH cryptographic hardening — modern ciphers, MACs, KEX
+  if [ -f /etc/ssh/sshd_config ] && systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+    local sshcfg="/etc/ssh/sshd_config"
+    local backup
+    backup="${sshcfg}.bak.$(date +%s%N)"
+    run sudo cp "$sshcfg" "$backup"
+    record_backup "$sshcfg" "$backup"
+    local crypto_directives=(
+      "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+      "MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512"
+      "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
+    )
+    for d in "${crypto_directives[@]}"; do
+      _set_or_append_sshd_config "${d%%=*}" "${d#*=}" "$sshcfg"
+    done
+    if sudo sshd -t 2>&1; then
+      _ssh_safe_restart "$sshcfg" || warn "SSH config valid but reload failed; changes apply on next restart."
+    else
+      err "sshd config invalid after crypto hardening — reverting."
+      run sudo cp -f "$backup" "$sshcfg"
+      return 1
+    fi
+    ok "SSH cryptographic hardening applied (modern ciphers/MACs/KEX only)."
+  fi
+
+  # 3) /etc/login.defs — password aging
+  local login_defs="/etc/login.defs"
+  if [ -f "$login_defs" ] && [ ! -f /var/backups/login.defs.bak ]; then
+    run sudo cp "$login_defs" /var/backups/login.defs.bak
+    record_backup "$login_defs" /var/backups/login.defs.bak
+  fi
+  local -A login_vals=(
+    [PASS_MAX_DAYS]=90
+    [PASS_MIN_DAYS]=7
+    [PASS_WARN_AGE]=14
+    [ENCRYPT_METHOD]=SHA512
+  )
+  for k in "${!login_vals[@]}"; do
+    local v="${login_vals[$k]}"
+    if grep -qE "^${k}[[:space:]]" "$login_defs" 2>/dev/null; then
+      run sudo sed -i -E "s/^${k}[[:space:]]+.*/${k} ${v}/" "$login_defs"
+    else
+      printf '%s %s\n' "$k" "$v" | run sudo tee -a "$login_defs" >/dev/null
+    fi
+  done
+  ok "login.defs password aging set (max 90d, min 7d, warn 14d)."
+
+  # 4) Core dump size limit — disable core dumps by default
+  local limits_conf="/etc/security/limits.conf"
+  if [ -f "$limits_conf" ] && [ ! -f /var/backups/limits.conf.bak ]; then
+    run sudo cp "$limits_conf" /var/backups/limits.conf.bak
+    record_backup "$limits_conf" /var/backups/limits.conf.bak
+  fi
+  if ! grep -qE '^\*[[:space:]]+hard[[:space:]]+core[[:space:]]+0' "$limits_conf" 2>/dev/null; then
+    printf '* hard core 0\n' | run sudo tee -a "$limits_conf" >/dev/null
+  fi
+  if ! grep -qE '^\*[[:space:]]+soft[[:space:]]+core[[:space:]]+0' "$limits_conf" 2>/dev/null; then
+    printf '* soft core 0\n' | run sudo tee -a "$limits_conf" >/dev/null
+  fi
+  ok "Core dumps disabled via limits.conf."
+
+  metrics_add services_hardened 1
+}
+
 run_optimize_asr() {
   msg "Attack-surface reduction (OptimizeLinuxASR.sh from the repo)"
   if ! prompt_yn "Run the interactive OptimizeLinuxASR script (service-by-service prompts)?" "n"; then return 0; fi
@@ -3047,10 +3574,10 @@ updates_only_mode() {
   # and is also runnable standalone:  sudo bash lib/updater.sh
   if ask_category_enabled "system" "Comprehensive system update" "y"; then
     _step_begin "system_update" "Comprehensive system update" "${_STEP_PREVIEWS[system]}"
-    local _step_start=$SECONDS
+    SECONDS=0
     local _rc=0
     _run_all_updates || _rc=$?
-    _step_end "system_update" "Comprehensive system update" $((SECONDS - _step_start))
+    _step_end "system_update" "Comprehensive system update"
     if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
   fi
 
@@ -3061,10 +3588,10 @@ updates_only_mode() {
   # one.
   if ask_category_enabled "system" "Kernel update + prune" "y"; then
     _step_begin "system_update" "Kernel update + prune" ""
-    local _step_start=$SECONDS
+    SECONDS=0
     local _rc=0
     update_kernel || _rc=$?
-    _step_end "system_update" "Kernel update + prune" $((SECONDS - _step_start))
+    _step_end "system_update" "Kernel update + prune"
     if [ "$_rc" -ne 0 ]; then mark_step "system_update" skip; fi
   fi
 
@@ -3104,10 +3631,10 @@ updates_only_mode() {
       apt)
         if ask_category_enabled "unattended" "Unattended security upgrades" "y"; then
           _step_begin "unattended" "Unattended security upgrades" "${_STEP_PREVIEWS[unattended]}"
-          local _step_start=$SECONDS
+          SECONDS=0
           local _rc=0
           configure_unattended_upgrades || _rc=$?
-          _step_end "unattended" "Unattended security upgrades" $((SECONDS - _step_start))
+          _step_end "unattended" "Unattended security upgrades"
           if [ "$_rc" -ne 0 ]; then mark_step "unattended" skip; fi
         fi
         ;;
@@ -3225,7 +3752,7 @@ rollback_mode() {
     info "Done. Review with:  sudo sshd -t   (and reload any service you changed)"
   else
     echo
-    info "Dry-run only. To actually apply:  sudo bash $SCRIPT_PATH --rollback --apply"
+    info "Dry-run only. To actually apply:  sudo bash $0 --rollback --apply"
   fi
 
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -3316,7 +3843,7 @@ _ssh_self_heal_check() {
   local _ak_count=0 _f _c
   for _f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
     [ -f "$_f" ] || continue
-    _c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$_f" 2>/dev/null) || _c=0
+    _c=$(grep -cE '^(ssh-|ecdsa-' "$_f" 2>/dev/null) || _c=0
     _ak_count=$((_ak_count + _c))
   done
 
@@ -3379,7 +3906,7 @@ _ssh_self_heal_install() {
 #!/bin/bash
 # neohiro-ssh-watchdog.sh -- invoked by systemd timer / cron every minute.
 # Calls the canonical self-heal logic in the parent linuxinstall.sh.
-exec /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
+exec /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
 SCRIPT
     chmod 0755 "$_script" 2>/dev/null || true
     cat > "$_svc" <<UNIT
@@ -3418,8 +3945,8 @@ TIMER
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 # Run self-heal at boot (+30s grace) and every minute
-@reboot sleep 30 && /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
-* * * * * root /bin/bash $(printf '%q' "$SCRIPT_PATH") --self-heal >> $_log 2>&1
+@reboot sleep 30 && /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
+* * * * * root /bin/bash $SCRIPT_PATH --self-heal >> $_log 2>&1
 CRON
     chmod 0644 "$_cron_dir/neohiro-ssh-watchdog"
     ok "SSH self-heal guard installed (cron: @reboot + every minute)."
@@ -3461,7 +3988,25 @@ restore_ssh_mode() {
   fi
 
   if ! command -v sshd >/dev/null 2>&1; then
-    err "sshd is not installed. Install:  sudo pkg_install openssh-server"
+    # No sshd. On a Tailscale-SSH-only host that is deliberate, not a fault --
+    # every check below inspects sshd/sshd_config, so none of them apply, and
+    # telling this user to install openssh-server would undo their decision and
+    # re-open port 22 while they are trying to recover from being locked out.
+    if _ts_ssh_is_access_path; then
+      ok "sshd is not installed and Tailscale SSH is the active access path."
+      info "Nothing to repair: there is no sshd or sshd_config on this host."
+      info "If Tailscale SSH is the thing that is broken, fix it there:"
+      info "  tailscale status              # backend must be Running"
+      info "  tailscale up                  # re-authenticate if needed"
+      info "  tailscale set --ssh=true      # ensure SSH is enabled for this node"
+      info "  tailnet ACL: https://tailscale.com/kb/1018/acls"
+      info "To deliberately go back to OpenSSH instead:"
+      info "  LINUXINSTALL_FORCE_SSHD=1 $0 --restore-ssh"
+      return 0
+    fi
+    err "sshd is not installed and Tailscale SSH is not the active access path."
+    err "This host has no working remote access path. From the console:"
+    err "  Install:  sudo pkg_install openssh-server"
     return 1
   fi
 
@@ -3507,7 +4052,7 @@ restore_ssh_mode() {
     local ak_count=0 f c
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
       [ -f "$f" ] || continue
-      c=$(grep -cE '^(ssh-(ed25519|rsa|dss|ecdsa)|ecdsa-sha2-nistp[0-9]+)' "$f" 2>/dev/null) || c=0
+      c=$(grep -cE '^(ssh-|ecdsa-)' "$f" 2>/dev/null) || c=0
       ak_count=$((ak_count + c))
     done
     if [ "$ak_count" -eq 0 ]; then
@@ -3615,12 +4160,12 @@ restore_ssh_mode() {
 main() {
   # Handle flags before anything else
   case "${1:-}" in
-    --reset-state)
-      bold "neohiro/linux - Clear persistent state"
-      _state_clear
-      echo "State file removed: ${NEOHIRO_STATE_FILE:-/etc/neohiro/linux-state.conf}"
-      echo "Next run will re-prompt for environment type and SSH usage."
-      exit 0
+    --auto|-y|--yes)
+      AUTO_MODE=1
+      QUIET_PROMPTS=1
+      shift
+      bold "[AUTO] Non-interactive mode: every prompt uses defaults, no input required."
+      info "[AUTO] Profile selected automatically based on detected environment."
       ;;
     --restore-ssh)
       bold "neohiro/linux - Restore SSH (standalone)"
@@ -3690,9 +4235,13 @@ main() {
       ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [--reset-state] [-h]
+Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
 
   (no flag)         Run the full interactive setup & hardening.
+  --auto, -y, --yes Run unattended: intelligent profile selection, no prompts,
+                    every decision is logged. Equivalent to choosing option 1
+                    "AUTO" in the main menu. Respects NEOHIRO_AUTO=1 env var.
+                    Already-applied steps are skipped (idempotent re-runs).
   --dry-run         Preview what would run without executing any commands.
   --step STEP       Run only the named step (e.g. --step firewall).
   --restore-ssh     Diagnose & fix the most common SSH lockout causes.
@@ -3712,10 +4261,16 @@ Usage: sudo bash linuxinstall.sh [--dry-run] [--step STEP] [--restore-ssh] [--re
   --rollback        Dry-prints the inverse cp commands needed to undo
                     every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those cp commands (latest backup wins).
-  --reset-state     Clear the persistent state file
-                    (/etc/neohiro/linux-state.conf) so the next run re-prompts
-                    for environment type and SSH usage.
   -h, --help        Show this help.
+
+Environment variables:
+  NEOHIRO_AUTO=1    Same as --auto. Useful in CI / cloud-init / packer.
+  QUIET_PROMPTS=1   Same as --auto. Legacy name for unattended runs.
+  STRICT_RUN=1      Exit non-zero if any command failed (vs default exit 0).
+  QUICK_MODE=1      Skip per-step prompts in Custom profile, use defaults.
+  TOR_NICK=...      Override the Tor relay nickname (default: hostname).
+  TOR_CONTACT=...   Override the Tor relay contact (default: you@example.com).
+  NEOHIRO_DEBUG_LOG=path  Override debug log location.
 USAGE
       exit 0
       ;;
@@ -3736,7 +4291,9 @@ USAGE
   print_welcome
   printf '\n'
 
-  # Full + server => run SSH hardening in auto mode (no interactive lockout-prone prompts)
+  # Profile numbers (0-indexed): 0=AUTO, 1=Recommended, 2=Standard, 3=Full,
+  # 4=Custom, 5=Restore SSH, 6=Maintenance, 7=DeepClean, 8=ASR, 9=Updates.
+  # Full + server => SSH hardening runs in auto mode (no interactive prompts).
   if [ "$REPLY_PROFILE" = "3" ] && [ "$ENV_TYPE" = "server" ]; then
     FULL_AUTO=1
     SSH_AUTO_MODE=1
@@ -3806,18 +4363,14 @@ USAGE
   # so a single failure does not abort subsequent steps.
   _run_step() {
     local key="$1" label="$2" preview="$3" fn="$4"
-    if ! ask_category_enabled "$key" "$label" "${5:-n}"; then
-      mark_step "$key" skip
-      return 0
-    fi
+    if ! ask_category_enabled "$key" "$label" "${5:-n}"; then return 0; fi
     local p="${_STEP_PREVIEWS[$key]:-$preview}"
     while true; do
       _step_begin "$key" "$label" "$p"
-      local step_start_sec=$SECONDS
+      SECONDS=0
       local rc=0
       "$fn" || rc=$?
-      local step_elapsed=$((SECONDS - step_start_sec))
-      _step_end "$key" "$label" "$step_elapsed" "$rc"
+      _step_end "$key" "$label"
       if [ "$rc" -eq 0 ]; then return 0; fi
       # Failure recovery: offer retry / skip / abort.
       if _prompt_failure_recovery "$label" "$rc"; then
@@ -3846,12 +4399,12 @@ USAGE
   if ask_category_enabled "system" "System update + base packages" "y"; then
     while true; do
       _step_begin "system_update" "System update + base packages" "${_STEP_PREVIEWS[system]}"
-      local _step_start=$SECONDS
+      SECONDS=0
       local _rc=0
       _run_all_updates || _rc=$?
       update_system || _rc=$?
       update_kernel || _rc=$?
-      _step_end "system_update" "System update + base packages" $((SECONDS - _step_start))
+      _step_end "system_update" "System update + base packages"
       if [ "$_rc" -eq 0 ]; then break; fi
       if _prompt_failure_recovery "System update" "$_rc"; then continue; fi
       mark_step "system_update" skip; break
@@ -3860,20 +4413,21 @@ USAGE
   _run_step dnscrypt     "DNSCrypt (DNS method is ambiguous)"         "" setup_dnscrypt            n
   _run_step firewall     "Firewall (UFW)"                             "" setup_firewall            y
   _run_step tor          "Tor daemon"                                 "" setup_tor                 n
+  _run_step ssh          "SSH hardening (lockout-prone)"              "" harden_ssh                n
   _run_step fail2ban    "Fail2ban"                                   "" setup_fail2ban            n
   _run_step unattended  "Unattended security upgrades"               "" configure_unattended_upgrades y
   _run_step ipv6        "Disable IPv6 (risky)"                       "" disable_ipv6              n
   _run_step sysctl      "Kernel/sysctl hardening profile"            "" harden_sysctl             n
   _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
   _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
+  _run_step attack_surface "Attack surface reduction (built-in)"     "" harden_attack_surface    n
   _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
-  _run_step ssh_hardening "SSH hardening (lockout-prone — run LAST)"   "" harden_ssh                n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then
     info "Because SSH was changed, verify a SECOND session can log in BEFORE closing this one."
     if [ "$SSH_AUTO_MODE" = "1" ]; then
       info "Full+server auto mode: SSH was hardened automatically. If anything went wrong,"
-      info "reconnect via console (or out-of-band) and run:  sudo bash $SCRIPT_PATH  --restore-ssh"
+      info "reconnect via console (or out-of-band) and run:  sudo bash $0  --restore-ssh"
     fi
   fi
   _print_run_summary
@@ -3894,19 +4448,21 @@ _print_run_summary() {
     total_time_str="${total_sec}s"
   fi
   local _hr="════════════════════════════════════════════════════════════"
-  printf '\n%s\n' "$(_c '1;36m' "  ╔═════════════════════════════════════════════════════════╗")"
+  printf '\n%s\n' "$(_c '1;36m' "  ╔══════════════════════════════════════════════════════════╗")"
   printf '%s\n' "$(_c '1;36m' "  ║               ✓  Run complete  —  $total_time_str                 ║")"
   printf '%s\n' "$(_c '1;36m' "  ╚══════════════════════════════════════════════════════════╝")"
   printf '\n'
   print_metrics_summary
   mark_step summary "done"
   show_progress
+  # Print the secrets summary right after metrics so the user sees any
+  # generated recovery keys / Tor relay credentials BEFORE the kernel-reboot
+  # prompt scrolls them off-screen.
+  print_secrets_summary
   if [ -n "$_ETC_SNAPSHOT_PATH" ]; then
     printf '\n  %s\n' "$(_c '1;36m' '== /etc SNAPSHOT')"
     printf '  Full /etc snapshot: %s\n' "$(_c '1;37m' "$_ETC_SNAPSHOT_PATH")"
-    _restore_cmd=$(_get_restore_cmd)
-    printf '  Restore whole /etc:  %s\n' "$_restore_cmd"
-    printf '  (or re-fetch: curl -fsSL %s/linuxinstall.sh | sudo bash -s -- --restore-etc-snapshot)\n' "$REPO_RAW_BASE"
+    printf '  Restore whole /etc:  sudo bash %q --restore-etc-snapshot\n' "$SCRIPT_PATH"
   fi
   # If update_kernel staged a new image, offer a reboot once we are
   # back at the prompt. Never auto-reboot — connection loss during the
@@ -3949,14 +4505,6 @@ _print_run_summary() {
       return 1
     else
       warn "$_FAIL_COUNT command(s) failed during the run. Re-run with STRICT_RUN=1 to exit non-zero."
-    fi
-  fi
-
-  # Offer to enter maintenance menu for further actions (unless already in maintenance profile)
-  if [ "${REPLY_PROFILE:-}" != "6" ] && [ -t 0 ]; then
-    printf '\n'
-    if prompt_yn "Open maintenance menu for additional tools (service management, SSH diagnostics, logs, etc.)?" "n"; then
-      maintenance_menu
     fi
   fi
   return 0

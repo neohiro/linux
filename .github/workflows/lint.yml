@@ -16,7 +16,12 @@ on:
 
 jobs:
   lint:
-    name: Shellcheck + bash -n
+    # NOTE: main's branch protection requires a status check context named
+    # exactly "Lint". The check name comes from this job's `name:`, NOT from the
+    # workflow name -- the workflow being called "Lint" is not sufficient, and
+    # renaming this to anything else makes the repo unmergeable. The steps below
+    # still spell out what is actually run.
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

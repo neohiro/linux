@@ -85,8 +85,10 @@ report_consumer() {
   fi
 
   if grep -q 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null; then
+    # wc -l, not grep -c: grep -c prints "<count>\n" which breaks
+    # the test on platforms that include a trailing newline.
     local n
-    n=$(grep -c 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null)
+    n=$(grep 'BEGIN_INHERIT_COLOR_GATE' "$consumer" 2>/dev/null | wc -l | tr -d '[:space:]')
     echo "  ALREADY MIGRATED ($n marker(s) found)"
     return
   fi
