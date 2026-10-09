@@ -3496,14 +3496,20 @@ harden_sysctl() {
   fi
 
   # Server vs desktop triage: servers get more aggressive hardening.
-  # Desktops skip user.max_user_namespaces=0 (breaks Docker/Podman) and
-  # tcp_sack=0 (hurts performance on modern LANs).
+  # user.max_user_namespaces=0 breaks Docker/Podman/LXD, so skip it whenever a
+  # container runtime is present, even on servers.
   local _is_server=0
-  [ "$ENV_TYPE" = "server" ] && _is_server=1
+  [ "${ENV_TYPE:-}" = "server" ] && _is_server=1
 
   local _extra=""
   if [ "$_is_server" = "1" ]; then
-    _extra=$'\n''user.max_user_namespaces=0'
+    if _service_present docker 2>/dev/null || _service_present podman 2>/dev/null || \
+       _service_present lxd 2>/dev/null || _service_present incus 2>/dev/null || \
+       command -v docker >/dev/null 2>&1 || command -v podman >/dev/null 2>&1; then
+      info "Keeping user namespaces enabled (container runtime detected)."
+    else
+      _extra=$'\n''user.max_user_namespaces=0'
+    fi
   fi
 
   run sudo tee "$f" >/dev/null <<EOF
@@ -3599,8 +3605,11 @@ EOF
   fi
 
   # Count actual applied entries (dynamic, not hardcoded).
+  # grep -c prints 0 but exits 1 on no matches, so use || true to avoid a
+  # duplicated "0\n0" capture from the fallback echo.
   local _count
-  _count=$(grep -cE '^[^#[:space:]]' "$f" 2>/dev/null || echo 0)
+  _count=$(grep -cE '^[^#[:space:]]' "$f" 2>/dev/null || true)
+  _count=${_count:-0}
   metrics_add sysctls_applied "$_count"
   metrics_add services_hardened 1
 }
@@ -3721,6 +3730,17 @@ harden_attack_surface() {
     backup="${sshcfg}.bak.$(date +%s%N)"
     run sudo cp "$sshcfg" "$backup"
     record_backup "$sshcfg" "$backup"
+    # _set_or_append_sshd_config edits a drop-in when the directive already
+    # lives there, so back those up too for a complete revert.
+    local -A _crypto_dropin_baks=()
+    local _crypto_dropin _crypto_bak
+    for _crypto_dropin in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$_crypto_dropin" ] || continue
+      _crypto_bak="${_crypto_dropin}.bak.$(date +%s%N)"
+      run sudo cp "$_crypto_dropin" "$_crypto_bak"
+      record_backup "$_crypto_dropin" "$_crypto_bak"
+      _crypto_dropin_baks["$_crypto_dropin"]="$_crypto_bak"
+    done
     local crypto_directives=(
       "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
       "MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512"
@@ -3734,6 +3754,10 @@ harden_attack_surface() {
     else
       err "sshd config invalid after crypto hardening — reverting."
       run sudo cp -f "$backup" "$sshcfg"
+      local _crypto_key
+      for _crypto_key in "${!_crypto_dropin_baks[@]}"; do
+        run sudo cp -f "${_crypto_dropin_baks[$_crypto_key]}" "$_crypto_key"
+      done
       return 1
     fi
     ok "SSH cryptographic hardening applied (modern ciphers/MACs/KEX only)."
