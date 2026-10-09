@@ -3367,7 +3367,8 @@ harden_attack_surface() {
   # 2) SSH cryptographic hardening — modern ciphers, MACs, KEX
   if [ -f /etc/ssh/sshd_config ] && systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
     local sshcfg="/etc/ssh/sshd_config"
-    local backup="${sshcfg}.bak.$(date +%s%N)"
+    local backup
+    backup="${sshcfg}.bak.$(date +%s%N)"
     run sudo cp "$sshcfg" "$backup"
     record_backup "$sshcfg" "$backup"
     local crypto_directives=(
