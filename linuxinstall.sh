@@ -40,6 +40,10 @@ if [ -n "$_NEOHIRO_LIB_DIR" ] && [ -r "$_NEOHIRO_LIB_DIR/color.sh" ]; then
   if [ -r "$_NEOHIRO_LIB_DIR/updater.sh" ]; then
     source "$_NEOHIRO_LIB_DIR/updater.sh"
   fi
+  # shellcheck disable=SC1091
+  if [ -r "$_NEOHIRO_LIB_DIR/apt-https.sh" ]; then
+    source "$_NEOHIRO_LIB_DIR/apt-https.sh"
+  fi
 else
   # Inline fallback for run-from-pipe (curl ... | bash) where the lib
   # directory is not on disk. Sources the canonical color-gate function from
@@ -158,42 +162,53 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
   VERBOSE="${VERBOSE:-0}"; UPDATED=0; FAILED=0
   _log() { [ "$VERBOSE" = "1" ] && info "$*" || true; }
   _update_apt()    { command -v apt >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_apt" || true
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq || return 1
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y -qq full-upgrade
     run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove -qq
     run sudo apt-get clean -qq; }
   _update_dnf()   { command -v dnf >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_dnf" || true
     run sudo dnf upgrade --refresh -y -q || return 1
     run sudo dnf autoremove -y -q; }
   _update_yum()   { command -v yum >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_yum" || true
     run sudo yum update -y -q || return 1
     run sudo yum autoremove -y -q; }
   _update_zypper(){ command -v zypper >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_zypper" || true
     run sudo zypper --quiet refresh
     run sudo zypper update -y --quiet || return 1
     run sudo zypper --quiet clean; }
   _update_pacman(){ command -v pacman >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_pacman" || true
     run sudo pacman -Syu --noconfirm --quiet || return 1
     run sudo pacman -Scc --noconfirm -q; }
   _update_snap()  { command -v snap >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_snap" || true
     run sudo snap refresh 2>/dev/null || true; }
   _update_flatpak(){ command -v flatpak >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_flatpak" || true
     run flatpak update -y --assumeyes 2>/dev/null || true
     run flatpak uninstall --unused -y --assumeyes 2>/dev/null || true; }
   _update_docker() { command -v docker >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_docker" || true
     while IFS= read -r img; do
       [ -z "$img" ] && continue
       docker pull "$img" >/dev/null 2>&1 || true
     done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v '<none>')
     docker image prune -f >/dev/null 2>&1 || true; }
   _update_brew()  { command -v brew >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_brew" || true
     HOMEBREW_NO_ANALYTICS=1 run brew update 2>/dev/null || true
     run brew upgrade 2>/dev/null || true
     run brew cleanup -s -q 2>/dev/null || true; }
   _update_firmware(){ command -v fwupdmgr >/dev/null 2>&1 || return 0
+    apt_https_guard "_update_firmware" || true
     run sudo fwupdmgr refresh 2>/dev/null || true
     run sudo fwupdmgr update -y --no-reboot-check 2>/dev/null || true; }
   _run_all_updates() {
+    apt_https_guard "_run_all_updates" || true
     msg "=== Comprehensive system update ==="
     _update_apt || true
     _update_dnf || true
@@ -206,6 +221,86 @@ if ! declare -F _run_all_updates >/dev/null 2>&1; then
     _update_brew || true
     _update_firmware || true
     printf '\n'; ok "Update engine complete."; }
+fi
+
+# ── lib/apt-https.sh resolution (curl|bash path) ─────────────────────────────
+# `curl ... | sudo bash` has no lib/ directory next to this script, so this
+# block used to carry a full inline copy of the repository transport guard.
+# That was ~400 lines of security-critical code duplicated from a canonical
+# source, which is the worst possible arrangement: fixes and new store
+# coverage silently did not reach the most common install path.
+#
+# Instead, resolve the canonical library -- from disk if it is there,
+# otherwise by fetching it from the same raw base this script already trusts
+# for DeepClean.sh and OptimizeLinuxASR.sh -- and source that. One
+# implementation, no drift, and the curl|bash path gets the same coverage as a
+# clone (every distro package manager plus apk, flatpak, docker, brew, pip,
+# npm, cargo, gem, nix and fwupd).
+#
+# If neither works (no network, filtered egress), define the public entry
+# points as loud no-ops so every caller still works and the operator is told
+# the precaution is inactive rather than being left to assume it is on.
+if ! declare -F apt_https_guard >/dev/null 2>&1; then
+  _apt_https_resolved=""
+  for _ah_cand in \
+      "${_NEOHIRO_LIB_DIR:-}/apt-https.sh" \
+      "/usr/local/lib/neohiro/apt-https.sh" \
+      "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)" 2>/dev/null)/lib/apt-https.sh"; do
+    if [ -n "$_ah_cand" ] && [ -r "$_ah_cand" ] && [ -s "$_ah_cand" ]; then
+      _apt_https_resolved="$_ah_cand"
+      break
+    fi
+  done
+
+  if [ -z "$_apt_https_resolved" ]; then
+    _apt_https_dir="$(mktemp -d "${TMPDIR:-/tmp}/neohiro-https.XXXXXX" 2>/dev/null)" || _apt_https_dir=""
+    if [ -n "$_apt_https_dir" ]; then
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REPO_RAW_BASE}/lib/apt-https.sh" \
+             -o "$_apt_https_dir/apt-https.sh" 2>/dev/null || true
+      elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$_apt_https_dir/apt-https.sh" \
+             "${REPO_RAW_BASE}/lib/apt-https.sh" 2>/dev/null || true
+      fi
+      if [ -s "$_apt_https_dir/apt-https.sh" ]; then
+        _apt_https_resolved="$_apt_https_dir/apt-https.sh"
+      else
+        rm -rf "$_apt_https_dir" 2>/dev/null || true
+      fi
+    fi
+  fi
+
+  if [ -n "$_apt_https_resolved" ]; then
+    # shellcheck disable=SC1090
+    . "$_apt_https_resolved" 2>/dev/null || _apt_https_resolved=""
+  fi
+
+  if ! declare -F apt_https_guard >/dev/null 2>&1; then
+    # Latch the warning to once per process. This stub stands in for a hot-path
+    # helper called by every pkg_* / update_* entry point, so without a latch
+    # a single run printed the same four lines a dozen times and buried the
+    # actual installer output.
+    _apt_https_unavailable() {
+      [ -n "${_APT_HTTPS_DEGRADED_WARNED:-}" ] && return 0
+      _APT_HTTPS_DEGRADED_WARNED=1
+      printf '%s\n' "[WARNING] lib/apt-https.sh could not be loaded, so the repository" >&2
+      printf '%s\n' "[WARNING] transport guard is INACTIVE for this run: packages may" >&2
+      printf '%s\n' "[WARNING] still be fetched over plaintext HTTP. Run from a clone of" >&2
+      printf '%s\n' "[WARNING] neohiro/linux to get the full guard." >&2
+      return 0
+    }
+    apt_https_guard()      { _apt_https_unavailable; return 0; }
+    apt_https_enforce()    { _apt_https_unavailable; return 0; }
+    apt_https_report()     { _apt_https_unavailable; return 0; }
+    apt_https_revert()     { _apt_https_unavailable; return 0; }
+    apt_https_status_text(){ return 0; }
+    apt_https_backup_dir() { printf '%s' "${NEOHIRO_APT_BACKUP_DIR:-/var/backups/neohiro-apt-https}"; }
+    apt_https_conf_file()  { printf '%s' "${NEOHIRO_APT_ETC_DIR:-/etc}/apt/apt.conf.d/99neohiro-force-https"; }
+    # Reported so no caller can mistake "the guard found nothing" for
+    # "the guard checked and the repos are fine". See _auto_skip_if_done.
+    apt_https_available()  { return 1; }
+  fi
+  unset _apt_https_resolved _apt_https_dir _ah_cand 2>/dev/null || true
 fi
 
 RECOVERY_CMD="tmux attach -t linux-setup   # reconnect after SSH disconnect"
@@ -399,6 +494,24 @@ print_recovery_if_ssh() {
   print_recovery_cmd
 }
 
+# Wrap an SSH run in a tmux session so a dropped socket cannot abort it.
+#
+# Three things this must get right, each of which was a bug:
+#
+#   1. Arguments must survive the re-exec. `bash "$SCRIPT_PATH"` with no
+#      "$@" silently dropped --auto / --step / --dry-run, so the run behaved
+#      differently after wrapping than the user asked for.
+#   2. A stale session must never be hijacked. `tmux new-session -A` attaches
+#      to an existing session if one exists, which means the new run never
+#      starts and the user is dropped into someone else's (possibly older,
+#      differently-flagged) run with no way back to theirs. A leftover
+#      session from a previous run is exactly how this happens, so the
+#      session is torn down on clean exit and a name collision falls back to
+#      a PID-suffixed name instead of attaching.
+#   3. The recovery command must be on screen BEFORE exec, because exec
+#      replaces this process and nothing after it can print. If the user
+#      detaches or the socket drops, "tmux attach -t <name>" is the only way
+#      back and they must not have to remember it.
 ensure_tmux_if_ssh() {
   [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] || return 0
   [ -z "${TMUX:-}" ] && [ -z "${STY:-}" ] || return 0
@@ -408,28 +521,63 @@ ensure_tmux_if_ssh() {
     fi
   fi
   command -v tmux >/dev/null 2>&1 || {
-    warn "tmux unavailable; SSH disconnect may kill the run. ${RECOVERY_CMD} will NOT exist - run the script from a local terminal instead."
+    warn "tmux unavailable; an SSH disconnect WILL kill this run and there is no way to reattach."
+    warn "Recovery: ${RECOVERY_CMD} will NOT exist -- run the script from a local terminal instead."
     return 0
   }
   [ -n "$SCRIPT_PATH" ] || { warn "SCRIPT_PATH is empty; cannot re-exec inside tmux."; return 0; }
-  bold "SSH session detected. Wrapping this run in a tmux session so disconnects do not abort it."
-  # Quote everything via env+args (no string interpolation) so paths with spaces
-  # or shell metacharacters survive. The inner bash re-execs the same script
-  # by absolute path; on clean exit it tears the tmux session down.
-  local inner
-  inner=$(cat <<'INNER_EOF'
-trap 'tmux kill-session -t linux-setup 2>/dev/null' EXIT
-cd "$1" && shift
-bash "$1" "$@"
+
+  # Never attach to a pre-existing session: pick a free name instead.
+  local _sess="linux-setup"
+  if tmux has-session -t "$_sess" 2>/dev/null; then
+    warn "A tmux session named '$_sess' already exists (a previous run that did not exit cleanly)."
+    warn "Starting this run as '$_sess-$$' instead so it is never mixed up with the old one."
+    _sess="linux-setup-$$"
+  fi
+
+  bold "SSH session detected. Wrapping this run in tmux so disconnects do not abort it."
+  # Shell-quote every argument so paths with spaces or metacharacters survive.
+  # printf '%q ' with zero arguments emits nothing, so a flagless run stays clean.
+  local _args="" _a
+  for _a in "$@"; do _args="$_args$(printf ' %q' "$_a")"; done
+
+  # Print the recovery command BEFORE exec: after exec nothing in this process
+  # can print, and this is the only moment the user is guaranteed to see it.
+  printf '\n'
+  ok "This run is now inside tmux. If you detach or lose the SSH socket, resume with:"
+  bold "  tmux attach -t $_sess"
+  printf '  (detach without stopping: Ctrl-b then d.  list sessions: tmux ls)\n\n'
+
+  # Inner wrapper: tears the session down on a clean exit so the next run is
+  # not poisoned by a leftover session. On failure the session is deliberately
+  # left alive -- that is the recovery path.
+  # Argument order: <session> <cwd> <script> [original args...]
+  local _inner
+  _inner="$(cat <<'INNER_EOF'
+NEOHIRO_TMUX_SESSION="$1"; shift
+trap 'tmux kill-session -t "$NEOHIRO_TMUX_SESSION" 2>/dev/null' EXIT
+cd "$1" || exit 1
+shift
+bash "$@"
 rc=$?
 if [ "$rc" -eq 0 ]; then
-  tmux kill-session -t linux-setup 2>/dev/null
+  tmux kill-session -t "$NEOHIRO_TMUX_SESSION" 2>/dev/null
 fi
 exit "$rc"
 INNER_EOF
-)
-  exec tmux new-session -A -s linux-setup -n setup \
-    "cd $(printf '%q' "$ORIG_CWD") && bash $(printf '%q' "$SCRIPT_PATH")"
+)"
+  local _inner_file="${TMP_DIR:-/tmp}/neohiro-tmux-inner.$$.sh"
+  mkdir -p "$(dirname "$_inner_file")" 2>/dev/null || true
+  if ! printf '%s\n' "$_inner" > "$_inner_file" 2>/dev/null; then
+    warn "Could not stage the tmux inner wrapper; running directly."
+    return 0
+  fi
+
+  # exec: the user ends up living inside tmux, which is the whole point.
+  # Every piece is printf %q-quoted so spaces and metacharacters survive.
+  local _cmd
+  _cmd="bash $(printf '%q' "$_inner_file") $(printf '%q' "$_sess") $(printf '%q' "$ORIG_CWD") $(printf '%q' "$SCRIPT_PATH")${_args}"
+  exec tmux new-session -s "$_sess" -n setup "cd $(printf '%q' "$ORIG_CWD") && $_cmd"
 }
 
 # bold/warn/err/ok/info/msg/_c are provided by lib/color.sh (sourced above).
@@ -695,6 +843,33 @@ run_remote_script() {
   fi
   chmod +x "$dst"
 
+  # Fetch lib/apt-https.sh alongside the subscript.
+  #
+  # A subscript fetched into $TMP_DIR resolves its helpers relative to its own
+  # location ($TMP_DIR/lib/...), and $TMP_DIR has no lib/ directory. Without
+  # this, DeepClean.sh's `apt-get autoremove --purge` would run with no
+  # transport guard even though the parent process already enforces one -
+  # the child is a separate process with its own once-per-process latch.
+  # Best effort: a failure here must not abort the run, because the parent
+  # has already enforced HTTPS for this operation.
+  _fetch_https_lib_for_subscript() {
+    local libdir="${TMP_DIR}/lib" libdst="${TMP_DIR}/lib/apt-https.sh"
+    local liburl="${REPO_RAW_BASE}/lib/apt-https.sh"
+    mkdir -p "$libdir" 2>/dev/null || return 1
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$liburl" -o "$libdst" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$libdst" "$liburl" 2>/dev/null || return 1
+    else
+      return 1
+    fi
+    [ -s "$libdst" ] || { rm -f "$libdst" 2>/dev/null; return 1; }
+    return 0
+  }
+  if ! _fetch_https_lib_for_subscript; then
+    _log "could not prefetch lib/apt-https.sh; $name will run without the transport guard"
+  fi
+
   # Optional GPG verification. Disabled by default; enable by setting
   #   NEOSIGN_GPG_LEVEL=required  NEOSIGN_GPG_FPR=<40-hex fingerprint>
   # in the environment. `advisory` warns but does not abort. The
@@ -739,24 +914,40 @@ run_remote_script() {
     local _tmux_sess="neohiro-sub-$name-$$"
     info "SSH session detected: wrapping $name in tmux ('$_tmux_sess') so disconnects don't kill it."
     info "Reattach anytime:  tmux attach -t $_tmux_sess"
-    # `tmux new-session -d` starts detached. We then `wait-for` it so the
-    # current shell pauses until the subscript finishes — keeps the
-    # parent's progress bar / step sequencing intact.
+    info "(Ctrl-b then d to detach without stopping it)"
+    # `tmux new-session -d` starts detached. We then poll for it so the
+    # parent's progress bar / step sequencing stays intact.
     tmux new-session -d -s "$_tmux_sess" "cd $(printf '%q' "$ORIG_CWD") && ${_env_prefix[*]:-} bash $(printf '%q' "$dst")"
     rc=$?
     if [ "$rc" -ne 0 ]; then
-      err "Could not start tmux for $name — running directly (may be killed by SSH drop)."
+      err "Could not start tmux for $name — running directly (an SSH drop WILL kill it)."
       "${_env_prefix[@]}" bash "$dst"; return $?
     fi
-    # Poll the tmux session until it ends. This avoids a long blocking
-    # wait and lets us show a one-line status every few seconds.
+    # Poll until the session ends. A heartbeat is printed every 30s: without
+    # one the screen looks frozen, which invites a Ctrl-C that kills this poll
+    # while the subscript keeps running detached -- the user is then staring
+    # at a stalled run with no indication of whether it is alive.
+    local _tick=0
     while tmux has-session -t "$_tmux_sess" 2>/dev/null; do
       sleep 5
+      _tick=$((_tick + 5))
+      if [ "$_tick" -ge 30 ]; then
+        _tick=0
+        info "  $name still running in tmux session '$_tmux_sess' (${_tick}s since last check). Reattach: tmux attach -t $_tmux_sess"
+      fi
     done
-    # tmux does not propagate child exit codes through has-session; if
-    # the user needs a non-zero detection they can run the subscript
+    info "$name finished (tmux session '$_tmux_sess' ended)."
+    # tmux does not propagate child exit codes through has-session; if the
+    # user needs a non-zero detection they can run the subscript
     # directly via Maintenance suite.
     return 0
+  fi
+  if [ "$_is_ssh" = "1" ] && [ "$_in_tmux" = "0" ]; then
+    # SSH, interactive, but no tmux to protect the hop. Say so plainly:
+    # this is precisely the case where a dropped socket loses the work with
+    # no way to recover it.
+    warn "No tmux available: $name runs directly and CANNOT be recovered if the SSH socket drops."
+    warn "Install tmux and re-run, or use a local terminal, to make this step disconnect-safe."
   fi
   "${_env_prefix[@]}" bash "$dst"
 }
@@ -873,6 +1064,9 @@ detect_distro() {
 }
 
 pkg_update() {
+  # Precaution: no repository traffic leaves this host in plaintext. Runs
+  # once per process, so the four pkg_* helpers below cost nothing extra.
+  apt_https_guard "pkg_update" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get update ;;
     dnf)    info "Checking for updates (dnf check-update)..."
@@ -892,6 +1086,7 @@ pkg_update() {
 }
 
 pkg_install() {
+  apt_https_guard "pkg_install" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
     dnf)    run sudo dnf install -y "$@" ;;
@@ -903,6 +1098,7 @@ pkg_install() {
 }
 
 pkg_upgrade() {
+  apt_https_guard "pkg_upgrade" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade ;;
     dnf)    run sudo dnf upgrade --refresh -y ;;
@@ -914,6 +1110,7 @@ pkg_upgrade() {
 }
 
 pkg_autoremove() {
+  apt_https_guard "pkg_autoremove" || true
   case "$PKG_MGR" in
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove ;;
     dnf)    run sudo dnf autoremove -y ;;
@@ -1295,6 +1492,7 @@ _BAR_Filled='#'; _BAR_Empty='-'
 declare -A CHECKLIST=(
   [tmux_wrap]=pending
   [env_detect]=pending
+  [apt_https]=pending
   [system]=pending
   [system_update]=pending
   [dns]=pending
@@ -1318,6 +1516,7 @@ declare -A CHECKLIST=(
 )
 CHECKLIST_LABEL_tmux_wrap="Auto-wrap SSH session in tmux"
 CHECKLIST_LABEL_env_detect="Detect environment (desktop/server)"
+CHECKLIST_LABEL_apt_https="Force HTTPS for all package repos"
 CHECKLIST_LABEL_system="System update + base packages"
 CHECKLIST_LABEL_system_update="System update + base packages"
 CHECKLIST_LABEL_dns="DNSCrypt + DNS routing"
@@ -1386,7 +1585,7 @@ _should_run_step() {
 # ask_category_enabled() in main(), otherwise --step will be rejected as
 # "unknown" even for legitimate steps.  Aliases (e.g. system_update,
 # ssh_hardening) are accepted alongside the short keys for convenience.
-_VALID_STEPS="system system_update dns dnscrypt firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize optimize_asr deepclean"
+_VALID_STEPS="system system_update dns dnscrypt apt_https firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize optimize_asr deepclean"
 _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
@@ -1395,6 +1594,7 @@ _valid_step() {
 # Short preview text for each step — printed before the step runs.
 # Keep entries under ~70 chars so the terminal doesn't wrap.
 declare -A _STEP_PREVIEWS
+_STEP_PREVIEWS["apt_https"]="force HTTPS for every apt/repo source; blocks plaintext downgrade."
 _STEP_PREVIEWS["system"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
 _STEP_PREVIEWS["system_update"]="apt update + upgrade, install base packages (curl, fail2ban, etc.)."
 _STEP_PREVIEWS["dns"]="install dnscrypt-proxy; you choose between DoH, DNSCrypt, and DoT."
@@ -1414,7 +1614,7 @@ _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Rever
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
-_CHECKLIST_ORDER="tmux_wrap env_detect system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize_asr deepclean other_scripts summary"
+_CHECKLIST_ORDER="tmux_wrap env_detect apt_https system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize_asr deepclean other_scripts summary"
 
 show_progress() {
   local done=0 total=0 key status
@@ -1676,7 +1876,7 @@ ask_profile() {
   printf '  %s  %s\n' "$(_c '1;31m' '6) Restore SSH')" "$(_c '1;37m' 'Diagnose & fix common SSH lockout causes; offers self-heal guard.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Safe recovery tool — re-run anytime without re-hardening.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;1;35m' '7) Maintenance')" "$(_c '1;37m' '20 individual tools: inspect, update, recover, optimize.')"
+  printf '  %s  %s\n' "$(_c '1;1;35m' '7) Maintenance')" "$(_c '1;37m' '21 individual tools: HTTPS guard, inspect, update, recover, optimize.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Persistent menu — go in and out without restarting.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;32m' '8) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
@@ -1696,7 +1896,7 @@ ask_profile() {
     "Full (includes Tor, IPv6 disable, attack-surface reduction, deep clean)" \
     "Custom (individual per-category prompts)" \
     "Restore SSH (diagnose & fix common lockout causes)" \
-    "Maintenance suite (20 individual tools, return to this menu)" \
+    "Maintenance suite (21 individual tools, return to this menu)" \
     "DeepClean (cleanup + auto-prune; no hardening)" \
     "Attack Surface Reduction (OptimizeLinuxASR.sh; service-by-service)" \
     "Updates only (system update + kernel + optional packages + auto-update)"
@@ -1712,6 +1912,22 @@ ask_profile() {
 _auto_skip_if_done() {
   local key="$1"
   case "$key" in
+    apt_https)
+      # Never claim the repos are fine unless a real guard actually looked.
+      # When lib/apt-https.sh could not be loaded, apt_https_status_text
+      # returns empty for "nothing found", which would otherwise read as
+      # "already HTTPS-only" -- an unverified security claim printed as fact.
+      if ! apt_https_available 2>/dev/null; then
+        return 1
+      fi
+      # Idempotent: if nothing plaintext is left, the guard has already run
+      # (a repo added since would show up here again and force a re-run).
+      if [ -z "$(apt_https_status_text)" ]; then
+        info "[AUTO] Repository sources are already HTTPS-only — skipping."
+        return 0
+      fi
+      return 1
+      ;;
     dnscrypt)
       if pkg_is_installed dnscrypt-proxy && systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
         info "[AUTO] dnscrypt-proxy already installed and running — skipping."
@@ -1807,6 +2023,14 @@ _auto_skip_if_done() {
 ask_category_enabled() {
   local key="$1" desc="$2" default="$3"
   _should_run_step "$key" || return 1
+  # Repository-transport hardening is a precaution, not an optional
+  # hardening choice: it is enabled for every profile, including Custom,
+  # so there is no profile in which apt can fetch over plaintext HTTP.
+  # NEOHIRO_APT_HTTPS=0 remains the documented escape hatch.
+  if [ "$key" = "apt_https" ]; then
+    _auto_skip_if_done "$key" && return 0
+    return 0
+  fi
   # AUTO_MODE: every step uses its per-profile default (Standard for desktop,
   # Full for server). No interactive prompts; decisions are logged by prompt_yn.
   # Also skip any step that is already fully applied (idempotent re-runs).
@@ -1941,13 +2165,15 @@ _maintenance_sysinfo() {
 }
 
 # Maintenance menu: expanded suite for SSH recovery, config inspection, key
-# management, self-heal controls, and system diagnostics.
-# The menu uses a magenta header and numbered choices (20 = exit).
+# management, self-heal controls, and system diagnostics. Option 1 forces
+# HTTPS for every package repository before anything is downloaded.
+# The menu uses a magenta header and numbered choices (21 = exit).
 maintenance_menu() {
   local choice rc
   while true; do
     printf '\n%s\n' "$(_c '1;35m' '━━━ Maintenance suite ━━━')"
-    prompt_choice "Maintenance — pick a category (20=exit)" \
+    prompt_choice "Maintenance — pick a category (21=exit)" \
+      "Force HTTPS for package repos (precaution before any download)" \
       "System update (apt update + upgrade + base packages)" \
       "DNSCrypt (DNS encryption)" \
       "Firewall (UFW)" \
@@ -1971,23 +2197,24 @@ maintenance_menu() {
     choice=$REPLY_CHOICE
     rc=0
     case $choice in
-      0) mark_step system_update "running"; show_progress; update_system   || rc=$?; mark_step system_update "$([ $rc -eq 0 ] && echo done || echo skip)"; update_kernel || rc=$?;;
-      1) mark_step dnscrypt "running";      show_progress; setup_dnscrypt  || rc=$?; mark_step dnscrypt      "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      2) mark_step firewall "running";     show_progress; setup_firewall   || rc=$?; mark_step firewall     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      3) mark_step tor "running";          show_progress; setup_tor        || rc=$?; mark_step tor          "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      4) mark_step ssh_hardening "running"; show_progress; harden_ssh       || rc=$?; mark_step ssh_hardening "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      5) mark_step fail2ban "running";     show_progress; setup_fail2ban   || rc=$?; mark_step fail2ban     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      6) mark_step unattended "running";   show_progress; configure_unattended_upgrades || rc=$?; mark_step unattended "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      7) mark_step ipv6 "running";         show_progress; disable_ipv6     || rc=$?; mark_step ipv6         "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      8) mark_step sysctl "running";       show_progress; harden_sysctl    || rc=$?; mark_step sysctl       "$([ $rc -eq 0 ] && echo done || echo skip)";;
-      9) mark_step apparmor "running";     show_progress; setup_apparmor   || rc=$?; mark_step apparmor     "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     10) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     11) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     12) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
-     13) bold "=== SSH diagnostics & lockout fix ==="; restore_ssh_mode || rc=$?;;
-     14) bold "=== Authorized keys ==="; _maintenance_list_keys;;
-     15) bold "=== SSH config review ==="; _ssh_inspect_config || rc=$?;;
-     16) bold "=== SSH self-heal guard ==="
+      0) mark_step apt_https "running"; show_progress; apt_https_enforce "maintenance menu" || rc=$?; apt_https_report || true; mark_step apt_https "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      1) mark_step system_update "running"; show_progress; update_system   || rc=$?; mark_step system_update "$([ $rc -eq 0 ] && echo done || echo skip)"; update_kernel || rc=$?;;
+      2) mark_step dnscrypt "running";      show_progress; setup_dnscrypt  || rc=$?; mark_step dnscrypt      "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      3) mark_step firewall "running";     show_progress; setup_firewall   || rc=$?; mark_step firewall     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      4) mark_step tor "running";          show_progress; setup_tor        || rc=$?; mark_step tor          "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      5) mark_step ssh_hardening "running"; show_progress; harden_ssh       || rc=$?; mark_step ssh_hardening "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      6) mark_step fail2ban "running";     show_progress; setup_fail2ban   || rc=$?; mark_step fail2ban     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      7) mark_step unattended "running";   show_progress; configure_unattended_upgrades || rc=$?; mark_step unattended "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      8) mark_step ipv6 "running";         show_progress; disable_ipv6     || rc=$?; mark_step ipv6         "$([ $rc -eq 0 ] && echo done || echo skip)";;
+      9) mark_step sysctl "running";       show_progress; harden_sysctl    || rc=$?; mark_step sysctl       "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     10) mark_step apparmor "running";     show_progress; setup_apparmor   || rc=$?; mark_step apparmor     "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     11) mark_step pam "running";          show_progress; harden_passwords || rc=$?; mark_step pam          "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     12) mark_step optimize_asr "running"; show_progress; run_optimize_asr || rc=$?; mark_step optimize_asr "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     13) mark_step deepclean "running";    show_progress; run_deepclean    || rc=$?; mark_step deepclean    "$([ $rc -eq 0 ] && echo done || echo skip)";;
+     14) bold "=== SSH diagnostics & lockout fix ==="; restore_ssh_mode || rc=$?;;
+     15) bold "=== Authorized keys ==="; _maintenance_list_keys;;
+     16) bold "=== SSH config review ==="; _ssh_inspect_config || rc=$?;;
+     17) bold "=== SSH self-heal guard ==="
          if [ -f /var/run/neohiro-ssh-watchdog.armed ]; then
            info "Self-heal guard is installed and armed."
            if prompt_yn "Remove the self-heal guard?" "n"; then
@@ -2000,9 +2227,9 @@ maintenance_menu() {
            fi
          fi
          ;;
-     17) bold "=== Log viewer ==="; _maintenance_logs;;
-     18) bold "=== System info ==="; _maintenance_sysinfo;;
-     19) info "Returning to main menu."; break;;
+     18) bold "=== Log viewer ==="; _maintenance_logs;;
+     19) bold "=== System info ==="; _maintenance_sysinfo;;
+     20) info "Returning to main menu."; break;;
     esac
     if [ $rc -eq 0 ]; then
       ok "Done."
@@ -2016,6 +2243,7 @@ maintenance_menu() {
 update_system() {
   msg "Updating system and installing base packages..."
   _warn_if_not_tmux
+  apt_https_guard "update_system" || true
   local upgradable=0
   case "$PKG_MGR" in
     apt) upgradable=$(apt list --upgradable 2>/dev/null | grep -c '/') || upgradable=0 ;;
@@ -2047,6 +2275,7 @@ update_system() {
 update_kernel() {
   msg "System and kernel update..."
   _warn_if_not_tmux
+  apt_https_guard "update_kernel" || true
 
   if [ "$EUID" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
     err "sudo required for kernel update."
@@ -3459,9 +3688,15 @@ harden_attack_surface() {
     "jffs2"      # Journalling Flash FS, rarely needed
     "hfs"        # macOS HFS, rarely needed on Linux
     "hfsplus"    # macOS HFS+, rarely needed on Linux
-    "squashfs"   # read-only compressed FS, may be needed for snaps/snapshots
     "udf"        # Universal Disk Format, rarely needed
   )
+  # Server/desktop triage: squashfs backs snaps/live media. Only blacklist it
+  # when no snap runtime is present; otherwise leave it loadable.
+  if command -v snap >/dev/null 2>&1 || _service_present snapd 2>/dev/null; then
+    info "Keeping squashfs loadable (snap runtime detected)."
+  else
+    fs_blacklist+=("squashfs")
+  fi
   local modprobe_dir="/etc/modprobe.d"
   run sudo mkdir -p "$modprobe_dir"
   local f="${modprobe_dir}/blacklist-filesystems.conf"
@@ -3480,7 +3715,7 @@ harden_attack_surface() {
   ok "Filesystem blacklist written to $f"
 
   # 2) SSH cryptographic hardening — modern ciphers, MACs, KEX
-  if [ -f /etc/ssh/sshd_config ] && systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+  if [ -f /etc/ssh/sshd_config ] && { systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; }; then
     local sshcfg="/etc/ssh/sshd_config"
     local backup
     backup="${sshcfg}.bak.$(date +%s%N)"
@@ -3492,7 +3727,7 @@ harden_attack_surface() {
       "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
     )
     for d in "${crypto_directives[@]}"; do
-      _set_or_append_sshd_config "${d%%=*}" "${d#*=}" "$sshcfg"
+      _set_or_append_sshd_config "${d%% *}" "${d#* }" "$sshcfg"
     done
     if sudo sshd -t 2>&1; then
       _ssh_safe_restart "$sshcfg" || warn "SSH config valid but reload failed; changes apply on next restart."
@@ -3561,6 +3796,25 @@ run_deepclean() {
 # about enabling automatic (security) updates. Never touches firewall,
 # SSH, sysctl, AppArmor, or any hardening. Use this for a "just sync
 # the system and have the latest binaries" pass.
+# Force HTTPS for every configured package repository, then report the
+# resulting state. Shared by the main workflow step, the maintenance menu,
+# and the --apt-https CLI flag so all three behave identically.
+_step_apt_https() {
+  local rc=0
+  # `if ! cmd; then rc=$?; fi` would capture the negation's status, not the
+  # command's, so use the explicit `|| rc=$?` form.
+  apt_https_enforce "step:apt_https" || rc=$?
+  # Count any backups the guard took so the run summary stays honest.
+  local bdir n=0 b
+  bdir="$(apt_https_backup_dir)"
+  if [ -d "$bdir" ]; then
+    for b in "$bdir"/*.orig; do [ -f "$b" ] && n=$((n + 1)); done
+  fi
+  [ "$n" -gt 0 ] && metrics_add configs_backed_up "$n"
+  apt_https_report || true
+  return "$rc"
+}
+
 updates_only_mode() {
   bold "=== Updates-only mode ==="
   info "This runs the comprehensive update engine (every available package"
@@ -3568,6 +3822,10 @@ updates_only_mode() {
   info "(but does not enable) the core service binaries, and optionally"
   info "enables automatic (security) updates. No firewall, SSH, or hardening."
   echo
+
+  # Precaution before anything is fetched: force repository traffic over
+  # HTTPS (and roll back automatically if a mirror cannot speak TLS).
+  apt_https_guard "updates_only_mode" || true
 
   # 1) Comprehensive system update — every package manager + snap/flatpak
   # + docker images + brew + firmware. Same engine lives in lib/updater.sh
@@ -4204,6 +4462,21 @@ main() {
       rollback_mode "${1#--rollback=}"
       exit $?
       ;;
+    --apt-https|--enforce-https)
+      bold "neohiro/linux - HTTPS package repositories (enforce)"
+      _step_apt_https
+      exit $?
+      ;;
+    --apt-https-audit)
+      bold "neohiro/linux - HTTPS package repositories (audit only)"
+      apt_https_report
+      exit $?
+      ;;
+    --apt-https-off|--disable-https)
+      bold "neohiro/linux - Revert HTTPS package repository enforcement"
+      apt_https_revert
+      exit $?
+      ;;
     --dry-run)
       DRY_RUN=1; shift
       bold "[DRY-RUN] Preview mode - no changes will be made"
@@ -4235,7 +4508,7 @@ main() {
       ;;
     -h|--help)
       cat <<'USAGE'
-Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [-h]
+Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restore-ssh] [--restore-etc-snapshot] [--rollback [--apply]] [--apt-https[=audit|off]] [-h]
 
   (no flag)         Run the full interactive setup & hardening.
   --auto, -y, --yes Run unattended: intelligent profile selection, no prompts,
@@ -4261,6 +4534,21 @@ Usage: sudo bash linuxinstall.sh [--auto|-y] [--dry-run] [--step STEP] [--restor
   --rollback        Dry-prints the inverse cp commands needed to undo
                     every change recorded in /var/log/linux-install-rollback.log.
   --rollback --apply  Run those cp commands (latest backup wins).
+  --apt-https       Force HTTPS for every configured package repository
+                    and app store (writes
+                    /etc/apt/apt.conf.d/99neohiro-force-https and rewrites
+                    http:// repo URLs to https://). Runs automatically
+                    before every apt/dnf/yum/zypper/pacman/apk/pip/npm/...
+                    download, so this flag is only needed to apply it on
+                    its own. Backups land in
+                    /var/backups/neohiro-apt-https/. A mirror that cannot
+                    speak HTTPS is detected and the rewrite is rolled back
+                    automatically. Alias: --enforce-https
+  --apt-https-audit Report the transport security of every app store
+                    without changing anything (exit 1 if plaintext
+                    remains).
+  --apt-https-off   Revert: restore every backed-up config file and remove
+                    the apt policy drop-in. Alias: --disable-https
   -h, --help        Show this help.
 
 Environment variables:
@@ -4271,6 +4559,24 @@ Environment variables:
   TOR_NICK=...      Override the Tor relay nickname (default: hostname).
   TOR_CONTACT=...   Override the Tor relay contact (default: you@example.com).
   NEOHIRO_DEBUG_LOG=path  Override debug log location.
+
+Repository transport guard (applies to every package/app store):
+  NEOHIRO_APT_HTTPS=1          Enforce HTTPS. Default.
+  NEOHIRO_APT_HTTPS=audit      Report only; never modify anything.
+  NEOHIRO_APT_HTTPS=0          Disable the guard entirely.
+  NEOHIRO_APT_HTTPS_REWRITE=1  Also rewrite http->https in the non-apt
+                               stores (apk, pip, npm, cargo, gem, nix,
+                               docker, fwupd, dnf/yum, zypper, pacman).
+                               Off by default: not every mirror serves the
+                               same paths over TLS.
+  NEOHIRO_APT_HTTPS_NOVERIFY=1 Skip the post-rewrite `apt-get update` check.
+  NEOHIRO_APT_HTTPS_STRICT=1   Treat leftover plaintext as a hard error.
+  NEOHIRO_APT_BLOCK_PORT80=1   Also add `ufw deny out 80/tcp` so no process can
+                               open a plaintext package connection at all.
+                               Off by default because a blanket outbound
+                               block also affects unrelated protocols.
+  NEOHIRO_APT_FAMILY=apt|dnf|zypper|pacman|none
+                               Pin the detected package manager (CI images).
 USAGE
       exit 0
       ;;
@@ -4280,7 +4586,10 @@ USAGE
   if [ "$EUID" -ne 0 ]; then
     err "This script must be run as root (use sudo)."; exit 1
   fi
-  ensure_tmux_if_ssh
+# Forward the script's arguments: the tmux re-exec restarts this same
+  # script, and without "$@" it would silently drop --auto / --step /
+  # --dry-run, so an SSH run would behave differently from what was asked.
+  ensure_tmux_if_ssh "$@"
   mark_step tmux_wrap "done"
   print_recovery_if_ssh
   _warn_if_not_tmux
@@ -4383,13 +4692,17 @@ USAGE
     done
   }
   # Workflow order, from most aggressive cleaning to most targeted update:
-  #   1) Attack-surface reduction FIRST — stop unneeded services so they are
+  #   0) HTTPS enforcement for every package repository. This runs FIRST and
+  #      on every profile so nothing below can fetch a package over plaintext
+  #      HTTP (a MITM on the mirror can inject arbitrary .deb/.rpm files).
+  #   1) Attack-surface reduction - stop unneeded services so they are
   #      no longer holding files / kernel modules when we upgrade.
-  #   2) Comprehensive system update + kernel prune — every package manager,
+  #   2) Comprehensive system update + kernel prune - every package manager,
   #      snap, flatpak, docker, brew, firmware, geoip.
   #   3) Hardening layer: firewall, SSH, fail2ban, sysctl, AppArmor, ...
   # Rationale: dropping unwanted services first means the system-update
   # transaction does not need to chase daemons that are about to go away.
+  _run_step apt_https "Force HTTPS for all package repos" "" _step_apt_https y
   _run_step optimize_asr "Attack-surface reduction (stop unneeded services)"  "" run_optimize_asr   n
   # System step is special: it always follows with update_kernel so the
   # new kernel can be detected before the run ends. The comprehensive
