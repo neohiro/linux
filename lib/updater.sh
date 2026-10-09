@@ -769,7 +769,7 @@ if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
 else
   # Called as a script. Pass all arguments to _run_all_updates.
   set -euo pipefail
-  local _start_sec=$SECONDS
+  _start_sec=$SECONDS
   _run_all_updates "$@"
   exit $?
 fi
