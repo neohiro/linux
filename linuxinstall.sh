@@ -1507,6 +1507,7 @@ declare -A CHECKLIST=(
   [sysctl]=pending
   [apparmor]=pending
   [pam]=pending
+  [attack_surface]=pending
   [optimize]=pending
   [optimize_asr]=pending
   [deepclean]=pending
@@ -1530,6 +1531,7 @@ CHECKLIST_LABEL_ipv6="Disable IPv6"
 CHECKLIST_LABEL_sysctl="Kernel/sysctl hardening"
 CHECKLIST_LABEL_apparmor="AppArmor"
 CHECKLIST_LABEL_pam="Password & lockout policy"
+CHECKLIST_LABEL_attack_surface="Attack surface reduction (built-in)"
 CHECKLIST_LABEL_optimize="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_optimize_asr="OptimizeLinuxASR.sh (ASR)"
 CHECKLIST_LABEL_deepclean="DeepClean.sh (cleanup)"
@@ -1583,7 +1585,7 @@ _should_run_step() {
 # ask_category_enabled() in main(), otherwise --step will be rejected as
 # "unknown" even for legitimate steps.  Aliases (e.g. system_update,
 # ssh_hardening) are accepted alongside the short keys for convenience.
-_VALID_STEPS="system system_update dns dnscrypt apt_https firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize optimize_asr deepclean"
+_VALID_STEPS="system system_update dns dnscrypt apt_https firewall tor ssh ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize optimize_asr deepclean"
 _valid_step() {
   case " $_VALID_STEPS " in *" $1 "*) return 0 ;; esac
   return 1
@@ -1607,11 +1609,12 @@ _STEP_PREVIEWS["ipv6"]="disable IPv6 system-wide (kernel + sysctl). Warned: may 
 _STEP_PREVIEWS["sysctl"]="apply hardened kernel/network sysctls (no IPv4 icmp-echo-block on deny)."
 _STEP_PREVIEWS["apparmor"]="enable AppArmor; enforce default profiles."
 _STEP_PREVIEWS["pam"]="tighten pam_faillock: 5 retries / 15 min lockout."
+_STEP_PREVIEWS["attack_surface"]="filesystem blacklist, SSH crypto hardening, login.defs aging, core dumps disabled."
 _STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
-_CHECKLIST_ORDER="tmux_wrap env_detect apt_https system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam optimize_asr deepclean other_scripts summary"
+_CHECKLIST_ORDER="tmux_wrap env_detect apt_https system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize_asr deepclean other_scripts summary"
 
 show_progress() {
   local done=0 total=0 key status
@@ -1978,11 +1981,19 @@ _auto_skip_if_done() {
         info "[AUTO] IPv6 already disabled — skipping."
         return 0
       fi
+      if [ -f /etc/sysctl.d/99-disable-ipv6.conf ] && \
+         grep -qE 'net\.ipv6\.conf\.all\.disable_ipv6\s*=\s*1' /etc/sysctl.d/99-disable-ipv6.conf 2>/dev/null; then
+        info "[AUTO] IPv6 disable config present — skipping."
+        return 0
+      fi
       return 1
       ;;
     sysctl)
-      if [ -f /etc/sysctl.d/99-hardening.conf ]; then
-        info "[AUTO] sysctl hardening (99-hardening.conf) already present — skipping."
+      if [ -f /etc/sysctl.d/99-hardening.conf ] && \
+         grep -qE 'net\.ipv4\.conf\.all\.rp_filter\s*=\s*1' /etc/sysctl.d/99-hardening.conf 2>/dev/null && \
+         grep -qE 'net\.ipv4\.tcp_syncookies\s*=\s*1' /etc/sysctl.d/99-hardening.conf 2>/dev/null && \
+         grep -qE 'net\.ipv4\.conf\.all\.accept_source_route\s*=\s*0' /etc/sysctl.d/99-hardening.conf 2>/dev/null; then
+        info "[AUTO] sysctl hardening (99-hardening.conf) already present with key values — skipping."
         return 0
       fi
       return 1
@@ -3039,24 +3050,17 @@ disable_ipv6() {
   fi
   run sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
   run sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
-  if [ -f /etc/sysctl.conf ] && [ ! -f /var/backups/sysctl.conf.bak ]; then
-    run sudo cp /etc/sysctl.conf /var/backups/sysctl.conf.bak
-    record_backup /etc/sysctl.conf /var/backups/sysctl.conf.bak
+  local f="/etc/sysctl.d/99-disable-ipv6.conf"
+  if [ -f "$f" ] && [ ! -f /var/backups/99-disable-ipv6.conf.bak ]; then
+    run sudo cp "$f" /var/backups/99-disable-ipv6.conf.bak
+    record_backup "$f" /var/backups/99-disable-ipv6.conf.bak
   fi
-  # Detect trailing newline by writing the last byte to a temp file (avoids
-  # the newline-stripping behavior of command substitution in subshells).
-  # If the file ends in \n, the check succeeds and tee appends on a fresh line.
-  # If the file lacks a trailing \n, we prepend one so we don't glue content.
-  run sudo bash -c '
-    lastbyte=$(tail -c1 /etc/sysctl.conf | od -An -tx1 -N1 | tr -d " \n")
-    [ "$lastbyte" != "0a" ] && printf "\n" >> /etc/sysctl.conf
-  '
-  run sudo tee -a /etc/sysctl.conf >/dev/null <<'EOF'
-
+  run sudo tee "$f" >/dev/null <<'EOF'
 # disabled by linuxinstall.sh
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
+  run sudo sysctl --system
   warn "Reboot may be required for full effect."
 }
 
@@ -3476,13 +3480,34 @@ configure_unattended_upgrades() {
 
 harden_sysctl() {
   msg "Kernel/network hardening via sysctl"
-  if ! prompt_yn "Apply the 99-hardening.conf sysctl profile from the README?" "y"; then return 0; fi
+  # AUTO_MODE: skip the prompt and apply based on detected environment.
+  # Servers get the full profile; desktops get a reduced set that does not
+  # break container runtimes or dual-stack networking.
+  if [ "${AUTO_MODE:-0}" = "1" ]; then
+    info "[AUTO] Applying sysctl hardening based on detected environment ($ENV_TYPE)."
+  elif ! prompt_yn "Apply the 99-hardening.conf sysctl profile from the README?" "y"; then
+    return 0
+  fi
+
   local f="/etc/sysctl.d/99-hardening.conf"
   if [ -f "$f" ] && [ ! -f /var/backups/99-hardening.conf.bak ]; then
     run sudo cp "$f" /var/backups/99-hardening.conf.bak
     record_backup "$f" /var/backups/99-hardening.conf.bak
   fi
-  run sudo tee "$f" >/dev/null <<'EOF'
+
+  # Server vs desktop triage: servers get more aggressive hardening.
+  # Desktops skip user.max_user_namespaces=0 (breaks Docker/Podman) and
+  # tcp_sack=0 (hurts performance on modern LANs).
+  local _is_server=0
+  [ "$ENV_TYPE" = "server" ] && _is_server=1
+
+  local _extra=""
+  if [ "$_is_server" = "1" ]; then
+    _extra=$'\n''user.max_user_namespaces=0'
+  fi
+
+  run sudo tee "$f" >/dev/null <<EOF
+# Kernel security hardening
 kernel.dmesg_restrict=1
 kernel.kptr_restrict=2
 kernel.unprivileged_bpf_disabled=1
@@ -3496,21 +3521,87 @@ fs.protected_symlinks=1
 fs.protected_hardlinks=1
 fs.protected_fifos=2
 fs.protected_regular=2
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
+kernel.panic=60
+kernel.panic_on_oops=1
+kernel.perf_event_paranoid=2
+vm.mmap_rnd_bits=32
+vm.mmap_rnd_compat_bits=16
+${_extra}
+# Network hardening - reverse path filtering
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.default.rp_filter=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
+
+# SYN flood protection
 net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_max_syn_backlog=2048
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_syn_retries=5
+
+# Source route / redirects
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+
+# Martian logging & ICMP
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# Time-wait assassination protection
+net.ipv4.tcp_rfc1337=1
+
+# TCP tuning
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=1200
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=3
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_moderate_rcvbuf=1
+
+# ARP hardening
+net.ipv4.conf.all.arp_ignore=1
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.all.proxy_arp=0
+
+# Forwarding (disable if not a router)
+net.ipv4.conf.all.forwarding=0
+net.ipv4.conf.default.forwarding=0
+
+# IPv6 hardening
 net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_ra=0
+net.ipv6.conf.default.accept_ra=0
+net.ipv6.conf.all.autoconf=0
+net.ipv6.conf.default.autoconf=0
+
+# Congestion control & buffers
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.core.somaxconn=4096
 EOF
-  run sudo sysctl --system
-  metrics_add sysctls_applied 25
+
+  if run sudo sysctl --system; then
+    ok "sysctl hardening applied."
+  else
+    warn "sysctl --system had errors; some settings may not have taken effect."
+  fi
+
+  # Count actual applied entries (dynamic, not hardcoded).
+  local _count
+  _count=$(grep -cE '^[^#[:space:]]' "$f" 2>/dev/null || echo 0)
+  metrics_add sysctls_applied "$_count"
   metrics_add services_hardened 1
 }
 
@@ -3582,6 +3673,103 @@ TMOUT=900; readonly TMOUT; export TMOUT
 EOF
   run sudo chmod 644 /etc/profile.d/99-tmout.sh
   ok "Password/lockout policy set. Note: 'core 0' in /etc/security/limits.conf is recommended."
+}
+
+harden_attack_surface() {
+  msg "Attack surface reduction (built-in: filesystems, SSH crypto, login policy)"
+  if ! prompt_yn "Apply additional built-in ASR hardening (filesystem blacklist, SSH crypto, login.defs)?" "y"; then
+    return 0
+  fi
+
+  # 1) Filesystem module blacklist — prevent loading of legacy/unused filesystems
+  local fs_blacklist=(
+    "cramfs"     # compressed ROM filesystem, rarely needed
+    "freevxfs"   # VERITAS VxFS, rarely needed
+    "jffs2"      # Journalling Flash FS, rarely needed
+    "hfs"        # macOS HFS, rarely needed on Linux
+    "hfsplus"    # macOS HFS+, rarely needed on Linux
+    "squashfs"   # read-only compressed FS, may be needed for snaps/snapshots
+    "udf"        # Universal Disk Format, rarely needed
+  )
+  local modprobe_dir="/etc/modprobe.d"
+  run sudo mkdir -p "$modprobe_dir"
+  local f="${modprobe_dir}/blacklist-filesystems.conf"
+  if [ -f "$f" ] && [ ! -f /var/backups/blacklist-filesystems.conf.bak ]; then
+    run sudo cp "$f" /var/backups/blacklist-filesystems.conf.bak
+    record_backup "$f" /var/backups/blacklist-filesystems.conf.bak
+  fi
+  {
+    printf '# Filesystem blacklist — attack surface reduction\n'
+    printf '# Generated by linuxinstall.sh\n'
+    for fs in "${fs_blacklist[@]}"; do
+      printf 'install %s /bin/true\n' "$fs"
+      printf 'blacklist %s\n' "$fs"
+    done
+  } | run sudo tee "$f" >/dev/null
+  ok "Filesystem blacklist written to $f"
+
+  # 2) SSH cryptographic hardening — modern ciphers, MACs, KEX
+  if [ -f /etc/ssh/sshd_config ] && systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd 2>/dev/null; then
+    local sshcfg="/etc/ssh/sshd_config"
+    local backup
+    backup="${sshcfg}.bak.$(date +%s%N)"
+    run sudo cp "$sshcfg" "$backup"
+    record_backup "$sshcfg" "$backup"
+    local crypto_directives=(
+      "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
+      "MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512"
+      "KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group-exchange-sha256"
+    )
+    for d in "${crypto_directives[@]}"; do
+      _set_or_append_sshd_config "${d%%=*}" "${d#*=}" "$sshcfg"
+    done
+    if sudo sshd -t 2>&1; then
+      _ssh_safe_restart "$sshcfg" || warn "SSH config valid but reload failed; changes apply on next restart."
+    else
+      err "sshd config invalid after crypto hardening — reverting."
+      run sudo cp -f "$backup" "$sshcfg"
+      return 1
+    fi
+    ok "SSH cryptographic hardening applied (modern ciphers/MACs/KEX only)."
+  fi
+
+  # 3) /etc/login.defs — password aging
+  local login_defs="/etc/login.defs"
+  if [ -f "$login_defs" ] && [ ! -f /var/backups/login.defs.bak ]; then
+    run sudo cp "$login_defs" /var/backups/login.defs.bak
+    record_backup "$login_defs" /var/backups/login.defs.bak
+  fi
+  local -A login_vals=(
+    [PASS_MAX_DAYS]=90
+    [PASS_MIN_DAYS]=7
+    [PASS_WARN_AGE]=14
+    [ENCRYPT_METHOD]=SHA512
+  )
+  for k in "${!login_vals[@]}"; do
+    local v="${login_vals[$k]}"
+    if grep -qE "^${k}[[:space:]]" "$login_defs" 2>/dev/null; then
+      run sudo sed -i -E "s/^${k}[[:space:]]+.*/${k} ${v}/" "$login_defs"
+    else
+      printf '%s %s\n' "$k" "$v" | run sudo tee -a "$login_defs" >/dev/null
+    fi
+  done
+  ok "login.defs password aging set (max 90d, min 7d, warn 14d)."
+
+  # 4) Core dump size limit — disable core dumps by default
+  local limits_conf="/etc/security/limits.conf"
+  if [ -f "$limits_conf" ] && [ ! -f /var/backups/limits.conf.bak ]; then
+    run sudo cp "$limits_conf" /var/backups/limits.conf.bak
+    record_backup "$limits_conf" /var/backups/limits.conf.bak
+  fi
+  if ! grep -qE '^\*[[:space:]]+hard[[:space:]]+core[[:space:]]+0' "$limits_conf" 2>/dev/null; then
+    printf '* hard core 0\n' | run sudo tee -a "$limits_conf" >/dev/null
+  fi
+  if ! grep -qE '^\*[[:space:]]+soft[[:space:]]+core[[:space:]]+0' "$limits_conf" 2>/dev/null; then
+    printf '* soft core 0\n' | run sudo tee -a "$limits_conf" >/dev/null
+  fi
+  ok "Core dumps disabled via limits.conf."
+
+  metrics_add services_hardened 1
 }
 
 run_optimize_asr() {
@@ -4539,6 +4727,7 @@ USAGE
   _run_step sysctl      "Kernel/sysctl hardening profile"            "" harden_sysctl             n
   _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
   _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
+  _run_step attack_surface "Attack surface reduction (built-in)"     "" harden_attack_surface    n
   _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then

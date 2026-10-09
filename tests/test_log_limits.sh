@@ -77,10 +77,10 @@ if echo "$JOURNALD_DROPIN" | grep -q 'SplitMode=none'; then
 else
     fail_t "journald drop-in: SplitMode=none" "not found"
 fi
-if echo "$JOURNALD_DROPIN" | grep -q 'RuntimeMaxUse=1M'; then
-    ok_t "journald drop-in: RuntimeMaxUse=\$\{RUNTIME_MAX_USE\} present"
+if echo "$JOURNALD_DROPIN" | grep -qF 'RuntimeMaxUse=${RUNTIME_MAX_USE}'; then
+    ok_t 'journald drop-in: RuntimeMaxUse=${RUNTIME_MAX_USE} present'
 else
-    fail_t "journald drop-in: RuntimeMaxUse=\$\{RUNTIME_MAX_USE\}" "not found"
+    fail_t 'journald drop-in: RuntimeMaxUse=${RUNTIME_MAX_USE}' "not found"
 fi
 if echo "$JOURNALD_DROPIN" | grep -q 'ForwardToKMsg=no'; then
     ok_t "journald drop-in: ForwardToKMsg=no present"
@@ -275,7 +275,7 @@ fi
 
 # Test 9: rsyslog rate limiting
 msg "Testing rsyslog rate limiting..."
-RSYSLOG_CFG=$(sed -n '/rsyslog rate limiting/,/^fi/p' "$DEEPCLEAN")
+RSYSLOG_CFG=$(sed -n '/RSYSLOG_DROPIN=/,/^fi/p' "$DEEPCLEAN")
 if echo "$RSYSLOG_CFG" | grep -q 'SystemLogRateLimitInterval 5'; then
     ok_t "rsyslog: SystemLogRateLimitInterval=5 present"
 else
@@ -294,7 +294,7 @@ fi
 
 # Test 10: syslog-ng rate limiting
 msg "Testing syslog-ng rate limiting..."
-SYSLOGNG_CFG=$(sed -n '/syslog-ng rate limiting/,/^fi/p' "$DEEPCLEAN")
+SYSLOGNG_CFG=$(sed -n '/SYSLOGNG_DROPIN=/,/^fi/p' "$DEEPCLEAN")
 if echo "$SYSLOGNG_CFG" | grep -q 'log-fifo-size(1000)'; then
     ok_t "syslog-ng: log-fifo-size=1000 present"
 else
@@ -338,7 +338,7 @@ if echo "$AUDIT_LOGIC" | grep -q 'TOTAL_LOG_KB'; then
 else
     fail_t "audit: TOTAL_LOG_KB before" "not found"
 fi
-POST_AUDIT=$(sed -n '/Post-clean log audit/,/printf/d' "$DEEPCLEAN" | head -20)
+POST_AUDIT=$(sed -n '/# Post-clean log audit/,/^done/p' "$DEEPCLEAN" | head -20)
 if echo "$POST_AUDIT" | grep -q 'POST_LOG_KB'; then
     ok_t "audit: POST_LOG_KB capture after clean"
 else
