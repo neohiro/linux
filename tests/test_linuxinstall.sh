@@ -594,6 +594,145 @@ $_summary_raw"
   fi
 fi
 
+# --- Hardening module invariants (harden_sysctl / harden_attack_surface) ---
+# These two functions write system files and call systemctl/sudo, so they are
+# not executed here. Instead the function bodies are extracted and asserted
+# structurally. Each check below pins a behaviour that was a real bug at some
+# point, so removing the guard fails the suite.
+if [ -f "$SRC" ]; then
+  SYSCTL_FN=$(sed -n '/^harden_sysctl() {/,/^}/p' "$SRC")
+  ASR_FN=$(sed -n '/^harden_attack_surface() {/,/^}/p' "$SRC")
+
+  if printf '%s' "$SYSCTL_FN" | grep -q 'harden_sysctl() {'; then
+    ok_t "harden_sysctl: function body extracted"
+  else
+    fail_t "harden_sysctl: function body extracted" "no body found in $SRC"
+  fi
+  if printf '%s' "$ASR_FN" | grep -q 'harden_attack_surface() {'; then
+    ok_t "harden_attack_surface: function body extracted"
+  else
+    fail_t "harden_attack_surface: function body extracted" "no body found in $SRC"
+  fi
+
+  # Core network hardening the profile is expected to guarantee.
+  for _kv in \
+    'net.ipv4.conf.all.rp_filter=1' \
+    'net.ipv4.conf.default.rp_filter=1' \
+    'net.ipv4.tcp_syncookies=1' \
+    'net.ipv4.conf.all.accept_source_route=0' \
+    'net.ipv4.conf.default.accept_source_route=0' \
+    'net.ipv4.conf.all.accept_redirects=0' \
+    'net.ipv4.tcp_rfc1337=1' \
+    'net.ipv4.conf.all.log_martians=1'
+  do
+    if printf '%s' "$SYSCTL_FN" | grep -qF "$_kv"; then
+      ok_t "harden_sysctl: profile sets $_kv"
+    else
+      fail_t "harden_sysctl: profile sets $_kv" "missing from 99-hardening.conf block"
+    fi
+  done
+
+  # user.max_user_namespaces=0 breaks Docker/Podman/LXD, so it must be
+  # conditional. Pin both halves: the detection and the guarded assignment.
+  if printf '%s' "$SYSCTL_FN" | grep -q '_service_present docker'; then
+    ok_t "harden_sysctl: container detection present before userns hardening"
+  else
+    fail_t "harden_sysctl: container detection" "user.max_user_namespaces set without a container check"
+  fi
+  if printf '%s' "$SYSCTL_FN" | grep -q 'user.max_user_namespaces=0'; then
+    ok_t "harden_sysctl: user.max_user_namespaces=0 still applied on bare servers"
+  else
+    fail_t "harden_sysctl: user.max_user_namespaces=0" "server hardening no longer limits user namespaces"
+  fi
+
+  # Regression: `grep -c ... || echo 0` printed "0" and then "0" because grep
+  # exits 1 on no match, so the metric was 00 and arithmetic broke. Pin the
+  # fallback to the same line as the count; a bare "|| true" elsewhere in the
+  # function would satisfy a looser check and hide the bug.
+  if printf '%s' "$SYSCTL_FN" | grep -qE 'grep -cE.*\|\| true'; then
+    ok_t "harden_sysctl: sysctl metrics counting tolerates grep -c exit status"
+  else
+    fail_t "harden_sysctl: sysctl metrics counting" \
+           "expected the grep -cE line to use '|| true', not a duplicated fallback echo"
+  fi
+  if printf '%s' "$SYSCTL_FN" | grep -qE 'grep -cE.*\|\| echo 0'; then
+    fail_t "harden_sysctl: sysctl metrics counting" \
+           "grep -c fallback echo yields a doubled '0' and breaks metrics arithmetic"
+  else
+    ok_t "harden_sysctl: no duplicated '0' metrics fallback"
+  fi
+
+  # squashfs backs snaps/live media; blacklisting it unconditionally is a
+  # regression that breaks snap on desktops. Assert the detection itself, not
+  # merely the word "snap" (which also appears in log messages).
+  if printf '%s' "$ASR_FN" | grep -q 'command -v snap'; then
+    ok_t "harden_attack_surface: squashfs blacklist is snap-aware"
+  else
+    fail_t "harden_attack_surface: snap-aware squashfs triage" \
+           "no 'command -v snap' check before blacklisting squashfs"
+  fi
+  # The triage must actually gate the entry: squashfs belongs in the list
+  # only in the non-snap branch, never in the static array above it.
+  if printf '%s' "$ASR_FN" | grep -qF 'fs_blacklist+=("squashfs")'; then
+    ok_t "harden_attack_surface: squashfs added conditionally, not unconditionally"
+  else
+    fail_t "harden_attack_surface: conditional squashfs" \
+           "squashfs is not appended conditionally"
+  fi
+  if printf '%s' "$ASR_FN" | sed -n '/local fs_blacklist=(/,/^  )/p' | grep -q '"squashfs"'; then
+    fail_t "harden_attack_surface: squashfs is static in fs_blacklist" \
+           "squashfs must not be in the static array; that blacklists it on snap hosts"
+  else
+    ok_t "harden_attack_surface: squashfs absent from the static blacklist array"
+  fi
+
+  # Regression: directives are "Ciphers <value>", not "Ciphers=<value>".
+  # Splitting on '=' produced key "Ciphers chacha20..." and value
+  # "chacha20...", which corrupted sshd_config.
+  if printf '%s' "$ASR_FN" | grep -qF '${d%% *}' && printf '%s' "$ASR_FN" | grep -qF '${d#* }'; then
+    ok_t "harden_attack_surface: SSH crypto directives split on first space"
+  else
+    fail_t "harden_attack_surface: SSH directive split" "expected space-delimited split, not '='"
+  fi
+  if printf '%s' "$ASR_FN" | grep -qF '${d%%=*}'; then
+    fail_t "harden_attack_surface: SSH directive split" "still splitting on '=', which corrupts sshd_config"
+  else
+    ok_t "harden_attack_surface: no '='-split left in SSH crypto path"
+  fi
+
+  # crypto directives target an existing drop-in when one defines them, so
+  # those files must be backed up and restored on validation failure.
+  if printf '%s' "$ASR_FN" | grep -q 'sshd_config.d/\*\.conf'; then
+    ok_t "harden_attack_surface: sshd_config.d drop-ins included in backup/revert"
+  else
+    fail_t "harden_attack_surface: sshd_config.d backup" "drop-ins are edited but not backed up"
+  fi
+
+  # Never downgrade an existing password hash algorithm.
+  if printf '%s' "$ASR_FN" | grep -q 'no downgrade'; then
+    ok_t "harden_attack_surface: login.defs ENCRYPT_METHOD never downgraded"
+  else
+    fail_t "harden_attack_surface: ENCRYPT_METHOD guard" "existing hash method can be replaced with SHA512"
+  fi
+
+  # Prompt text must describe what the step actually does (it also handles
+  # core dumps), otherwise operators decline on a misleading summary.
+  if printf '%s' "$ASR_FN" | grep -q 'core dumps'; then
+    ok_t "harden_attack_surface: prompt/header mentions core dumps"
+  else
+    fail_t "harden_attack_surface: prompt text" "prompt omits the core-dump hardening it performs"
+  fi
+
+  # Both steps must be reachable as first-class steps.
+  for _step in attack_surface apt_https; do
+    if _valid_step "$_step"; then
+      ok_t "harden step reachable via --step: $_step"
+    else
+      fail_t "harden step reachable via --step: $_step" "_valid_step rejected a wired-up step"
+    fi
+  done
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -eq 0 ]; then
