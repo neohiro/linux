@@ -674,9 +674,13 @@ timedatectl status
 
 ### Kernel Hardening (sysctl)
 
-Save as `/etc/sysctl.d/99-hardening.conf` (identical on every distro):
+The `sysctl` step writes `/etc/sysctl.d/99-hardening.conf` and runs
+`sudo sysctl --system`. The profile below is what the script actually emits, in
+the same order. It is identical on every distro except for the two server-only
+keys noted at the end.
+
 ```
-# information disclosure
+# Kernel security hardening
 kernel.dmesg_restrict=1
 kernel.kptr_restrict=2
 kernel.unprivileged_bpf_disabled=1
@@ -690,26 +694,114 @@ fs.protected_symlinks=1
 fs.protected_hardlinks=1
 fs.protected_fifos=2
 fs.protected_regular=2
+kernel.panic=60
+kernel.panic_on_oops=1
+kernel.perf_event_paranoid=2
+vm.mmap_rnd_bits=32
+vm.mmap_rnd_compat_bits=16
 
-# network stack
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
+# Network hardening - reverse path filtering
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.default.rp_filter=1
-net.ipv4.icmp_echo_ignore_broadcasts=1
+
+# SYN flood protection
 net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_max_syn_backlog=2048
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_syn_retries=5
+
+# Source route / redirects
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.secure_redirects=0
+net.ipv4.conf.default.secure_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+
+# Martian logging & ICMP
+net.ipv4.conf.all.log_martians=1
+net.ipv4.conf.default.log_martians=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+
+# Time-wait assassination protection
+net.ipv4.tcp_rfc1337=1
+
+# TCP tuning
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=1200
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=3
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_moderate_rcvbuf=1
+
+# ARP hardening
+net.ipv4.conf.all.arp_ignore=1
+net.ipv4.conf.all.arp_announce=2
+net.ipv4.conf.all.proxy_arp=0
+
+# Forwarding (disable if not a router)
+net.ipv4.conf.all.forwarding=0
+net.ipv4.conf.default.forwarding=0
+
+# IPv6 hardening
 net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_ra=0
+net.ipv6.conf.default.accept_ra=0
+net.ipv6.conf.all.autoconf=0
+net.ipv6.conf.default.autoconf=0
+
+# Congestion control & buffers
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.core.somaxconn=4096
 ```
 
-Apply:
+Server-only (added on servers, skipped when a container runtime is detected):
+
+```
+user.max_user_namespaces=0
+```
+
+Apply manually:
 ```bash
 sudo sysctl --system
 ```
+
+Notes:
+- `net.ipv4.conf.*.forwarding=0` replaces the older `net.ipv4.ip_forward=0`;
+  per-interface forwarding is what modern network namespaces and containers use.
+- `tcp_fin_timeout`, `tcp_tw_reuse`, keepalive and buffer sizes are capacity
+  tuning, not exploit mitigations. They are safe defaults, but on a busy host
+  tune them to your link rather than treating them as security settings.
+- `net.ipv4.tcp_congestion_control=bbr` is ignored on kernels without BBR; the
+  rest of the file still applies.
+
+### Attack surface reduction (built-in)
+
+The `attack_surface` step (`--step attack_surface`) applies, all backed up and
+logged to the rollback log first:
+
+- **Filesystem blacklist** — `cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`,
+  `udf`, plus `squashfs` when no snap runtime is present. Written to
+  `/etc/modprobe.d/blacklist-filesystems.conf`.
+- **SSH crypto** — restricts `Ciphers`, `MACs` and `KexAlgorithms` to modern
+  AEAD/curve255 suites. Validates with `sshd -t`, backs up and restores
+  `sshd_config.d` drop-ins, then reloads (never restarts, so the session
+  survives).
+- **`/etc/login.defs`** — `PASS_MAX_DAYS 90`, `PASS_MIN_DAYS 7`,
+  `PASS_WARN_AGE 14`. An existing `ENCRYPT_METHOD` (yescrypt/bcrypt) is kept;
+  it is never downgraded to `SHA512`.
+- **Core dumps** — `* hard core 0` and `* soft core 0` in
+  `/etc/security/limits.conf`.
 
 ### Mandatory Access Control: AppArmor vs SELinux
 

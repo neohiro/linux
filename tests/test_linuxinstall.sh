@@ -731,6 +731,68 @@ if [ -f "$SRC" ]; then
       fail_t "harden step reachable via --step: $_step" "_valid_step rejected a wired-up step"
     fi
   done
+
+  # --- README <-> code consistency -----------------------------------------
+  # The README documents the sysctl profile as a copy-paste block. It drifted
+  # from the script (stale net.ipv4.ip_forward, dozens of undocumented keys).
+  # This compares the two directions so neither can silently diverge again:
+  #   1. every key the script emits must be documented
+  #   2. every key documented in the profile block must still be emitted
+  _README="$ROOT/README.md"
+  if [ -f "$_README" ]; then
+    # Isolate the documented profile block (the fenced block after the
+    # "Kernel Hardening (sysctl)" heading).
+    _README_BLOCK=$(sed -n '/^### Kernel Hardening (sysctl)/,/^Apply manually:/p' "$_README")
+
+    # Keys emitted by the script, excluding comments, blanks, and the
+    # server-only ${_extra} interpolation line (asserted separately).
+    _CODE_KEYS=$(printf '%s\n' "$SYSCTL_FN" \
+      | sed -n '/^# Kernel security hardening/,/^EOF$/p' \
+      | grep -E '^[a-z][a-z0-9_.]*=' \
+      | cut -d= -f1 \
+      | sort -u)
+    # Keys documented in the README profile block (both blocks).
+    _DOC_KEYS=$(printf '%s\n' "$_README_BLOCK" \
+      | grep -E '^[a-z][a-z0-9_.]*=' \
+      | cut -d= -f1 \
+      | sort -u)
+
+    if [ -n "$_CODE_KEYS" ] && [ -n "$_DOC_KEYS" ]; then
+      _missing=$(printf '%s\n' "$_CODE_KEYS" | while IFS= read -r k; do
+        printf '%s\n' "$_DOC_KEYS" | grep -qxF "$k" || printf '%s\n' "$k"
+      done)
+      if [ -z "$_missing" ]; then
+        ok_t "README: every sysctl key emitted by harden_sysctl is documented"
+      else
+        fail_t "README: documents every emitted sysctl key" \
+               "undocumented: $(printf '%s' "$_missing" | tr '\n' ' ')"
+      fi
+
+      _stale=$(printf '%s\n' "$_DOC_KEYS" | while IFS= read -r k; do
+        [ "$k" = "user.max_user_namespaces" ] && continue
+        printf '%s\n' "$_CODE_KEYS" | grep -qxF "$k" || printf '%s\n' "$k"
+      done)
+      if [ -z "$_stale" ]; then
+        ok_t "README: no stale sysctl keys left in the documented profile"
+      else
+        fail_t "README: no stale sysctl keys" \
+               "documented but not emitted: $(printf '%s' "$_stale" | tr '\n' ' ')"
+      fi
+
+      # The server-only key must be documented as conditional.
+      if printf '%s\n' "$_DOC_KEYS" | grep -qxF "user.max_user_namespaces"; then
+        ok_t "README: server-only user.max_user_namespaces is documented"
+      else
+        fail_t "README: server-only user.max_user_namespaces" \
+               "script emits it conditionally on servers but README omits it"
+      fi
+    else
+      fail_t "README: sysctl profile block parsed" \
+             "could not extract keys from code or README (README profile block may have moved)"
+    fi
+  else
+    fail_t "README: present for sysctl consistency check" "README.md not found at $_README"
+  fi
 fi
 
 echo
