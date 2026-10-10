@@ -787,8 +787,20 @@ Notes:
 
 ### Attack surface reduction (built-in)
 
-The `attack_surface` step (`--step attack_surface`) applies, all backed up and
-logged to the rollback log first:
+There are **two** attack-surface controls, and they do not overlap:
+
+| Part | Entry point | Mechanism | Writes config? |
+|---|---|---|---|
+| **Services** | `OptimizeLinuxASR.sh` (profile 9, maintenance, `run_remote_script`) | `systemctl stop/disable/mask` per daemon | No |
+| **Kernel + config** | `attack_surface` step (`--step attack_surface`) | writes sysctl/modprobe/sshd/login/limits files | Yes |
+
+`OptimizeLinuxASR.sh` removes *running software* (rpcbind, samba, ftp, telnet,
+snapd, …) and touches no configuration file. The `attack_surface` step
+hardens the *kernel and configuration surface* and touches no service. Run
+both for full coverage; neither substitutes for the other.
+
+The `attack_surface` step applies, all backed up and logged to the rollback log
+first:
 
 - **Filesystem blacklist** — `cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`,
   `udf`, plus `squashfs` when no snap runtime is present. Written to
@@ -802,6 +814,13 @@ logged to the rollback log first:
   it is never downgraded to `SHA512`.
 - **Core dumps** — `* hard core 0` and `* soft core 0` in
   `/etc/security/limits.conf`.
+
+> **Ordering note:** the `squashfs` carve-out keys off a snap runtime being
+> present. If you disable `snapd` via `OptimizeLinuxASR.sh` first, a later
+> `attack_surface` run will blacklist `squashfs`. That is intended (no snap, no
+> need for squashfs) but breaks live media and some container storage — review
+> `/etc/modprobe.d/blacklist-filesystems.conf` if you boot ISOs or use squashfs
+> images.
 
 ### Mandatory Access Control: AppArmor vs SELinux
 

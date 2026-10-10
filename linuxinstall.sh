@@ -1531,9 +1531,9 @@ CHECKLIST_LABEL_ipv6="Disable IPv6"
 CHECKLIST_LABEL_sysctl="Kernel/sysctl hardening"
 CHECKLIST_LABEL_apparmor="AppArmor"
 CHECKLIST_LABEL_pam="Password & lockout policy"
-CHECKLIST_LABEL_attack_surface="Attack surface reduction (built-in)"
-CHECKLIST_LABEL_optimize="OptimizeLinuxASR.sh (ASR)"
-CHECKLIST_LABEL_optimize_asr="OptimizeLinuxASR.sh (ASR)"
+CHECKLIST_LABEL_attack_surface="ASR: kernel + config hardening"
+CHECKLIST_LABEL_optimize="ASR: disable unneeded services"
+CHECKLIST_LABEL_optimize_asr="ASR: disable unneeded services"
 CHECKLIST_LABEL_deepclean="DeepClean.sh (cleanup)"
 CHECKLIST_LABEL_other_scripts="Other helpers (Shadowsocks / server extras)"
 CHECKLIST_LABEL_summary="Print run summary"
@@ -1609,9 +1609,9 @@ _STEP_PREVIEWS["ipv6"]="disable IPv6 system-wide (kernel + sysctl). Warned: may 
 _STEP_PREVIEWS["sysctl"]="apply hardened kernel/network sysctls (no IPv4 icmp-echo-block on deny)."
 _STEP_PREVIEWS["apparmor"]="enable AppArmor; enforce default profiles."
 _STEP_PREVIEWS["pam"]="tighten pam_faillock: 5 retries / 15 min lockout."
-_STEP_PREVIEWS["attack_surface"]="filesystem blacklist, SSH crypto hardening, login.defs aging, core dumps disabled."
-_STEP_PREVIEWS["optimize"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
-_STEP_PREVIEWS["optimize_asr"]="run OptimizeLinuxASR.sh (network/disk tweaks). Reversible."
+_STEP_PREVIEWS["attack_surface"]="filesystem blacklist, SSH crypto, login.defs aging, core dumps disabled."
+_STEP_PREVIEWS["optimize"]="stop/mask unneeded daemons via OptimizeLinuxASR.sh (interactive)."
+_STEP_PREVIEWS["optimize_asr"]="stop/mask unneeded daemons via OptimizeLinuxASR.sh (interactive)."
 _STEP_PREVIEWS["deepclean"]="run DeepClean.sh (apt cache, journal, old kernels). Safe but uses disk."
 
 _CHECKLIST_ORDER="tmux_wrap env_detect apt_https system_update dnscrypt firewall tor ssh_hardening fail2ban unattended ipv6 sysctl apparmor pam attack_surface optimize_asr deepclean other_scripts summary"
@@ -1882,8 +1882,9 @@ ask_profile() {
   printf '  %s  %s\n' "$(_c '1;32m' '8) DeepClean')" "$(_c '1;37m' 'Run DeepClean.sh: journal, logs, apt/dnf/pacman cache,')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'snap/dock/flatpak cleanup, systemd coredump, logrotate.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;32m' '9) Attack Surface Reduction')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
-  printf '  %s        %s\n' "" "$(_c '1;30m' 'Categories: hardware, networking, legacy protocols, etc.')"
+  printf '  %s  %s\n' "$(_c '1;32m' '9) Attack Surface Reduction (services)')" "$(_c '1;37m' 'Run OptimizeLinuxASR.sh: disable unused services interactively.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'Stops/masks daemons only. Kernel + config hardening is the')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'built-in attack_surface step (--step attack_surface).')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;32m' '10) Updates only')" "$(_c '1;37m' 'System update + kernel prune. Install (do not enable)')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'tor / fail2ban / shadowsocks / dnscrypt. Auto-update opt-in.')"
@@ -2185,7 +2186,7 @@ maintenance_menu() {
       "Kernel/sysctl hardening" \
       "AppArmor" \
       "Password & lockout policy" \
-      "OptimizeLinuxASR (attack-surface reduction)" \
+      "OptimizeLinuxASR (attack-surface reduction: disable services)" \
       "DeepClean (cleanup + auto-prune)" \
       "SSH diagnostics & lockout fix (restore_ssh_mode)" \
       "Authorized keys (list + inspect)" \
@@ -4762,7 +4763,7 @@ USAGE
   _run_step sysctl      "Kernel/sysctl hardening profile"            "" harden_sysctl             n
   _run_step apparmor    "AppArmor"                                   "" setup_apparmor            n
   _run_step pam         "Password & lockout policy"                  "" harden_passwords          n
-  _run_step attack_surface "Attack surface reduction (built-in)"     "" harden_attack_surface    n
+  _run_step attack_surface "ASR: kernel + config hardening"              "" harden_attack_surface    n
   _run_step deepclean   "Run DeepClean.sh (new helper)"              "" run_deepclean            n
 
   if [ "$USE_REMOTE_SSH" = "yes" ]; then
