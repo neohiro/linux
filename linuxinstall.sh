@@ -1071,14 +1071,24 @@ pkg_update() {
     apt)    run sudo env DEBIAN_FRONTEND=noninteractive apt-get update ;;
     dnf)    info "Checking for updates (dnf check-update)..."
                sudo dnf check-update >/dev/null 2>&1; rc=$?
-               [ "$rc" -eq 100 ] && ok "Updates available — will upgrade." \
-               || [ "$rc" -eq 0 ] && ok "System up to date." \
-               || info "dnf check-update exited $rc." ;;
+               # dnf/yum check-update exits 100 when updates are available,
+               # 0 when up to date, and anything else is an error. A flat
+               # `A && B || C && D || E` chain does not express "exactly one of
+               # three": for rc=100 it printed BOTH "Updates available" and
+               # "System up to date". A case statement makes each rc map to
+               # exactly one message.
+               case "$rc" in
+                 100) ok "Updates available — will upgrade." ;;
+                 0)   ok "System up to date." ;;
+                 *)   info "dnf check-update exited $rc." ;;
+               esac ;;
     yum)    info "Checking for updates (yum check-update)..."
                sudo yum check-update >/dev/null 2>&1; rc=$?
-               [ "$rc" -eq 100 ] && ok "Updates available — will upgrade." \
-               || [ "$rc" -eq 0 ] && ok "System up to date." \
-               || info "yum check-update exited $rc." ;;
+               case "$rc" in
+                 100) ok "Updates available — will upgrade." ;;
+                 0)   ok "System up to date." ;;
+                 *)   info "yum check-update exited $rc." ;;
+               esac ;;
     zypper) run sudo zypper --quiet refresh ;;
     pacman) run sudo pacman -Sy ;;
     *)      info "  pkg_update: no-op on $PKG_MGR" ;;
@@ -1734,11 +1744,21 @@ print_welcome() {
     _user_label="$USER (non-root — re-run with sudo)"
   fi
   local _step_count _ssh_note
+  # Profile numbers here are the 0-based values produced by prompt_choice:
+  #   0=AUTO, 1=Recommended, 2=Standard, 3=Full, 4=Custom.
+  # The counts must match what ask_category_enabled() actually enables for that
+  # profile, otherwise the header contradicts the step list the user is about
+  # to watch run. Counted from the _run_step table in main():
+  #   Recommended = the four default=y steps (apt_https, system, firewall,
+  #                 unattended)                                   -> 4
+  #   Standard    = Recommended + ssh, fail2ban, sysctl, pam,
+  #                 optimize_asr, apparmor, attack_surface         -> 11
+  #   Full        = every step (adds dnscrypt, tor, ipv6, deepclean) -> 15
   case "$REPLY_PROFILE" in
-    0|1) _step_count=10 _ssh_note="(auto-detect — SSH depends on environment)" ;;
-    2) _step_count=6 _ssh_note="(no SSH changes)" ;;
-    3) _step_count=10 _ssh_note="(includes SSH hardening)" ;;
-    4) _step_count=12 _ssh_note="(includes SSH hardening + Tor)" ;;
+    0|1) _step_count=4 _ssh_note="(auto-detect — SSH depends on environment)" ;;
+    2) _step_count=11 _ssh_note="(includes SSH hardening)" ;;
+    3) _step_count=15 _ssh_note="(includes SSH hardening + Tor)" ;;
+    4) _step_count=15 _ssh_note="(custom — each category prompted)" ;;
     7|8|9) _step_count=1 _ssh_note="(single-mode)" ;;
     *) _step_count=0 _ssh_note="" ;;
   esac
@@ -1862,12 +1882,12 @@ ask_profile() {
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Also: NEOHIRO_AUTO=1, --auto, or -y on the command line.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;32m' '2) Recommended')" "$(_c '1;37m' 'Safe defaults — firewall, system updates, unattended upgrades.')"
-  printf '  %s        %s\n' "" "$(_c '1;30m' 'No risk of SSH lockout.  ~6 steps.  Takes 1-3 min.')"
+  printf '  %s        %s\n' "" "$(_c '1;30m' 'No risk of SSH lockout.  ~4 steps.  Takes 1-3 min.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;36m' '3) Standard')"   "$(_c '1;37m' 'Recommended + SSH hardening, Fail2ban, kernel sysctls,')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'attack-surface reduction, AppArmor, password policies.  ~11 steps.')"
   printf '\n'
-  printf '  %s  %s\n' "$(_c '1;35m' '4) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~12 steps.')"
+  printf '  %s  %s\n' "$(_c '1;35m' '4) Full')"       "$(_c '1;37m' 'Standard + Tor, IPv6 disable, deep clean.  ~15 steps.')"
   printf '  %s        %s\n' "" "$(_c '1;30m' 'Most aggressive.  Takes 5-10 min.')"
   printf '\n'
   printf '  %s  %s\n' "$(_c '1;33m' '5) Custom')"     "$(_c '1;37m' 'Choose each step individually.')"
@@ -1906,6 +1926,36 @@ ask_profile() {
     info "Quick mode: individual prompts skipped — using recommended defaults."
     info "Override individual steps with STRICT_RUN=1 if needed."
   fi
+}
+
+# Resolve the *effective* value of an sshd directive, honouring OpenSSH's
+# first-set-wins rule: /etc/ssh/sshd_config.d/*.conf is Included from the top of
+# the main file, so a value in a drop-in overrides one set later in
+# /etc/ssh/sshd_config. Returns the value (lower-cased) on stdout, or empty if
+# the directive is unset.
+#
+# This matters for idempotency checks: grepping only the main file would report
+# "PermitRootLogin no" even when a drop-in re-enables it, causing a re-run to
+# falsely believe SSH was already hardened and skip the fix.
+_effective_sshd_value() {
+  local param="$1" cfg="${2:-/etc/ssh/sshd_config}"
+  local _dropin_dir="${NEOHIRO_SSHD_DROPIN_DIR:-/etc/ssh/sshd_config.d}"
+  local _d _v _p
+  _p=$(printf '%s' "$param" | tr 'A-Z' 'a-z')
+  # Drop-ins first (in the order sshd reads them: sorted, first match wins).
+  for _d in "$_dropin_dir"/*.conf; do
+    [ -f "$_d" ] || continue
+    _v=$(awk -v p="$_p" '
+      tolower($1) == p { print $2; exit }
+    ' "$_d" 2>/dev/null)
+    if [ -n "$_v" ]; then printf '%s\n' "$_v" | tr 'A-Z' 'a-z'; return 0; fi
+  done
+  # Then the main file.
+  _v=$(awk -v p="$_p" '
+    tolower($1) == p { print $2; exit }
+  ' "$cfg" 2>/dev/null)
+  [ -n "$_v" ] && printf '%s\n' "$_v" | tr 'A-Z' 'a-z'
+  return 0
 }
 
 # In AUTO_MODE, check if the feature is already applied and skip it if so.
@@ -1955,9 +2005,15 @@ _auto_skip_if_done() {
     ssh)
       if [ "$USE_REMOTE_SSH" != "yes" ]; then return 1; fi
       local cfg="/etc/ssh/sshd_config"
-      if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+no' "$cfg" 2>/dev/null && \
-         grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+no' "$cfg" 2>/dev/null; then
-        info "[AUTO] SSH already hardened (PermitRootLogin=no, PasswordAuthentication=no) — skipping."
+      # Use the *effective* directive values (drop-in aware), not a grep of the
+      # main file only: a drop-in can override the main config, so checking just
+      # /etc/ssh/sshd_config would report "already hardened" while the live
+      # value is still permissive.
+      local _prl _pwa
+      _prl="$(_effective_sshd_value PermitRootLogin "$cfg")"
+      _pwa="$(_effective_sshd_value PasswordAuthentication "$cfg")"
+      if [ "$_prl" = "no" ] && [ "$_pwa" = "no" ]; then
+        info "[AUTO] SSH already hardened (effective PermitRootLogin=no, PasswordAuthentication=no) — skipping."
         return 0
       fi
       return 1
@@ -2032,12 +2088,24 @@ ask_category_enabled() {
     _auto_skip_if_done "$key" && return 0
     return 0
   fi
-  # AUTO_MODE: every step uses its per-profile default (Standard for desktop,
-  # Full for server). No interactive prompts; decisions are logged by prompt_yn.
-  # Also skip any step that is already fully applied (idempotent re-runs).
+  # AUTO_MODE / QUICK_MODE-Custom: no prompts, but the *selected profile* is
+  # authoritative. ask_profile() has already resolved AUTO_MODE to a concrete
+  # profile number (2=Standard on desktops, 3=Full on servers) before any step
+  # runs, and the profile case below is exactly the set of categories that
+  # profile promises ("Full — ~15 steps", "Standard — ~11 steps"). Gating on
+  # the per-step `default` instead would silently drop every step whose default
+  # is "n" (dnscrypt, tor, ssh, fail2ban, sysctl, pam, attack_surface, ipv6,
+  # deepclean, ...), so the run would advertise "Profile 3 — Full" and then
+  # execute four steps and print a success summary. That is how an auto run
+  # could report success while leaving SSH hardening, sysctls, Fail2ban and
+  # attack-surface reduction entirely unapplied.
+  #
+  # So: always honour _auto_skip_if_done() first (idempotent re-runs stay
+  # cheap), then fall through to the shared profile case for the actual
+  # enabled/disabled decision. `default` is only consulted for the profiles
+  # that are defined by their defaults (Recommended) or for Custom.
   if [ "${AUTO_MODE:-0}" = "1" ]; then
     _auto_skip_if_done "$key" && return 0
-    [ "$default" = "y" ] && return 0 || return 1
   fi
   # In QUICK_MODE with Custom profile (4), skip individual prompts — use defaults.
   if [ "$QUICK_MODE" = "1" ] && [ "$REPLY_PROFILE" = "4" ]; then
@@ -2045,12 +2113,12 @@ ask_category_enabled() {
     [ "$default" = "y" ] && return 0 || return 1
   fi
   # Profile numbers (0-indexed; produced by prompt_choice):
-  #   0=AUTO (handled by AUTO_MODE block above)
+  #   0=AUTO (resolved to 2 or 3 by ask_profile before steps run)
   #   1=Recommended, 2=Standard, 3=Full, 4=Custom,
   #   5=Restore SSH, 6=Maintenance
   case "$REPLY_PROFILE" in
-    1) [ "$default" = "y" ]; return $?;;   # Recommended
-    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ]; return $?;;  # Standard
+    0|1) [ "$default" = "y" ]; return $?;;   # AUTO fallback / Recommended
+    2) [ "$default" = "y" ] || [ "$key" = "ssh" ] || [ "$key" = "fail2ban" ] || [ "$key" = "sysctl" ] || [ "$key" = "pam" ] || [ "$key" = "optimize_asr" ] || [ "$key" = "apparmor" ] || [ "$key" = "attack_surface" ]; return $?;;  # Standard
     3) return 0;;                            # Full
     4) prompt_yn "Run: $desc?" "$default"; return $?;;  # Custom
     5) return 1;;                             # Restore SSH
@@ -2348,7 +2416,10 @@ update_kernel() {
         | tr '\n' ' ' || true)"
     if [ -n "$removed" ]; then
       info "  Pruning: $removed"
-      run sudo DEBIAN_FRONTEND=noninteractive apt-get -y remove --purge $removed || true
+      # An array (not bare $removed) so each package stays one argv entry even
+      # if a name ever contains whitespace; guarded above against empty.
+      read -r -a _removed_pkgs <<<"$removed"
+      run sudo DEBIAN_FRONTEND=noninteractive apt-get -y remove --purge "${_removed_pkgs[@]}" || true
     else
       info "  No additional kernels to prune."
     fi
@@ -2856,6 +2927,9 @@ EOF
     "iptables -t nat -A OUTPUT -p tcp --dport $DIR_PORT -j RETURN"
   )
   for c in "${cmds[@]}"; do
+    # Word-splitting is intentional: $c is a fully-formed command line that
+    # must expand into argv (e.g. "iptables ... -j REDIRECT --to-ports 9040").
+    # shellcheck disable=SC2086
     run sudo $c
   done
   run sudo netfilter-persistent save
@@ -2907,6 +2981,9 @@ EOF
     "iptables -t nat -A OUTPUT -p udp --dport 443 -j REDIRECT --to-ports 9040"
   )
   for c in "${cmds[@]}"; do
+    # Word-splitting is intentional: $c is a fully-formed command line that
+    # must expand into argv (e.g. "iptables ... -j REDIRECT --to-ports 9040").
+    # shellcheck disable=SC2086
     run sudo $c
   done
   run sudo netfilter-persistent save
@@ -4516,7 +4593,7 @@ main() {
       SELECTED_STEP="${1#--step=}"
       if ! _valid_step "$SELECTED_STEP"; then
         err "Unknown step: $SELECTED_STEP"
-        info "Valid steps: $(echo $_VALID_STEPS | tr ' ' ', ')"
+        info "Valid steps: $(echo "$_VALID_STEPS" | tr ' ' ', ')"
         exit 1
       fi
       bold "[STEP] Running only step: $SELECTED_STEP"
@@ -4530,7 +4607,7 @@ main() {
       SELECTED_STEP="$2"
       if ! _valid_step "$SELECTED_STEP"; then
         err "Unknown step: $SELECTED_STEP"
-        info "Valid steps: $(echo $_VALID_STEPS | tr ' ' ', ')"
+        info "Valid steps: $(echo "$_VALID_STEPS" | tr ' ' ', ')"
         exit 1
       fi
       bold "[STEP] Running only step: $SELECTED_STEP"

@@ -144,8 +144,12 @@ do
   TPUT_VAL="${COMBO#*|}"
   write_tput "${TPUT_VAL#TPUT_OUTPUT=}"
   FULL_ENV="$ENV_PART $TPUT_VAL"
-  DRIVER_OUT="$(env $FULL_ENV PATH="$WD2:/usr/bin:/bin" bash "$WD/driver.sh" 2>/dev/null)"
-  CANON_OUT="$(env $FULL_ENV PATH="$WD2:/usr/bin:/bin" bash -c '. "'"$SCRIPT_DIR"'/lib/color-gate.sh"; _apply_color_gate' 2>/dev/null)"
+  # `env` needs each VAR=VAL as its own argv entry, so the two tokens in
+  # FULL_ENV must remain separate arguments (an array makes that explicit and
+  # avoids relying on unquoted expansion).
+  read -r -a _full_env_arr <<<"$FULL_ENV"
+  DRIVER_OUT="$(env "${_full_env_arr[@]}" PATH="$WD2:/usr/bin:/bin" bash "$WD/driver.sh" 2>/dev/null)"
+  CANON_OUT="$(env "${_full_env_arr[@]}" PATH="$WD2:/usr/bin:/bin" bash -c '. "'"$SCRIPT_DIR"'/lib/color-gate.sh"; _apply_color_gate' 2>/dev/null)"
   if [ "$DRIVER_OUT" != "$CANON_OUT" ]; then
     echo "  [FAIL] COMBO='$ENV_PART' $TPUT_VAL: driver=$DRIVER_OUT canonical=$CANON_OUT"
     PARITY_FAIL=$((PARITY_FAIL + 1)); FAIL=$((FAIL + 1))

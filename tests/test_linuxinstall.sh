@@ -795,6 +795,72 @@ if [ -f "$SRC" ]; then
   fi
 fi
 
+# --- _effective_sshd_value + auto-skip: drop-in aware idempotency ------------
+# A drop-in (/etc/ssh/sshd_config.d/*.conf) is Included from the top of
+# sshd_config, so its value wins. An idempotency check that grepped only the
+# main file would report "already hardened" while the live value is permissive,
+# causing an AUTO re-run to skip the SSH hardening fix entirely.
+if declare -F _effective_sshd_value >/dev/null 2>&1; then
+  _SSHD_WD="$WD/sshd"
+  mkdir -p "$_SSHD_WD/dropins"
+  cat > "$_SSHD_WD/sshd_config" <<'EOF'
+#PermitRootLogin prohibit-password
+PermitRootLogin no
+PasswordAuthentication no
+EOF
+  # No drop-ins: the main file's values are effective.
+  if [ "$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/no-such-dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")" = "no" ]; then
+    ok_t "_effective_sshd_value: reads the main file when no drop-in sets it"
+  else
+    fail_t "_effective_sshd_value: main file read" \
+           "got '$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/no-such-dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")'"
+  fi
+
+  # A drop-in that re-enables root login must win over the main file.
+  printf 'PermitRootLogin yes\n' > "$_SSHD_WD/dropins/99-override.conf"
+  if [ "$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")" = "yes" ]; then
+    ok_t "_effective_sshd_value: drop-in overrides the main file (first-set wins)"
+  else
+    fail_t "_effective_sshd_value: drop-in override" \
+           "got '$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")'"
+  fi
+
+  # Keyword casing must not matter (sshd keywords are case-insensitive).
+  printf 'PERMITROOTLOGIN no\n' > "$_SSHD_WD/dropins/99-override.conf"
+  if [ "$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")" = "no" ]; then
+    ok_t "_effective_sshd_value: matches keyword case-insensitively"
+  else
+    fail_t "_effective_sshd_value: case-insensitive keyword" \
+           "got '$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/dropins" _effective_sshd_value PermitRootLogin "$_SSHD_WD/sshd_config")'"
+  fi
+
+  # An unset directive must resolve to empty (not a false positive).
+  if [ -z "$(NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/no-such-dropins" _effective_sshd_value PermitEmptyPasswords "$_SSHD_WD/sshd_config")" ]; then
+    ok_t "_effective_sshd_value: unset directive resolves to empty"
+  else
+    fail_t "_effective_sshd_value: unset directive" "expected empty, got non-empty"
+  fi
+
+  # And the auto-skip gate must NOT skip when a drop-in un-hardens SSH.
+  rm -f "$_SSHD_WD/dropins/99-override.conf"
+  printf 'PermitRootLogin yes\n' > "$_SSHD_WD/dropins/50-permissive.conf"
+  if declare -F _auto_skip_if_done >/dev/null 2>&1; then
+    _skip_rc=0
+    USE_REMOTE_SSH="yes"
+    NEOHIRO_SSHD_DROPIN_DIR="$_SSHD_WD/dropins" \
+      _auto_skip_if_done ssh >/dev/null 2>&1 || _skip_rc=$?
+    if [ "$_skip_rc" -ne 0 ]; then
+      ok_t "_auto_skip_if_done ssh: does not skip when a drop-in un-hardens SSH"
+    else
+      fail_t "_auto_skip_if_done ssh: drop-in aware" \
+             "returned 0 (skip) while a drop-in set PermitRootLogin yes"
+    fi
+  fi
+  unset USE_REMOTE_SSH
+else
+  fail_t "_effective_sshd_value: declared in extracted slice" "function not found"
+fi
+
 echo
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -eq 0 ]; then
